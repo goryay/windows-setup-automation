@@ -188,8 +188,8 @@ function Test-FurMarkGpuAvailable {
 
     $probeArgs = @(
         '--demo', 'furmark-vk',
-        '--width', '640',
-        '--height', '480',
+        '--width', '1920',
+        '--height', '1080',
         '--max-time', '8',
         '--no-score-box',
         '--disable-demo-options',
