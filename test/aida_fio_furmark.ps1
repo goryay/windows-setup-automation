@@ -217,6 +217,136 @@ function Test-FurMarkGpuAvailable {
     }
 }
 
+function Get-NvidiaSmiPath {
+    $candidates = @(
+        "$env:WINDIR\System32\nvidia-smi.exe",
+        "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+        "${env:ProgramFiles(x86)}\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+    )
+
+    foreach ($path in $candidates) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            return $path
+        }
+    }
+
+    $cmd = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) {
+        return $cmd.Source
+    }
+
+    return $null
+}
+
+function Get-NvidiaGpuLines {
+    $smi = Get-NvidiaSmiPath
+
+    if (-not $smi) {
+        return @()
+    }
+
+    try {
+        $lines = @(
+            & $smi --query-gpu=index,name --format=csv,noheader 2>$null |
+            Where-Object { $_ -and $_.Trim() }
+        )
+
+        return $lines
+    }
+    catch {
+        return @()
+    }
+}
+
+function Get-ExpectedNvidiaDisplayCount {
+    $count = 0
+
+    try {
+        $pnpDevices = @(
+            Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.FriendlyName -like '*NVIDIA*' -and
+                $_.Status -ne 'Error'
+            }
+        )
+
+        if ($pnpDevices.Count -gt 0) {
+            $count = $pnpDevices.Count
+        }
+    }
+    catch {
+        $count = 0
+    }
+
+    if ($count -le 0) {
+        try {
+            $controllers = @(
+                Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Name -like '*NVIDIA*'
+                }
+            )
+
+            if ($controllers.Count -gt 0) {
+                $count = $controllers.Count
+            }
+        }
+        catch {
+            $count = 0
+        }
+    }
+
+    return $count
+}
+
+function Wait-NvidiaGpusReady {
+    param(
+        [int]$ExpectedCount = 1,
+        [int]$TimeoutSeconds = 300
+    )
+
+    if ($ExpectedCount -lt 1) {
+        $ExpectedCount = 1
+    }
+
+    Write-Host "Waiting for NVIDIA GPUs. Expected count: $ExpectedCount" -ForegroundColor DarkGray
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $stableHits = 0
+    $lastCount = -1
+    $lastLines = @()
+
+    while ((Get-Date) -lt $deadline) {
+        $lines = @(Get-NvidiaGpuLines)
+        $count = $lines.Count
+
+        if ($count -eq $lastCount -and $count -ge $ExpectedCount) {
+            $stableHits++
+        }
+        else {
+            $stableHits = 0
+        }
+
+        $lastCount = $count
+        $lastLines = $lines
+
+        if ($stableHits -ge 3) {
+            Write-Host "NVIDIA GPUs ready: $($lines -join '; ')" -ForegroundColor Green
+            return $lines
+        }
+
+        Write-Host "NVIDIA GPUs visible now: $count. Waiting..." -ForegroundColor DarkGray
+        Start-Sleep -Seconds 10
+    }
+
+    Write-Warning "NVIDIA GPUs were not fully ready within timeout. Last visible count: $($lastLines.Count)"
+    if ($lastLines.Count -gt 0) {
+        Write-Warning "Last NVIDIA list: $($lastLines -join '; ')"
+    }
+
+    return $lastLines
+}
+
 function Start-FurMarkConsole {
     param(
         [Parameter(Mandatory)] [int]$DurationSeconds,
@@ -234,7 +364,7 @@ function Start-FurMarkConsole {
     $params = @(
         '--demo furmark-vk',
         '--width 1920',
-        '--height 1060',
+        '--height 1080',
         "--max-time $DurationSeconds",
         '--no-score-box',
         '--disable-demo-options',
@@ -364,7 +494,46 @@ try {
     if ($durationMin -le 0) { throw "Invalid duration: $durationMin" }
 
     $totalSeconds = $durationMin * 60
-    $gpuCount = if ($tests -contains 'GPU2') { 2 } else { 1 }
+    $requestedGpuCount = 1
+
+    if ($tests -contains 'GPU2') {
+        $requestedGpuCount = 2
+    }
+
+    $expectedGpuCount = Get-ExpectedNvidiaDisplayCount
+
+    if ($expectedGpuCount -lt $requestedGpuCount) {
+        $expectedGpuCount = $requestedGpuCount
+    }
+
+    Write-Host "Requested GPU count: $requestedGpuCount" -ForegroundColor DarkGray
+    Write-Host "Expected NVIDIA GPU count from system: $expectedGpuCount" -ForegroundColor DarkGray
+
+    $nvidiaGpuLines = @(Wait-NvidiaGpusReady -ExpectedCount $expectedGpuCount -TimeoutSeconds 300)
+    $detectedGpuCount = $nvidiaGpuLines.Count
+
+    if ($detectedGpuCount -ge 2) {
+        $gpuCount = $detectedGpuCount
+    }
+    elseif ($expectedGpuCount -ge 2) {
+        $gpuCount = 2
+    }
+    elseif ($requestedGpuCount -ge 2) {
+        $gpuCount = 2
+    }
+    elseif ($detectedGpuCount -ge 1) {
+        $gpuCount = $detectedGpuCount
+    }
+    else {
+        $gpuCount = 1
+    }
+
+    Write-Host "Final FurMark GPU count: $gpuCount" -ForegroundColor Green
+
+    if ($nvidiaGpuLines.Count -gt 0) {
+        Write-Host "NVIDIA GPUs for FurMark: $($nvidiaGpuLines -join '; ')" -ForegroundColor Gray
+    }
+
     $fioDrives = @($tests | Where-Object { $_ -match '^[A-Za-z]$' } | ForEach-Object { $_.ToUpper() })
 
     Write-Host '========================================' -ForegroundColor Cyan
