@@ -359,38 +359,76 @@ function Start-FurMarkConsole {
     }
 
     $number = $GpuIndex + 1
-    $baseTitle = "IPDROM_FURMARK_$number"
+    $baseTitle = "IPDROM_FURMARK_GPU$GpuIndex"
+    $logDir = Join-Path $env:ProgramData 'IPDROM\Logs'
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
-    $params = @(
-        '--demo furmark-vk',
-        '--width 1920',
-        '--height 1080',
-        "--max-time $DurationSeconds",
+    $gpuLog = Join-Path $logDir "furmark_gpu$GpuIndex.log"
+
+    $furmarkArgs = @(
+        '--demo', 'furmark-vk',
+        '--width', '1920',
+        '--height', '1080',
+        '--max-time', "$DurationSeconds",
         '--no-score-box',
         '--disable-demo-options',
-        "--gpu-index $GpuIndex"
+        '--gpu-index', "$GpuIndex"
     )
+
+    $furmarkCommand = "`"$script:FurMarkFullPath`" $($furmarkArgs -join ' ')"
+
+    Write-Host "Starting FurMark GPU $GpuIndex" -ForegroundColor Yellow
+    Write-Host "Command: $furmarkCommand" -ForegroundColor DarkGray
 
     $cmdLine = @(
         "title ${baseTitle}_RUNNING",
-        "echo Starting FurMark for GPU $GpuIndex...",
-        "`"$script:FurMarkFullPath`" $($params -join ' ')",
+        "echo ========================================",
+        "echo IPDROM FurMark GPU $GpuIndex",
+        "echo Started: %DATE% %TIME%",
+        "echo Command: $furmarkCommand",
+        "echo ========================================",
+        "echo.",
+        "echo Checking NVIDIA state before FurMark...",
+        "nvidia-smi",
+        "echo.",
+        $furmarkCommand,
         'set "IPDROM_RC=!ERRORLEVEL!"',
-        'echo.',
-        'echo ========================================',
-        'echo FurMark test completed!',
-        'echo Exit code: !IPDROM_RC!',
-        'echo ========================================',
+        "echo.",
+        "echo Checking NVIDIA state after FurMark...",
+        "nvidia-smi",
+        "echo.",
+        "echo ========================================",
+        "echo FurMark GPU $GpuIndex completed",
+        "echo Exit code: !IPDROM_RC!",
+        "echo Finished: %DATE% %TIME%",
+        "echo ========================================",
         "title ${baseTitle}_FINAL",
-        'pause > nul'
+        "pause > nul"
     ) -join ' & '
 
-    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/v:on', '/k', $cmdLine) -WindowStyle Normal -PassThru
+    $wrappedCmd = "/v:on /k `"$cmdLine`""
 
-    return [pscustomobject]@{
-        Process    = $proc
-        TitleToken = $baseTitle
-        GpuIndex   = $GpuIndex
+    try {
+        $proc = Start-Process -FilePath 'cmd.exe' `
+                              -ArgumentList $wrappedCmd `
+                              -WindowStyle Normal `
+                              -PassThru `
+                              -ErrorAction Stop
+
+        "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Started FurMark GPU $GpuIndex. PID=$($proc.Id)" | Out-File -FilePath $gpuLog -Encoding UTF8 -Append
+        "Command: $furmarkCommand" | Out-File -FilePath $gpuLog -Encoding UTF8 -Append
+
+        return [pscustomobject]@{
+            Process    = $proc
+            TitleToken = $baseTitle
+            GpuIndex   = $GpuIndex
+            LogPath    = $gpuLog
+        }
+    }
+    catch {
+        "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] FAILED to start FurMark GPU $GpuIndex. Error: $_" | Out-File -FilePath $gpuLog -Encoding UTF8 -Append
+        Write-Warning "Failed to start FurMark GPU $GpuIndex. Error: $_"
+        return $null
     }
 }
 
@@ -570,7 +608,6 @@ try {
         if ($aidaEndsAt -gt $latestEnd) { $latestEnd = $aidaEndsAt }
         Write-Host "AIDA64 started (PID: $($aidaProcess.Id))" -ForegroundColor Green
 
-        # Дать AIDA64 нормально открыть окно перед запуском FurMark
         if ($totalSeconds -gt 180) {
             Start-Sleep -Seconds 120
         } else {
@@ -588,14 +625,9 @@ try {
                 $furMarkLaunches += $launch
                 Write-Host "FurMark console started (PID: $($launch.Process.Id), GPU: $gpu, Token: $($launch.TitleToken))" -ForegroundColor Green
             }
-            # Пауза 30 сек между инстанциями FurMark.
-            # Подтверждено тестом: --gpu-index 1 работает (GPU 1: 100%), но если запускать
-            # вторую инстанцию слишком быстро — краш exit -1073741819 (0xC0000005) из-за
-            # конфликта Vulkan-инициализации пока первая инстанция ещё захватывает ресурсы.
-            # Проб-тест (8 сек) частично прогревает контекст, 30 сек паузы гарантируют стабильность.
             if ($gpu -lt ($gpuCount - 1)) {
-                Write-Host "Waiting 30 sec before starting next FurMark instance (Vulkan init buffer)..." -ForegroundColor DarkGray
-                Start-Sleep -Seconds 30
+                Write-Host "Waiting 120 sec before starting next FurMark instance (Vulkan init buffer)..." -ForegroundColor DarkGray
+                Start-Sleep -Seconds 120
             }
         }
 
