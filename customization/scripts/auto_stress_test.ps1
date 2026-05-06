@@ -608,17 +608,32 @@ catch {
 }
 
 Write-ColorOutput '[4/7] Starting stress test...' 'Yellow'
-$psExe = if (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { 'pwsh.exe' } else { 'powershell.exe' }
+
+$psCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+if ($psCmd -and $psCmd.Source) {
+    $psExe = $psCmd.Source
+} else {
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+}
+
 $argumentList = @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
     '-File', $testScript,
     '-UsbRoot', $usbRoot
 ) + $testArgs
-$process = Start-Process -FilePath $psExe -ArgumentList $argumentList -Wait -NoNewWindow -PassThru
 
-if ($process.ExitCode -ne 0) {
-    Write-ColorOutput "  Test finished with exit code $($process.ExitCode)" 'Yellow'
+Write-ColorOutput "  PowerShell engine: $psExe" 'Gray'
+Write-ColorOutput "  Test script: $testScript" 'Gray'
+Write-ColorOutput "  Full command: `"$psExe`" $($argumentList -join ' ')" 'Gray'
+
+& $psExe @argumentList
+
+$testExitCode = $LASTEXITCODE
+
+if ($testExitCode -ne 0) {
+    Write-ColorOutput "  Test finished with exit code $testExitCode" 'Red'
+    throw "Stress test child script failed with exit code $testExitCode"
 } else {
     Write-ColorOutput '  Test completed successfully' 'Green'
 }
