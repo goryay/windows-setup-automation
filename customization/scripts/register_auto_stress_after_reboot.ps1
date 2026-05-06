@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$InstallRoot,
-    [int]$DurationMinutes = 720
+    [int]$DurationMinutes = 30
 )
 
 $ErrorActionPreference = 'Stop'

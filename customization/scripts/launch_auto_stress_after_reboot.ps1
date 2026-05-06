@@ -1,5 +1,5 @@
 param(
-    [int]$DurationMinutes = 720
+    [int]$DurationMinutes = 30
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,11 +75,11 @@ for ($i = 0; $i -lt $maxWaitSeconds; $i++) {
     Start-Sleep -Seconds 1
 }
 if ($ready) {
-    Write-LauncherLog 'Explorer detected. Waiting extra 20 seconds before stress test.'
-    Start-Sleep -Seconds 20
+    Write-LauncherLog 'Explorer detected. Waiting extra 120 seconds before stress test.'
+    Start-Sleep -Seconds 120
 } else {
-    Write-LauncherLog 'Explorer not detected within timeout. Waiting fallback 30 seconds.'
-    Start-Sleep -Seconds 30
+    Write-LauncherLog 'Explorer not detected within timeout. Waiting fallback 130 seconds.'
+    Start-Sleep -Seconds 130
 }
 
 $installRoot = Get-InstallRoot
