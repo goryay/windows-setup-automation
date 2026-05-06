@@ -3,7 +3,7 @@
     Automatic stress test (AIDA64 + FurMark + FIO)
 #>
 param(
-    [int]$DurationMinutes = 720
+    [int]$DurationMinutes = 30
 )
 
 $ErrorActionPreference = 'Stop'
@@ -100,23 +100,108 @@ if (-not (Test-Path $testScript)) {
 }
 Write-ColorOutput "Test folder: $testFolder" 'Green'
 
+function Get-NvidiaSmiPath {
+    $candidates = @(
+        "$env:WINDIR\System32\nvidia-smi.exe",
+        "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+    )
+
+    foreach ($path in $candidates) {
+        if (Test-Path -LiteralPath $path) {
+            return $path
+        }
+    }
+
+    $cmd = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) {
+        return $cmd.Source
+    }
+
+    return $null
+}
+
+function Get-NvidiaGpuLines {
+    $smi = Get-NvidiaSmiPath
+    if (-not $smi) {
+        return @()
+    }
+
+    try {
+        return @(& $smi --query-gpu=index,name --format=csv,noheader 2>$null | Where-Object {
+            $_ -and $_.Trim()
+        })
+    } catch {
+        return @()
+    }
+}
+
+function Wait-NvidiaGpusReady {
+    param(
+        [int]$ExpectedCount = 1,
+        [int]$TimeoutSeconds = 300
+    )
+
+    Write-ColorOutput "  Waiting for NVIDIA GPUs via nvidia-smi, expected: $ExpectedCount" 'Gray'
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $stableCount = 0
+    $lastCount = -1
+    $lastLines = @()
+
+    while ((Get-Date) -lt $deadline) {
+        $lines = @(Get-NvidiaGpuLines)
+        $count = $lines.Count
+
+        if ($count -eq $lastCount -and $count -ge $ExpectedCount) {
+            $stableCount++
+        } else {
+            $stableCount = 0
+        }
+
+        $lastCount = $count
+        $lastLines = $lines
+
+        if ($stableCount -ge 3) {
+            Write-ColorOutput "  NVIDIA GPUs ready: $($lines -join '; ')" 'Green'
+            return $lines
+        }
+
+        Write-ColorOutput "  NVIDIA GPUs currently visible: $count. Waiting..." 'Gray'
+        Start-Sleep -Seconds 10
+    }
+
+    Write-Warning "  NVIDIA GPUs were not fully ready within timeout. Last visible count: $($lastLines.Count)"
+    return $lastLines
+}
+
 Write-ColorOutput '[2/7] Detecting configuration...' 'Yellow'
+
 $allControllers = Get-CimInstance Win32_VideoController
 Write-ColorOutput "  Found video controllers: $($allControllers.Name -join ', ')" 'Gray'
 
-$discreteGpuCount = 0
-$nvidiaSmi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+$pnpNvidia = @(Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Where-Object {
+    $_.FriendlyName -like '*NVIDIA*'
+})
 
-if ($nvidiaSmi) {
-    try {
-        $gpuLines = @(& $nvidiaSmi.Source --query-gpu=index,name --format=csv,noheader 2>$null | Where-Object { $_.Trim() })
-        if ($gpuLines.Count -gt 0) {
-            $discreteGpuCount = $gpuLines.Count
-            Write-ColorOutput "  NVIDIA GPUs via nvidia-smi: $($gpuLines -join '; ')" 'Gray'
-        }
-    } catch {
-        Write-Warning "  nvidia-smi detection failed: $_"
-    }
+$expectedNvidiaCount = $pnpNvidia.Count
+
+if ($expectedNvidiaCount -lt 1) {
+    $expectedNvidiaCount = @($allControllers | Where-Object {
+        $_.Name -like '*NVIDIA*'
+    }).Count
+}
+
+if ($expectedNvidiaCount -lt 1) {
+    $expectedNvidiaCount = 1
+}
+
+$gpuLines = @(Wait-NvidiaGpusReady -ExpectedCount $expectedNvidiaCount -TimeoutSeconds 300)
+
+$discreteGpuCount = 0
+
+if ($gpuLines.Count -gt 0) {
+    $discreteGpuCount = $gpuLines.Count
+    Write-ColorOutput "  NVIDIA GPUs via nvidia-smi: $($gpuLines -join '; ')" 'Gray'
 }
 
 if ($discreteGpuCount -eq 0) {
@@ -130,6 +215,7 @@ if ($discreteGpuCount -eq 0) {
         $_.Name -notlike '*AMD Radeon(TM) Graphics*' -and
         $_.Name -notlike '*AMD Radeon Graphics*'
     })
+
     $discreteGpuCount = $discreteControllers.Count
 }
 
