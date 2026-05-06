@@ -67,6 +67,340 @@ function Send-ArchiveToServer {
     }
 }
 
+function Write-RaidLog {
+    param([string]$Message)
+
+    $logDir = Join-Path $env:ProgramData 'IPDROM\Logs'
+    New-Item -ItemType Directory -Path $logDir -Force -ErrorAction SilentlyContinue | Out-Null
+
+    $logFile = Join-Path $logDir 'mega_raid_prepare.log'
+    $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+    $line | Out-File -FilePath $logFile -Encoding UTF8 -Append
+}
+
+function Get-FreeDriveLetter {
+    $used = @(
+        Get-Volume -ErrorAction SilentlyContinue |
+        Where-Object { $_.DriveLetter } |
+        ForEach-Object { $_.DriveLetter.ToString().ToUpper() }
+    )
+
+    $preferred = @('R','S','T','U','V','W','Y','Z','D','E','F','G','H','I','J','K','L','M','N','O','P','Q')
+
+    foreach ($letter in $preferred) {
+        if ($used -notcontains $letter) {
+            return $letter
+        }
+    }
+
+    throw 'No free drive letters available.'
+}
+
+function Find-StorCliPath {
+    param([Parameter(Mandatory)][string]$UsbRoot)
+
+    $programFilesX86 = ${env:ProgramFiles(x86)}
+
+    $candidates = @(
+        (Join-Path $UsbRoot 'SoftForTest\StorCLI\storcli64.exe'),
+        (Join-Path $UsbRoot 'SoftForTest\storcli\storcli64.exe'),
+        (Join-Path $UsbRoot 'software\AvagoMegaRaid\StorCLI\storcli64.exe'),
+        (Join-Path $UsbRoot 'software\AvagoMegaRaid\storcli64.exe'),
+        (Join-Path $env:ProgramFiles 'Broadcom\StorCLI\storcli64.exe'),
+        (Join-Path $env:ProgramFiles 'MegaRAID Storage Manager\StorCLI\storcli64.exe')
+    )
+
+    if ($programFilesX86) {
+        $candidates += (Join-Path $programFilesX86 'MegaRAID Storage Manager\StorCLI\storcli64.exe')
+        $candidates += (Join-Path $programFilesX86 'MegaRAID Storage Manager\StorCLI\storcli.exe')
+    }
+
+    foreach ($path in $candidates) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            return $path
+        }
+    }
+
+    return $null
+}
+
+function Install-MegaRaidDriverIfPresent {
+    param([Parameter(Mandatory)][string]$UsbRoot)
+
+    $driverDirs = @(
+        (Join-Path $UsbRoot 'software\DriverAvagoMegaRaid'),
+        (Join-Path $UsbRoot 'drivers\common\megaraid'),
+        (Join-Path $UsbRoot 'drivers\common\lsi'),
+        (Join-Path $UsbRoot 'drivers\common\avago'),
+        (Join-Path $UsbRoot 'drivers\common\broadcom')
+    )
+
+    foreach ($dir in $driverDirs) {
+        if (-not (Test-Path -LiteralPath $dir)) {
+            continue
+        }
+
+        $infFiles = @(Get-ChildItem -Path $dir -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
+        if ($infFiles.Count -eq 0) {
+            Write-RaidLog "Driver folder exists, but INF not found: $dir"
+            continue
+        }
+
+        Write-ColorOutput "  Installing MegaRAID driver from: $dir" 'Gray'
+        Write-RaidLog "Installing MegaRAID driver from: $dir"
+
+        & pnputil.exe /add-driver "$dir\*.inf" /subdirs /install 2>&1 | ForEach-Object {
+            Write-RaidLog $_
+        }
+
+        Write-RaidLog "pnputil exit code: $LASTEXITCODE"
+    }
+}
+
+function Invoke-StorageRescan {
+    Write-ColorOutput '  Rescanning storage...' 'Gray'
+    Write-RaidLog 'Storage rescan started.'
+
+    try {
+        & pnputil.exe /scan-devices 2>&1 | ForEach-Object {
+            Write-RaidLog $_
+        }
+    } catch {
+        Write-RaidLog "pnputil /scan-devices failed: $_"
+    }
+
+    try {
+        Update-HostStorageCache -ErrorAction SilentlyContinue
+    } catch {
+        Write-RaidLog "Update-HostStorageCache failed: $_"
+    }
+
+    try {
+        $diskpartScript = Join-Path $env:TEMP 'ipdrom_diskpart_rescan.txt'
+        Set-Content -Path $diskpartScript -Value 'rescan' -Encoding ASCII
+        & diskpart.exe /s $diskpartScript 2>&1 | ForEach-Object {
+            Write-RaidLog $_
+        }
+        Remove-Item $diskpartScript -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-RaidLog "diskpart rescan failed: $_"
+    }
+
+    Start-Sleep -Seconds 5
+}
+
+function Test-IsMegaRaidLikeDisk {
+    param([Parameter(Mandatory)]$Disk)
+
+    $text = @(
+        $Disk.FriendlyName,
+        $Disk.Manufacturer,
+        $Disk.Model,
+        $Disk.Location,
+        $Disk.SerialNumber,
+        $Disk.BusType
+    ) -join ' '
+
+    if ($text -match '(?i)avago|lsi|broadcom|megaraid|mega raid|raid|virtual|sas') {
+        return $true
+    }
+
+    if ($Disk.BusType.ToString() -in @('RAID', 'SAS', 'SCSI')) {
+        return $true
+    }
+
+    return $false
+}
+
+function Get-MegaRaidVirtualDriveState {
+    param([string]$StorCliPath)
+
+    if (-not $StorCliPath) {
+        Write-RaidLog 'StorCLI not found. Skipping controller-level check.'
+        return $false
+    }
+
+    Write-ColorOutput "  StorCLI found: $StorCliPath" 'Gray'
+    Write-RaidLog "StorCLI found: $StorCliPath"
+
+    try {
+        Write-RaidLog 'Running: storcli /call show'
+        $controllers = & $StorCliPath '/call' 'show' 2>&1 | Out-String
+        Write-RaidLog $controllers
+
+        Write-RaidLog 'Running: storcli /call/vall show all'
+        $virtualDrives = & $StorCliPath '/call/vall' 'show' 'all' 2>&1 | Out-String
+        Write-RaidLog $virtualDrives
+
+        if ($virtualDrives -match '(?i)RAID|Virtual Drive|VD LIST|Optimal|Optl|Dgrd|Degraded') {
+            Write-ColorOutput '  MegaRAID virtual drive detected by StorCLI.' 'Green'
+            Write-RaidLog 'MegaRAID virtual drive detected by StorCLI.'
+            return $true
+        }
+
+        Write-RaidLog 'StorCLI did not report virtual drives.'
+        return $false
+    } catch {
+        Write-RaidLog "StorCLI check failed: $_"
+        return $false
+    }
+}
+
+function Ensure-DataDiskHasDriveLetter {
+    param(
+        [Parameter(Mandatory)]$Disk,
+        [bool]$AllowCreatePartition
+    )
+
+    Write-RaidLog "Preparing disk Number=$($Disk.Number), FriendlyName=$($Disk.FriendlyName), Size=$($Disk.Size), BusType=$($Disk.BusType), PartitionStyle=$($Disk.PartitionStyle), Offline=$($Disk.IsOffline), ReadOnly=$($Disk.IsReadOnly)"
+
+    try {
+        if ($Disk.IsOffline) {
+            Write-ColorOutput "  Disk $($Disk.Number) is Offline. Bringing Online..." 'Yellow'
+            Set-Disk -Number $Disk.Number -IsOffline $false -ErrorAction Stop
+        }
+
+        if ($Disk.IsReadOnly) {
+            Write-ColorOutput "  Disk $($Disk.Number) is ReadOnly. Clearing ReadOnly..." 'Yellow'
+            Set-Disk -Number $Disk.Number -IsReadOnly $false -ErrorAction Stop
+        }
+
+        $Disk = Get-Disk -Number $Disk.Number -ErrorAction Stop
+    } catch {
+        Write-RaidLog "Failed to bring disk online/writable: $_"
+        return @()
+    }
+
+    if ($Disk.PartitionStyle -eq 'RAW') {
+        if (-not $AllowCreatePartition) {
+            Write-RaidLog "Disk $($Disk.Number) is RAW, but auto-create is not allowed. Skipped."
+            return @()
+        }
+
+        try {
+            $letter = Get-FreeDriveLetter
+
+            Write-ColorOutput "  RAW RAID disk found. Initializing disk $($Disk.Number) as GPT, letter $letter`: ..." 'Yellow'
+            Write-RaidLog "Initializing RAW disk $($Disk.Number) as GPT, creating NTFS volume $letter`:"
+
+            Initialize-Disk -Number $Disk.Number -PartitionStyle GPT -ErrorAction Stop
+            $partition = New-Partition -DiskNumber $Disk.Number -UseMaximumSize -DriveLetter $letter -ErrorAction Stop
+            Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel 'IPDROM_RAID_TEST' -Confirm:$false -Force -ErrorAction Stop | Out-Null
+
+            Write-RaidLog "Disk $($Disk.Number) prepared as $letter`:"
+            return @($letter)
+        } catch {
+            Write-RaidLog "Failed to initialize/format disk $($Disk.Number): $_"
+            return @()
+        }
+    }
+
+    $letters = @()
+
+    try {
+        $partitions = @(
+            Get-Partition -DiskNumber $Disk.Number -ErrorAction Stop |
+            Where-Object {
+                $_.Type -notmatch 'Reserved|Recovery|System' -and
+                $_.Size -gt 1GB
+            } |
+            Sort-Object Size -Descending
+        )
+
+        foreach ($partition in $partitions) {
+            if ($partition.DriveLetter) {
+                $letters += $partition.DriveLetter.ToString().ToUpper()
+                continue
+            }
+
+            $letter = Get-FreeDriveLetter
+            Write-ColorOutput "  Assigning drive letter $letter`: to disk $($Disk.Number), partition $($partition.PartitionNumber)..." 'Yellow'
+            Write-RaidLog "Assigning drive letter $letter`: to disk $($Disk.Number), partition $($partition.PartitionNumber)"
+
+            Add-PartitionAccessPath -DiskNumber $Disk.Number -PartitionNumber $partition.PartitionNumber -DriveLetter $letter -ErrorAction Stop
+            $letters += $letter
+        }
+    } catch {
+        Write-RaidLog "Failed to process partitions on disk $($Disk.Number): $_"
+    }
+
+    return @($letters | Sort-Object -Unique)
+}
+
+function Get-FioTargetDriveLetters {
+    param(
+        [Parameter(Mandatory)][string]$UsbRoot,
+        [Parameter(Mandatory)][string]$SystemDriveLetter
+    )
+
+    Write-ColorOutput '  Preparing storage for FIO...' 'Yellow'
+    Write-RaidLog '========== Preparing storage for FIO =========='
+    Write-RaidLog "UsbRoot: $UsbRoot"
+    Write-RaidLog "SystemDriveLetter: $SystemDriveLetter"
+
+    Install-MegaRaidDriverIfPresent -UsbRoot $UsbRoot
+
+    $storCli = Find-StorCliPath -UsbRoot $UsbRoot
+    $megaRaidVdExists = Get-MegaRaidVirtualDriveState -StorCliPath $storCli
+
+    Invoke-StorageRescan
+
+    $candidateDisks = @(
+        Get-Disk -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.IsBoot -eq $false -and
+            $_.IsSystem -eq $false -and
+            $_.BusType.ToString() -notin @('USB', 'File Backed Virtual')
+        } |
+        Sort-Object Number
+    )
+
+    if ($candidateDisks.Count -eq 0) {
+        Write-ColorOutput '  No non-system disks found for FIO.' 'Yellow'
+        Write-RaidLog 'No non-system disks found for FIO.'
+        return @()
+    }
+
+    $preparedLetters = @()
+
+    foreach ($disk in $candidateDisks) {
+        $isMegaRaidLike = Test-IsMegaRaidLikeDisk -Disk $disk
+
+        $allowCreate = $false
+        if ($isMegaRaidLike) {
+            $allowCreate = $true
+        } elseif ($megaRaidVdExists -and $candidateDisks.Count -eq 1) {
+            $allowCreate = $true
+        }
+
+        $preparedLetters += Ensure-DataDiskHasDriveLetter -Disk $disk -AllowCreatePartition:$allowCreate
+    }
+
+    Invoke-StorageRescan
+
+    $finalLetters = @(
+        Get-Disk -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.IsBoot -eq $false -and
+            $_.IsSystem -eq $false -and
+            $_.OperationalStatus -eq 'Online' -and
+            $_.BusType.ToString() -notin @('USB', 'File Backed Virtual')
+        } |
+        Get-Partition -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.DriveLetter -and
+            $_.DriveLetter.ToString().ToUpper() -ne $SystemDriveLetter.ToUpper()
+        } |
+        ForEach-Object {
+            $_.DriveLetter.ToString().ToUpper()
+        } |
+        Sort-Object -Unique
+    )
+
+    Write-RaidLog "Final FIO drive letters: $($finalLetters -join ', ')"
+    return @($finalLetters)
+}
+
 if (-not (Test-IsAdmin)) {
     Write-ColorOutput 'Run as administrator!' 'Red'
     exit 1
@@ -222,12 +556,16 @@ if ($discreteGpuCount -eq 0) {
 Write-ColorOutput "  Discrete GPUs: $discreteGpuCount" 'Gray'
 
 $systemDrive = $env:SystemDrive[0]
-$additionalDrives = Get-Disk | Where-Object {
-    $_.IsBoot -eq $false -and
-    $_.OperationalStatus -eq 'Online' -and
-    $_.BusType -notin @('USB', 'File Backed Virtual')
-} | Get-Partition | Where-Object { $_.DriveLetter -and $_.DriveLetter -ne $systemDrive }
-$driveLetters = @($additionalDrives | ForEach-Object { $_.DriveLetter })
+
+$driveLetters = @(
+    Get-FioTargetDriveLetters -UsbRoot $usbRoot -SystemDriveLetter $systemDrive
+)
+
+if ($driveLetters.Count -gt 0) {
+    Write-ColorOutput "  FIO target drives: $($driveLetters -join ', ')" 'Green'
+} else {
+    Write-ColorOutput "  FIO target drives not found. RAID may be visible in BIOS/StorCLI but not exposed to Windows." 'Yellow'
+}
 Write-ColorOutput "  Additional drives: $($driveLetters -join ', ')" 'Gray'
 
 $testArgs = @('AIDA')
