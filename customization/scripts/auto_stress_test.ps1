@@ -627,9 +627,13 @@ Write-ColorOutput "  PowerShell engine: $psExe" 'Gray'
 Write-ColorOutput "  Test script: $testScript" 'Gray'
 Write-ColorOutput "  Full command: `"$psExe`" $($argumentList -join ' ')" 'Gray'
 
-& $psExe @argumentList
-
-$testExitCode = $LASTEXITCODE
+try {
+    & $psExe @argumentList
+    $testExitCode = $LASTEXITCODE
+}
+finally {
+    Unregister-ScheduledTask -TaskName $watchdogTaskName -Confirm:$false -ErrorAction SilentlyContinue
+}
 
 if ($testExitCode -ne 0) {
     Write-ColorOutput "  Test finished with exit code $testExitCode" 'Red'
@@ -684,8 +688,6 @@ if (Test-Path $baseDir) {
 } else {
     Write-Warning "  Results folder not found: $baseDir"
 }
-
-
 
 Write-ColorOutput '[6.5/7] Creating full system backup...' 'Yellow'
 $backupScript = Join-Path $scriptDir 'Create-FullBackup.ps1'
