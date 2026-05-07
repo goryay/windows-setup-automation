@@ -410,7 +410,7 @@ function Start-FurMarkConsole {
 
     try {
         $proc = Start-Process -FilePath 'cmd.exe' `
-                              -ArgumentList $wrappedCmd `
+                              -ArgumentList @('/v:on', '/k', $cmdLine) `
                               -WindowStyle Normal `
                               -PassThru `
                               -ErrorAction Stop
@@ -600,42 +600,57 @@ try {
     }
 
     if ($tests -contains 'AIDA') {
-        Write-Host 'Starting AIDA64...' -ForegroundColor Yellow
-        $aidaStartedAt = Get-Date
-        $includeGPU = -not $furMarkAvailable
-        $aidaProcess = Start-AidaTest -DurationMinutes $durationMin -IncludeGPU $includeGPU
-        $aidaEndsAt = $aidaStartedAt.AddSeconds($totalSeconds)
-        if ($aidaEndsAt -gt $latestEnd) { $latestEnd = $aidaEndsAt }
-        Write-Host "AIDA64 started (PID: $($aidaProcess.Id))" -ForegroundColor Green
+		Write-Host 'Starting AIDA64...' -ForegroundColor Yellow
+		$aidaStartedAt = Get-Date
+		$includeGPU = -not $furMarkAvailable
+		$aidaProcess = Start-AidaTest -DurationMinutes $durationMin -IncludeGPU $includeGPU
+		$aidaEndsAt = $aidaStartedAt.AddSeconds($totalSeconds)
 
-        if ($totalSeconds -gt 180) {
-            Start-Sleep -Seconds 120
-        } else {
-            Start-Sleep -Seconds 20
-        }
-    }
+		if ($aidaEndsAt -gt $latestEnd) {
+        $latestEnd = $aidaEndsAt
+		}
+
+		Write-Host "AIDA64 started (PID: $($aidaProcess.Id))" -ForegroundColor Green
+
+		Write-Host "Waiting 20 sec before FurMark start..." -ForegroundColor DarkGray
+		Start-Sleep -Seconds 20
+	}
 
     if ($furMarkAvailable) {
-        Write-Host 'Starting FurMark...' -ForegroundColor Yellow
-        $furStartedAt = Get-Date
+		Write-Host 'Starting FurMark...' -ForegroundColor Yellow
+		$furStartedAt = Get-Date
 
-        for ($gpu = 0; $gpu -lt $gpuCount; $gpu++) {
-            $launch = Start-FurMarkConsole -DurationSeconds $totalSeconds -GpuIndex $gpu
-            if ($launch) {
-                $furMarkLaunches += $launch
-                Write-Host "FurMark console started (PID: $($launch.Process.Id), GPU: $gpu, Token: $($launch.TitleToken))" -ForegroundColor Green
-            }
-            if ($gpu -lt ($gpuCount - 1)) {
-                Write-Host "Waiting 120 sec before starting next FurMark instance (Vulkan init buffer)..." -ForegroundColor DarkGray
-                Start-Sleep -Seconds 120
-            }
-        }
+		for ($gpu = 0; $gpu -lt $gpuCount; $gpu++) {
+			Write-Host "Launching FurMark instance for GPU $gpu of $($gpuCount - 1)..." -ForegroundColor Yellow
 
-        if ($furMarkLaunches.Count -gt 0) {
-            $furEndsAt = $furStartedAt.AddSeconds($totalSeconds + 20)
-            if ($furEndsAt -gt $latestEnd) { $latestEnd = $furEndsAt }
-        }
-    }
+			$launch = Start-FurMarkConsole -DurationSeconds $totalSeconds -GpuIndex $gpu
+
+			if ($launch) {
+				$furMarkLaunches += $launch
+				Write-Host "FurMark console started (PID: $($launch.Process.Id), GPU: $gpu, Token: $($launch.TitleToken))" -ForegroundColor Green
+			} else {
+				Write-Warning "FurMark GPU $gpu was not started."
+			}
+
+			if ($gpu -lt ($gpuCount - 1)) {
+				Write-Host "Waiting 5 sec before starting next FurMark GPU..." -ForegroundColor DarkGray
+				Start-Sleep -Seconds 5
+			}
+		}
+
+		Write-Host "FurMark launch summary: started $($furMarkLaunches.Count) of $gpuCount instance(s)." -ForegroundColor Cyan
+
+		if ($furMarkAvailable -and $gpuCount -ge 2 -and $furMarkLaunches.Count -lt 2) {
+			Write-Warning "Two GPUs were expected, but less than two FurMark instances were started."
+		}
+
+		if ($furMarkLaunches.Count -gt 0) {
+			$furEndsAt = $furStartedAt.AddSeconds($totalSeconds + 20)
+			if ($furEndsAt -gt $latestEnd) {
+				$latestEnd = $furEndsAt
+			}
+		}
+	}
 
     if ($tests -contains 'FIO') {
         if ($fioDrives.Count -eq 0) {
