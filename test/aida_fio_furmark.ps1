@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+    Stable async launch with robust GPU detection.
+    Screenshots via screen.ps1, reports unchanged.
+#>
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$UsbRoot,
@@ -5,17 +10,14 @@ param(
     [string[]]$TestArgs
 )
 
-Push-Location -LiteralPath $PSScriptRoot
-$script:__popOnExit = $true
 $ErrorActionPreference = 'Stop'
 
+# ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====================
 function Get-PowerShellEngine {
     $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
     if ($pwsh -and $pwsh.Source) { return $pwsh.Source }
-
     $powershell = Get-Command powershell.exe -ErrorAction SilentlyContinue
     if ($powershell -and $powershell.Source) { return $powershell.Source }
-
     throw 'PowerShell engine not found.'
 }
 
@@ -32,7 +34,6 @@ function Invoke-PowerShellFile {
 
     $engine = Get-PowerShellEngine
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $FilePath) + $ExtraArguments
-
     $style = if ($Hidden) { 'Hidden' } else { 'Normal' }
     $proc = Start-Process -FilePath $engine -ArgumentList $argList -WindowStyle $style -Wait -PassThru
 
@@ -41,151 +42,12 @@ function Invoke-PowerShellFile {
     }
 }
 
-function Start-ScreenCapture {
-    param(
-        [Parameter(Mandatory)]
-        [ValidateSet('AidaAuto','AidaFinal','FurMarkFinal','FioFinal','DesktopFinal')]
-        [string]$Mode
-    )
-
-    $screenScript = Join-Path $PSScriptRoot 'screen.ps1'
-    if (-not (Test-Path -LiteralPath $screenScript)) {
-        Write-Warning "screen.ps1 not found: $screenScript. Screenshot skipped: $Mode"
-        return
-    }
-
-    try {
-        Invoke-PowerShellFile -FilePath $screenScript -ExtraArguments @('-Mode', $Mode) -Hidden
-        Write-Host "Screenshot done: $Mode" -ForegroundColor Green
-    }
-    catch {
-        Write-Warning "Screenshot failed: $Mode. Error: $_"
-    }
-}
-
-function Sleep-UntilMoment {
-    param(
-        [Parameter(Mandatory)] [datetime]$Moment,
-        [string]$Label = 'wait'
-    )
-
-    $remain = [int][Math]::Ceiling(($Moment - (Get-Date)).TotalSeconds)
-    if ($remain -gt 0) {
-        Write-Host "Waiting $remain sec for $Label..." -ForegroundColor DarkGray
-        Start-Sleep -Seconds $remain
-    }
-}
-
-function Wait-ForProcessNamesToExit {
-    param(
-        [Parameter(Mandatory)] [string[]]$ProcessNames,
-        [int]$TimeoutSec = 180,
-        [string]$Label = 'processes'
-    )
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    do {
-        $alive = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $ProcessNames -contains $_.ProcessName })
-        if ($alive.Count -eq 0) {
-            Write-Host "$Label finished." -ForegroundColor Green
-            return $true
-        }
-        Start-Sleep -Seconds 2
-    } while ((Get-Date) -lt $deadline)
-
-    Write-Warning "$Label still running after $TimeoutSec sec"
-    return $false
-}
-
-function Wait-ForFinalCmdWindows {
-    param(
-        [Parameter(Mandatory)] [string]$Token,
-        [Parameter(Mandatory)] [int]$ExpectedCount,
-        [int]$TimeoutSec = 180,
-        [string]$Label = 'console final state'
-    )
-
-    if ($ExpectedCount -le 0) { return $true }
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    do {
-        $found = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-            $_.ProcessName -ieq 'cmd' -and
-            $_.MainWindowHandle -ne 0 -and
-            $_.MainWindowTitle -and
-            $_.MainWindowTitle -like "*$Token*" -and
-            $_.MainWindowTitle -like '*_FINAL*'
-        })
-
-        if ($found.Count -ge $ExpectedCount) {
-            Write-Host "$Label ready ($($found.Count)/$ExpectedCount)." -ForegroundColor Green
-            Start-Sleep -Seconds 3
-            return $true
-        }
-
-        Start-Sleep -Seconds 2
-    } while ((Get-Date) -lt $deadline)
-
-    Write-Warning "$Label not ready after $TimeoutSec sec"
-    return $false
-}
-
-function Find-FioExecutable {
-    param([Parameter(Mandatory)] [string]$Root)
-
-    $candidates = @(
-        'C:\Program Files\fio\fio.exe',
-        'C:\Program Files (x86)\fio\fio.exe',
-        (Join-Path $Root 'SoftForTest\fio\fio.exe'),
-        (Join-Path $Root 'SoftForTest\FIO\fio.exe'),
-        (Join-Path $Root 'SoftForTest\fio\x64\fio.exe'),
-        (Join-Path $Root 'SoftForTest\FIO\x64\fio.exe')
-    )
-
-    foreach ($path in $candidates) {
-        if ($path -and (Test-Path -LiteralPath $path)) { return $path }
-    }
-
-    $softRoot = Join-Path $Root 'SoftForTest'
-    if (Test-Path -LiteralPath $softRoot) {
-        $found = Get-ChildItem -Path $softRoot -Filter 'fio.exe' -Recurse -File -ErrorAction SilentlyContinue |
-            Select-Object -First 1 -ExpandProperty FullName
-        if ($found) { return $found }
-    }
-
-    return $null
-}
-
-function Start-AidaTest {
-    param(
-        [Parameter(Mandatory)] [int]$DurationMinutes,
-        [bool]$IncludeGPU
-    )
-
-    if (-not (Test-Path -LiteralPath $script:Aida64FullPath)) {
-        throw "AIDA64 not found: $script:Aida64FullPath"
-    }
-
-    $targets = @('CPU','FPU','Cache','RAM','Disk')
-    if ($IncludeGPU) { $targets += 'GPU' }
-
-    $argList = @('/SST', ($targets -join ','), '/SSTDUR', "$DurationMinutes")
-    return Start-Process -FilePath $script:Aida64FullPath -ArgumentList $argList -PassThru
-}
-
 function Test-FurMarkGpuAvailable {
-    <#
-    .SYNOPSIS
-        Быстрая проверка: может ли FurMark запустить рендеринг на указанном GPU.
-        Запускает FurMark с --max-time 8, ждёт завершения и проверяет exit code.
-        Exit 0 = GPU доступен. Любой другой код (особ. -1073741819 = 0xC0000005) = недоступен.
-    #>
-    param(
-        [Parameter(Mandatory)] [int]$GpuIndex
-    )
+    param([Parameter(Mandatory)] [int]$GpuIndex)
 
-    Write-Host "  Probing GPU $GpuIndex availability (8-sec FurMark test)..." -ForegroundColor DarkGray
+    if (-not (Test-Path $script:FurMarkFullPath)) { return $false }
 
+    Write-Host "  Checking GPU $GpuIndex (8 sec FurMark probe)..." -ForegroundColor DarkGray
     $probeArgs = @(
         '--demo', 'furmark-vk',
         '--width', '1920',
@@ -197,18 +59,12 @@ function Test-FurMarkGpuAvailable {
     )
 
     try {
-        $proc = Start-Process -FilePath $script:FurMarkFullPath `
-                              -ArgumentList $probeArgs `
-                              -WindowStyle Hidden `
-                              -Wait -PassThru `
-                              -ErrorAction Stop
-
+        $proc = Start-Process -FilePath $script:FurMarkFullPath -ArgumentList $probeArgs -WindowStyle Hidden -Wait -PassThru
         if ($proc.ExitCode -eq 0) {
-            Write-Host "  GPU $GpuIndex probe: OK (exit 0)" -ForegroundColor Green
+            Write-Host "  GPU $GpuIndex available (exit 0)" -ForegroundColor Green
             return $true
         } else {
-            Write-Warning "  GPU $GpuIndex probe FAILED (exit $($proc.ExitCode)). This GPU will be skipped."
-            Write-Warning "  Exit -1073741819 (0xC0000005) = Access Violation: GPU likely has no display output or Vulkan surface unavailable."
+            Write-Warning "  GPU $GpuIndex NOT available (exit $($proc.ExitCode)). Will be skipped."
             return $false
         }
     } catch {
@@ -217,251 +73,107 @@ function Test-FurMarkGpuAvailable {
     }
 }
 
-function Get-NvidiaSmiPath {
-    $candidates = @(
-        "$env:WINDIR\System32\nvidia-smi.exe",
-        "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
-        "${env:ProgramFiles(x86)}\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
-    )
-
-    foreach ($path in $candidates) {
-        if ($path -and (Test-Path -LiteralPath $path)) {
-            return $path
-        }
-    }
-
-    $cmd = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source) {
-        return $cmd.Source
-    }
-
-    return $null
-}
-
-function Get-NvidiaGpuLines {
-    $smi = Get-NvidiaSmiPath
-
-    if (-not $smi) {
-        return @()
-    }
-
-    try {
-        $lines = @(
-            & $smi --query-gpu=index,name --format=csv,noheader 2>$null |
-            Where-Object { $_ -and $_.Trim() }
-        )
-
-        return $lines
-    }
-    catch {
-        return @()
+function Close-ProcessByName {
+    param([string]$name, [int]$waitSeconds = 10)
+    $p = Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $p) { return }
+    try { if ($p.MainWindowHandle -ne 0) { $null = $p.CloseMainWindow() } } catch {}
+    try { $p | Wait-Process -Timeout $waitSeconds -ErrorAction SilentlyContinue } catch {}
+    if (Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1) {
+        Stop-Process -Name $name -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
     }
 }
 
-function Get-ExpectedNvidiaDisplayCount {
-    $count = 0
+# ===================== ПУТИ =====================
+if (-not $UsbRoot) { $UsbRoot = [System.IO.Path]::GetPathRoot($PSScriptRoot) }
+$script:Aida64FullPath  = Join-Path $UsbRoot 'SoftForTest\AIDA64\AIDA64Port.exe'
+$script:FurMarkFullPath = Join-Path $UsbRoot 'SoftForTest\FurMark\furmark.exe'
+$script:FioFullPath     = 'C:\Program Files\fio\fio.exe'
 
-    try {
-        $pnpDevices = @(
-            Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.FriendlyName -like '*NVIDIA*' -and
-                $_.Status -ne 'Error'
-            }
-        )
+$screenScript = Join-Path $PSScriptRoot 'screen.ps1'   # <-- ваш screen.ps1
 
-        if ($pnpDevices.Count -gt 0) {
-            $count = $pnpDevices.Count
-        }
-    }
-    catch {
-        $count = 0
-    }
-
-    if ($count -le 0) {
-        try {
-            $controllers = @(
-                Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $_.Name -like '*NVIDIA*'
-                }
-            )
-
-            if ($controllers.Count -gt 0) {
-                $count = $controllers.Count
-            }
-        }
-        catch {
-            $count = 0
-        }
-    }
-
-    return $count
+# ===================== РАЗБОР АРГУМЕНТОВ =====================
+if (-not $TestArgs -or $TestArgs.Count -lt 2) {
+    Write-Host 'Not enough arguments. Example: .\aida_fio_furmark.ps1 AIDA FURMARK GPU2 FIO D 10'
+    exit 1
 }
 
-function Wait-NvidiaGpusReady {
-    param(
-        [int]$ExpectedCount = 1,
-        [int]$TimeoutSeconds = 300
-    )
+$tests = @($TestArgs[0..($TestArgs.Count - 2)])
+$durationMin = [int]([double]$TestArgs[-1])
+if ($durationMin -le 0) { throw "Invalid duration: $durationMin min" }
 
-    if ($ExpectedCount -lt 1) {
-        $ExpectedCount = 1
-    }
+$hours = $durationMin / 60
+$totalSeconds = [int][Math]::Round($hours * 3600)
 
-    Write-Host "Waiting for NVIDIA GPUs. Expected count: $ExpectedCount" -ForegroundColor DarkGray
+$requestedGpuCount = 1
+if ($tests -contains 'GPU2') { $requestedGpuCount = 2 }
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    $stableHits = 0
-    $lastCount = -1
-    $lastLines = @()
+$fioDrives = @($tests | Where-Object { $_ -match '^[A-Za-z]$' } | ForEach-Object { $_.ToUpper() })
 
-    while ((Get-Date) -lt $deadline) {
-        $lines = @(Get-NvidiaGpuLines)
-        $count = $lines.Count
-
-        if ($count -eq $lastCount -and $count -ge $ExpectedCount) {
-            $stableHits++
+# ===================== ПРОВЕРКА GPU =====================
+$usableGpus = @()
+if ($tests -contains 'FURMARK') {
+    Write-Host "Probing GPUs for FurMark..." -ForegroundColor Yellow
+    for ($gpu = 0; $gpu -lt $requestedGpuCount; $gpu++) {
+        if (Test-FurMarkGpuAvailable -GpuIndex $gpu) {
+            $usableGpus += $gpu
         }
-        else {
-            $stableHits = 0
-        }
-
-        $lastCount = $count
-        $lastLines = $lines
-
-        if ($stableHits -ge 3) {
-            Write-Host "NVIDIA GPUs ready: $($lines -join '; ')" -ForegroundColor Green
-            return $lines
-        }
-
-        Write-Host "NVIDIA GPUs visible now: $count. Waiting..." -ForegroundColor DarkGray
-        Start-Sleep -Seconds 10
     }
-
-    Write-Warning "NVIDIA GPUs were not fully ready within timeout. Last visible count: $($lastLines.Count)"
-    if ($lastLines.Count -gt 0) {
-        Write-Warning "Last NVIDIA list: $($lastLines -join '; ')"
+    if ($usableGpus.Count -eq 0) {
+        Write-Warning "No working GPUs found. FurMark will be skipped."
+    } else {
+        Write-Host "Usable GPUs: $($usableGpus -join ', ')" -ForegroundColor Green
     }
+}
 
-    return $lastLines
+# ===================== ФУНКЦИИ ЗАПУСКА (как в старой версии, с токенами _FINAL для screen.ps1) =====================
+function Start-AidaTest {
+    param([double]$hours, [bool]$includeGPU)
+    if (-not (Test-Path $script:Aida64FullPath)) { throw "AIDA64 not found: $script:Aida64FullPath" }
+
+    $minutes = [Math]::Round($hours * 60)
+    $gpu = if ($includeGPU) { ",GPU" } else { "" }
+    $params = @("/SST CPU,FPU,Cache,RAM,Disk$gpu", "/SSTDUR $minutes")
+    $cmdLine = "`"$script:Aida64FullPath`" $($params -join ' ')"
+
+    Write-Host "Starting AIDA64..."
+    $proc = Start-Process -FilePath "cmd.exe" -ArgumentList @("/k", "$cmdLine") -PassThru
+    return $proc
 }
 
 function Start-FurMarkConsole {
-    param(
-        [Parameter(Mandatory)] [int]$DurationSeconds,
-        [Parameter(Mandatory)] [int]$GpuIndex
-    )
+    param([int]$DurationSeconds, [int]$GpuIndex)
+    if (-not (Test-Path $script:FurMarkFullPath)) { return $null }
 
-    if (-not (Test-Path -LiteralPath $script:FurMarkFullPath)) {
-        Write-Warning "FurMark not found: $script:FurMarkFullPath. FurMark skipped."
-        return $null
-    }
-
-    $number = $GpuIndex + 1
-    $baseTitle = "IPDROM_FURMARK_GPU$GpuIndex"
-    $logDir = Join-Path $env:ProgramData 'IPDROM\Logs'
-    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-
-    $gpuLog = Join-Path $logDir "furmark_gpu$GpuIndex.log"
-
-    $furmarkArgs = @(
-        '--demo', 'furmark-vk',
-        '--width', '1920',
-        '--height', '1080',
-        '--max-time', "$DurationSeconds",
-        '--no-score-box',
-        '--disable-demo-options',
-        '--gpu-index', "$GpuIndex"
-    )
-
-    $furmarkCommand = "`"$script:FurMarkFullPath`" $($furmarkArgs -join ' ')"
-
-    Write-Host "Starting FurMark GPU $GpuIndex" -ForegroundColor Yellow
-    Write-Host "Command: $furmarkCommand" -ForegroundColor DarkGray
-
+    $baseTitle = "IPDROM_FURMARK_GPU${GpuIndex}"
     $cmdLine = @(
         "title ${baseTitle}_RUNNING",
-        "echo ========================================",
-        "echo IPDROM FurMark GPU $GpuIndex",
-        "echo Started: %DATE% %TIME%",
-        "echo Command: $furmarkCommand",
-        "echo ========================================",
-        "echo.",
-        "echo Checking NVIDIA state before FurMark...",
-        "nvidia-smi",
-        "echo.",
-        $furmarkCommand,
-        'set "IPDROM_RC=!ERRORLEVEL!"',
-        "echo.",
-        "echo Checking NVIDIA state after FurMark...",
-        "nvidia-smi",
+        "echo Starting FurMark GPU $GpuIndex...",
+        "`"$script:FurMarkFullPath`" --demo furmark-vk --width 1920 --height 1080 --max-time $DurationSeconds --no-score-box --disable-demo-options --gpu-index=$GpuIndex",
+        'set IPDROM_RC=!ERRORLEVEL!',
         "echo.",
         "echo ========================================",
-        "echo FurMark GPU $GpuIndex completed",
-        "echo Exit code: !IPDROM_RC!",
-        "echo Finished: %DATE% %TIME%",
+        "echo FurMark GPU $GpuIndex completed (exit !IPDROM_RC!)",
         "echo ========================================",
         "title ${baseTitle}_FINAL",
         "pause > nul"
     ) -join ' & '
 
-    $wrappedCmd = "/v:on /k `"$cmdLine`""
-
-    try {
-        $proc = Start-Process -FilePath 'cmd.exe' `
-                              -ArgumentList @('/v:on', '/k', $cmdLine) `
-                              -WindowStyle Normal `
-                              -PassThru `
-                              -ErrorAction Stop
-
-        "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Started FurMark GPU $GpuIndex. PID=$($proc.Id)" | Out-File -FilePath $gpuLog -Encoding UTF8 -Append
-        "Command: $furmarkCommand" | Out-File -FilePath $gpuLog -Encoding UTF8 -Append
-
-        return [pscustomobject]@{
-            Process    = $proc
-            TitleToken = $baseTitle
-            GpuIndex   = $GpuIndex
-            LogPath    = $gpuLog
-        }
-    }
-    catch {
-        "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] FAILED to start FurMark GPU $GpuIndex. Error: $_" | Out-File -FilePath $gpuLog -Encoding UTF8 -Append
-        Write-Warning "Failed to start FurMark GPU $GpuIndex. Error: $_"
-        return $null
-    }
+    Write-Host "Launching FurMark GPU $GpuIndex"
+    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/v:on', '/k', $cmdLine) -WindowStyle Normal -PassThru
+    return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; GpuIndex = $GpuIndex }
 }
 
 function Start-FioConsole {
-    param(
-        [Parameter(Mandatory)] [string]$DriveLetter,
-        [Parameter(Mandatory)] [int]$DurationSeconds
-    )
-
-    if (-not $script:FioFullPath) {
-        Write-Warning 'FIO executable not found. FIO skipped.'
-        return $null
-    }
+    param([string]$DriveLetter, [int]$DurationSeconds)
+    if (-not $script:FioFullPath) { return $null }
 
     $DriveLetter = $DriveLetter.Trim().TrimEnd(':').ToUpper()
-    if ($DriveLetter -notmatch '^[A-Z]$') {
-        Write-Warning "Invalid FIO drive letter: $DriveLetter"
-        return $null
-    }
-
-    $driveRoot = "${DriveLetter}:\"
-    if (-not (Test-Path -LiteralPath $driveRoot)) {
-        Write-Warning "Drive does not exist: $driveRoot"
-        return $null
-    }
-
     $testDir = "${DriveLetter}:\fio_tests"
-    if (-not (Test-Path -LiteralPath $testDir)) {
-        New-Item -ItemType Directory -Path $testDir -Force | Out-Null
-    }
-
-    $testFile = Join-Path $testDir ("ipdrom_fio_test_{0}.tmp" -f ([guid]::NewGuid().ToString('N')))
-    $jobFile = Join-Path $env:TEMP ("ipdrom_fio_{0}_{1}.fio" -f $DriveLetter, ([guid]::NewGuid().ToString('N')))
+    New-Item -ItemType Directory -Path $testDir -Force | Out-Null
+    $testFile = Join-Path $testDir "fio_test_$(New-Guid).dat"
+    $jobFile = Join-Path $env:TEMP "fio_job_$(New-Guid).fio"
 
     $jobContent = @"
 [global]
@@ -482,299 +194,148 @@ numjobs=14
 bs=896k
 rw=rw
 "@
-
     Set-Content -Path $jobFile -Value $jobContent -Encoding ASCII
 
-    $baseTitle = "IPDROM_FIO_$DriveLetter"
+    $baseTitle = "IPDROM_FIO_${DriveLetter}"
     $cmdLine = @(
         "title ${baseTitle}_RUNNING",
-        "echo Starting FIO test for drive $DriveLetter...",
-        'echo Please wait...',
+        "echo Starting FIO on drive $DriveLetter...",
         "`"$script:FioFullPath`" `"$jobFile`"",
-        'set "IPDROM_RC=!ERRORLEVEL!"',
-        'echo.',
-        'echo ========================================',
-        'echo FIO test completed!',
-        'echo Exit code: !IPDROM_RC!',
-        'echo ========================================',
+        'set IPDROM_RC=!ERRORLEVEL!',
+        "echo.",
+        "echo ========================================",
+        "echo FIO $DriveLetter completed (exit !IPDROM_RC!)",
+        "echo ========================================",
         "title ${baseTitle}_FINAL",
-        'pause > nul'
+        "pause > nul"
     ) -join ' & '
 
+    Write-Host "Launching FIO on $DriveLetter"
     $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/v:on', '/k', $cmdLine) -WindowStyle Normal -PassThru
+    return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; Drive = $DriveLetter; JobFile = $jobFile }
+}
 
-    return [pscustomobject]@{
-        Process    = $proc
-        TitleToken = $baseTitle
-        Drive      = $DriveLetter
-        JobFile    = $jobFile
+# ===================== ЗАПУСК ТЕСТОВ =====================
+$aidaProcess = $null
+$furmarkStarted = @()
+$fioStarted = @()
+
+if ($tests -contains 'AIDA') {
+    $aidaStartTime = Get-Date
+    $includeGPU = -not ($tests -contains 'FURMARK')
+    $aidaProcess = Start-AidaTest -hours $hours -includeGPU $includeGPU
+    Write-Host "AIDA64 started (PID: $($aidaProcess.Id))"
+    Start-Sleep -Seconds 20
+}
+
+if ($tests -contains 'FURMARK' -and $usableGpus.Count -gt 0) {
+    Write-Host "Starting FurMark for GPUs: $($usableGpus -join ', ')"
+    foreach ($gpu in $usableGpus) {
+        $launch = Start-FurMarkConsole -DurationSeconds $totalSeconds -GpuIndex $gpu
+        if ($launch) {
+            $furmarkStarted += $launch
+            Start-Sleep -Seconds 3
+        }
     }
 }
 
-try {
-    if (-not $UsbRoot) {
-        $UsbRoot = [System.IO.Path]::GetPathRoot($PSScriptRoot)
-    }
-    if (-not $UsbRoot) { $UsbRoot = 'D:\' }
-
-    $script:Aida64FullPath  = Join-Path $UsbRoot 'SoftForTest\AIDA64\AIDA64Port.exe'
-    $script:FurMarkFullPath = Join-Path $UsbRoot 'SoftForTest\FurMark\furmark.exe'
-    $script:FioFullPath     = Find-FioExecutable -Root $UsbRoot
-
-    if (-not $TestArgs -or $TestArgs.Count -lt 2) {
-        Write-Host 'No test arguments provided.' -ForegroundColor Yellow
-        Write-Host 'Example: .\aida_fio_furmark6.ps1 AIDA FURMARK GPU2 FIO D 10' -ForegroundColor Yellow
-        exit 1
-    }
-
-    $tests = @($TestArgs[0..($TestArgs.Count - 2)])
-    $durationMin = [int]([double]$TestArgs[-1])
-    if ($durationMin -le 0) { throw "Invalid duration: $durationMin" }
-
-    $totalSeconds = $durationMin * 60
-    $requestedGpuCount = 1
-
-    if ($tests -contains 'GPU2') {
-        $requestedGpuCount = 2
-    }
-
-    $expectedGpuCount = Get-ExpectedNvidiaDisplayCount
-
-    if ($expectedGpuCount -lt $requestedGpuCount) {
-        $expectedGpuCount = $requestedGpuCount
-    }
-
-    Write-Host "Requested GPU count: $requestedGpuCount" -ForegroundColor DarkGray
-    Write-Host "Expected NVIDIA GPU count from system: $expectedGpuCount" -ForegroundColor DarkGray
-
-    $nvidiaGpuLines = @(Wait-NvidiaGpusReady -ExpectedCount $expectedGpuCount -TimeoutSeconds 300)
-    $detectedGpuCount = $nvidiaGpuLines.Count
-
-    if ($detectedGpuCount -ge 2) {
-        $gpuCount = $detectedGpuCount
-    }
-    elseif ($expectedGpuCount -ge 2) {
-        $gpuCount = 2
-    }
-    elseif ($requestedGpuCount -ge 2) {
-        $gpuCount = 2
-    }
-    elseif ($detectedGpuCount -ge 1) {
-        $gpuCount = $detectedGpuCount
-    }
-    else {
-        $gpuCount = 1
-    }
-
-    Write-Host "Final FurMark GPU count: $gpuCount" -ForegroundColor Green
-
-    if ($nvidiaGpuLines.Count -gt 0) {
-        Write-Host "NVIDIA GPUs for FurMark: $($nvidiaGpuLines -join '; ')" -ForegroundColor Gray
-    }
-
-    $fioDrives = @($tests | Where-Object { $_ -match '^[A-Za-z]$' } | ForEach-Object { $_.ToUpper() })
-
-    Write-Host '========================================' -ForegroundColor Cyan
-    Write-Host 'STARTING TESTS' -ForegroundColor Cyan
-    Write-Host '========================================' -ForegroundColor Cyan
-    Write-Host "USB root:   $UsbRoot" -ForegroundColor DarkGray
-    Write-Host "AIDA64:     $script:Aida64FullPath" -ForegroundColor DarkGray
-    Write-Host "FurMark:    $script:FurMarkFullPath" -ForegroundColor DarkGray
-    Write-Host "FIO:        $(if ($script:FioFullPath) { $script:FioFullPath } else { 'NOT FOUND' })" -ForegroundColor DarkGray
-    Write-Host "Tests:      $($tests -join ', ')" -ForegroundColor Gray
-    Write-Host "Duration:   $durationMin min" -ForegroundColor Gray
-
-    $latestEnd = Get-Date
-    $aidaStartedAt = $null
-    $aidaEndsAt = $null
-    $aidaProcess = $null
-    $furMarkLaunches = @()
-    $fioLaunches = @()
-
-    $furMarkRequested = $tests -contains 'FURMARK'
-    $furMarkAvailable = $furMarkRequested -and (Test-Path -LiteralPath $script:FurMarkFullPath)
-
-    if ($furMarkRequested -and -not $furMarkAvailable) {
-        Write-Warning "FurMark requested but executable not found: $script:FurMarkFullPath"
-        Write-Host 'AIDA64 will keep GPU stress enabled because FurMark is unavailable.' -ForegroundColor Yellow
-    }
-
-    if ($tests -contains 'AIDA') {
-		Write-Host 'Starting AIDA64...' -ForegroundColor Yellow
-		$aidaStartedAt = Get-Date
-		$includeGPU = -not $furMarkAvailable
-		$aidaProcess = Start-AidaTest -DurationMinutes $durationMin -IncludeGPU $includeGPU
-		$aidaEndsAt = $aidaStartedAt.AddSeconds($totalSeconds)
-
-		if ($aidaEndsAt -gt $latestEnd) {
-        $latestEnd = $aidaEndsAt
-		}
-
-		Write-Host "AIDA64 started (PID: $($aidaProcess.Id))" -ForegroundColor Green
-
-		Write-Host "Waiting 20 sec before FurMark start..." -ForegroundColor DarkGray
-		Start-Sleep -Seconds 20
-	}
-
-    if ($furMarkAvailable) {
-		Write-Host 'Starting FurMark...' -ForegroundColor Yellow
-		$furStartedAt = Get-Date
-
-		for ($gpu = 0; $gpu -lt $gpuCount; $gpu++) {
-			Write-Host "Launching FurMark instance for GPU $gpu of $($gpuCount - 1)..." -ForegroundColor Yellow
-
-			$launch = Start-FurMarkConsole -DurationSeconds $totalSeconds -GpuIndex $gpu
-
-			if ($launch) {
-				$furMarkLaunches += $launch
-				Write-Host "FurMark console started (PID: $($launch.Process.Id), GPU: $gpu, Token: $($launch.TitleToken))" -ForegroundColor Green
-			} else {
-				Write-Warning "FurMark GPU $gpu was not started."
-			}
-
-			if ($gpu -lt ($gpuCount - 1)) {
-				Write-Host "Waiting 5 sec before starting next FurMark GPU..." -ForegroundColor DarkGray
-				Start-Sleep -Seconds 5
-			}
-		}
-
-		Write-Host "FurMark launch summary: started $($furMarkLaunches.Count) of $gpuCount instance(s)." -ForegroundColor Cyan
-
-		if ($furMarkAvailable -and $gpuCount -ge 2 -and $furMarkLaunches.Count -lt 2) {
-			Write-Warning "Two GPUs were expected, but less than two FurMark instances were started."
-		}
-
-		if ($furMarkLaunches.Count -gt 0) {
-			$furEndsAt = $furStartedAt.AddSeconds($totalSeconds + 20)
-			if ($furEndsAt -gt $latestEnd) {
-				$latestEnd = $furEndsAt
-			}
-		}
-	}
-
-    if ($tests -contains 'FIO') {
-        if ($fioDrives.Count -eq 0) {
-            Write-Warning 'FIO requested, but no drive letters were provided. Example: FIO D 10'
-        } else {
-            Write-Host "Starting FIO for drives: $($fioDrives -join ', ')" -ForegroundColor Yellow
-            $fioStartedAt = Get-Date
-
-            foreach ($drive in $fioDrives) {
-                $launch = Start-FioConsole -DriveLetter $drive -DurationSeconds $totalSeconds
-                if ($launch) {
-                    $fioLaunches += $launch
-                    Write-Host "FIO console started (PID: $($launch.Process.Id), Drive: $drive, Token: $($launch.TitleToken))" -ForegroundColor Green
-                }
+if ($tests -contains 'FIO') {
+    if ($fioDrives.Count -eq 0) {
+        Write-Warning "FIO requested but no drives specified."
+    } else {
+        Write-Host "Starting FIO for drives: $($fioDrives -join ', ')"
+        foreach ($drive in $fioDrives) {
+            $launch = Start-FioConsole -DriveLetter $drive -DurationSeconds $totalSeconds
+            if ($launch) {
+                $fioStarted += $launch
                 Start-Sleep -Seconds 3
             }
-
-            if ($fioLaunches.Count -gt 0) {
-                $fioEndsAt = $fioStartedAt.AddSeconds($totalSeconds + 20)
-                if ($fioEndsAt -gt $latestEnd) { $latestEnd = $fioEndsAt }
-            }
         }
     }
+}
 
-    if ($aidaStartedAt) {
-        $autoShotAt = if ($totalSeconds -gt 300) {
-            $aidaEndsAt.AddSeconds(-300)
-        } else {
-            $aidaStartedAt.AddSeconds([Math]::Max($totalSeconds - 30, 15))
-        }
+# ===================== ОЖИДАНИЕ ОКОНЧАНИЯ ТЕСТОВ =====================
+Write-Host "Waiting for tests to finish (~${durationMin} min)..."
+$waitExtra = 30
+Start-Sleep -Seconds ($totalSeconds + $waitExtra)
 
-        if ($autoShotAt -lt $aidaEndsAt) {
-            Sleep-UntilMoment -Moment $autoShotAt -Label 'AIDA64 auto screenshot'
-            Write-Host 'Taking AIDA64 auto screenshot...' -ForegroundColor Yellow
-            Start-ScreenCapture -Mode 'AidaAuto'
-        }
-    }
+# Даём окнам время переключиться в _FINAL (если ещё не)
+if ($furmarkStarted.Count -gt 0 -or $fioStarted.Count -gt 0) {
+    Write-Host "Giving console windows a few seconds to finalize..."
+    Start-Sleep -Seconds 10
+}
 
-    Sleep-UntilMoment -Moment $latestEnd -Label 'expected test completion'
-
-    if ($furMarkLaunches.Count -gt 0) {
-        Write-Host 'Waiting for FurMark renderer to finish...' -ForegroundColor Yellow
-        Wait-ForProcessNamesToExit -ProcessNames @('furmark','furmark_gui') -TimeoutSec 180 -Label 'FurMark renderer' | Out-Null
-
-        Write-Host 'Waiting for FurMark final console text...' -ForegroundColor Yellow
-        Wait-ForFinalCmdWindows -Token 'IPDROM_FURMARK_' -ExpectedCount $furMarkLaunches.Count -TimeoutSec 180 -Label 'FurMark final console' | Out-Null
-
-        Write-Host 'Capturing FurMark final console(s)...' -ForegroundColor Yellow
-        Start-ScreenCapture -Mode 'FurMarkFinal'
-    } elseif ($furMarkRequested) {
-        Write-Host 'FurMark was skipped. No FurMark final screenshots will be taken.' -ForegroundColor Yellow
-    }
-
-    if (($tests -contains 'FIO') -and $fioLaunches.Count -gt 0) {
-        Write-Host 'Waiting for FIO worker(s) to finish...' -ForegroundColor Yellow
-        Wait-ForProcessNamesToExit -ProcessNames @('fio') -TimeoutSec 180 -Label 'FIO workers' | Out-Null
-
-        Write-Host 'Waiting for FIO final console text...' -ForegroundColor Yellow
-        Wait-ForFinalCmdWindows -Token 'IPDROM_FIO_' -ExpectedCount $fioLaunches.Count -TimeoutSec 180 -Label 'FIO final console' | Out-Null
-
-        Write-Host 'Capturing FIO final console(s)...' -ForegroundColor Yellow
-        Start-ScreenCapture -Mode 'FioFinal'
-    }
-
-    if ($aidaStartedAt) {
-        Write-Host 'Capturing final AIDA64 window...' -ForegroundColor Yellow
-        Start-ScreenCapture -Mode 'AidaFinal'
-    }
-
-    Write-Host 'Taking final desktop screenshot...' -ForegroundColor Yellow
-    Start-ScreenCapture -Mode 'DesktopFinal'
-
-    Write-Host "`n========================================" -ForegroundColor Cyan
-    Write-Host 'GENERATING REPORTS' -ForegroundColor Cyan
-    Write-Host '========================================' -ForegroundColor Cyan
-
-    $computerName = $env:COMPUTERNAME
-    $desktop = [Environment]::GetFolderPath('Desktop')
-    $baseDir = Join-Path $desktop $computerName
-    $reportsDir = Join-Path $baseDir 'Reports'
-    New-Item -ItemType Directory -Force -Path $reportsDir | Out-Null
-
-    Get-Process -Name 'AIDA64Port','aida64','AIDA64BusinessPortable' -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 5
-
-    if (Test-Path -LiteralPath $script:Aida64FullPath) {
-        $reportPath = Join-Path $reportsDir 'SystemReport.html'
-        Write-Host 'Generating AIDA64 report...' -ForegroundColor Yellow
-        Start-Process -FilePath $script:Aida64FullPath -ArgumentList @('/R', $reportPath, '/ALL', '/SUM', '/HW', '/SW', '/AUDIT', '/HTML') -Wait -NoNewWindow
-
-        if (Test-Path -LiteralPath $reportPath) {
-            Write-Host "AIDA64 report: $reportPath" -ForegroundColor Green
-        } else {
-            Write-Warning "AIDA64 report was not created: $reportPath"
-        }
-    } else {
-        Write-Warning "AIDA64 report skipped. AIDA64 not found: $script:Aida64FullPath"
-    }
-
-    $smartScript = Join-Path $PSScriptRoot 'smart.ps1'
-    if (Test-Path -LiteralPath $smartScript) {
-        Write-Host 'Generating SMART disk report...' -ForegroundColor Yellow
+# ===================== СКРИНШОТЫ ЧЕРЕЗ SCREEN.PS1 =====================
+$invokeScreen = {
+    param([string]$Mode)
+    if (Test-Path $screenScript) {
         try {
-            Invoke-PowerShellFile -FilePath $smartScript -ExtraArguments @('-ComputerName', $computerName, '-OutputFolder', $reportsDir, '-NoPause')
-            Write-Host 'SMART disk report generated.' -ForegroundColor Green
+            Invoke-PowerShellFile -FilePath $screenScript -ExtraArguments @('-Mode', $Mode) -Hidden
+            Write-Host "Screenshot $Mode completed." -ForegroundColor Green
         } catch {
-            Write-Warning "SMART disk report failed: $_"
+            Write-Warning "Screenshot $Mode failed: $_"
         }
     } else {
-        Write-Warning "smart.ps1 not found: $smartScript"
+        Write-Warning "screen.ps1 not found at $screenScript"
     }
+}
 
-    Write-Host 'Testing completed' -ForegroundColor Green
-    exit 0
+# AIDA auto screenshot (за 5 минут до конца, если длительность > 5 мин)
+if ($tests -contains 'AIDA' -and $totalSeconds -gt 300) {
+    $autoShotDelay = $totalSeconds - 300
+    if ($autoShotDelay -gt 0) {
+        Write-Host "Waiting $autoShotDelay sec before AidaAuto screenshot..."
+        Start-Sleep -Seconds $autoShotDelay
+        & $invokeScreen 'AidaAuto'
+        # возвращаем оставшееся время
+        $remaining = $totalSeconds - $autoShotDelay
+        if ($remaining -gt 0) { Start-Sleep -Seconds $remaining }
+    }
+} else {
+    # Для коротких тестов просто ждали всё время выше
 }
-catch {
-    Write-Host ''
-    Write-Host '========================================' -ForegroundColor Red
-    Write-Host 'TEST SCRIPT FAILED' -ForegroundColor Red
-    Write-Host '========================================' -ForegroundColor Red
-    Write-Host $_ -ForegroundColor Red
-    exit 1
+
+# Финальные скриншоты
+if ($tests -contains 'AIDA') {
+    & $invokeScreen 'AidaFinal'
 }
-finally {
-    if ($script:__popOnExit) { Pop-Location }
+
+if ($furmarkStarted.Count -gt 0) {
+    & $invokeScreen 'FurMarkFinal'
+    # Закрываем окна FurMark после скриншотов
+    Get-Process -Name 'furmark' -ErrorAction SilentlyContinue | Stop-Process -Force
 }
+
+if ($fioStarted.Count -gt 0) {
+    & $invokeScreen 'FioFinal'
+}
+
+& $invokeScreen 'DesktopFinal'
+
+# ===================== ОТЧЁТ AIDA64 =====================
+Write-Host "Generating AIDA64 report..."
+Close-ProcessByName -name "AIDA64Port" -waitSeconds 20
+Close-ProcessByName -name "aida64" -waitSeconds 5
+
+if (Test-Path $script:Aida64FullPath) {
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $computerName = $env:COMPUTERNAME
+    $reportsDir = Join-Path (Join-Path $desktop $computerName) 'Reports'
+    New-Item -ItemType Directory -Force -Path $reportsDir | Out-Null
+    $reportPath = Join-Path $reportsDir 'SystemReport.html'
+
+    Start-Process -FilePath $script:Aida64FullPath -ArgumentList @(
+        '/R', $reportPath,
+        '/ALL', '/SUM', '/HW', '/SW', '/AUDIT', '/HTML'
+    ) -Wait -NoNewWindow
+
+    if (Test-Path $reportPath) {
+        Write-Host "Report saved to $reportPath" -ForegroundColor Green
+    } else {
+        Write-Warning "Failed to generate AIDA64 report."
+    }
+} else {
+    Write-Warning "AIDA64 not found, report skipped."
+}
+
+Write-Host "Testing completed." -ForegroundColor Green
