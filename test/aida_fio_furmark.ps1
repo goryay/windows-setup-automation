@@ -254,20 +254,10 @@ if ($tests -contains 'FIO') {
     }
 }
 
-# ===================== ОЖИДАНИЕ ОКОНЧАНИЯ ТЕСТОВ =====================
-Write-Host "Waiting for tests to finish (~${durationMin} min)..."
-$waitExtra = 30
-Start-Sleep -Seconds ($totalSeconds + $waitExtra)
-
-# Даём окнам время переключиться в _FINAL (если ещё не)
-if ($furmarkStarted.Count -gt 0 -or $fioStarted.Count -gt 0) {
-    Write-Host "Giving console windows a few seconds to finalize..."
-    Start-Sleep -Seconds 10
-}
-
 # ===================== СКРИНШОТЫ ЧЕРЕЗ SCREEN.PS1 =====================
 $invokeScreen = {
     param([string]$Mode)
+
     if (Test-Path $screenScript) {
         try {
             Invoke-PowerShellFile -FilePath $screenScript -ExtraArguments @('-Mode', $Mode) -Hidden
@@ -280,19 +270,27 @@ $invokeScreen = {
     }
 }
 
-# AIDA auto screenshot (за 5 минут до конца, если длительность > 5 мин)
+# ===================== ОЖИДАНИЕ ОКОНЧАНИЯ ТЕСТОВ =====================
+Write-Host "Waiting for tests to finish (~${durationMin} min)..."
+
 if ($tests -contains 'AIDA' -and $totalSeconds -gt 300) {
     $autoShotDelay = $totalSeconds - 300
-    if ($autoShotDelay -gt 0) {
-        Write-Host "Waiting $autoShotDelay sec before AidaAuto screenshot..."
-        Start-Sleep -Seconds $autoShotDelay
-        & $invokeScreen 'AidaAuto'
-        # возвращаем оставшееся время
-        $remaining = $totalSeconds - $autoShotDelay
-        if ($remaining -gt 0) { Start-Sleep -Seconds $remaining }
-    }
+
+    Write-Host "Waiting $autoShotDelay sec before AidaAuto screenshot..."
+    Start-Sleep -Seconds $autoShotDelay
+
+    & $invokeScreen 'AidaAuto'
+
+    Write-Host "Waiting remaining 300 sec..."
+    Start-Sleep -Seconds 300
 } else {
-    # Для коротких тестов просто ждали всё время выше
+    Start-Sleep -Seconds $totalSeconds
+}
+
+# Даём окнам время переключиться в _FINAL
+if ($furmarkStarted.Count -gt 0 -or $fioStarted.Count -gt 0) {
+    Write-Host "Giving console windows a few seconds to finalize..."
+    Start-Sleep -Seconds 10
 }
 
 # Финальные скриншоты

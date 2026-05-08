@@ -177,26 +177,33 @@ try {
     Remove-Item -LiteralPath $pendingFile -Force -ErrorAction SilentlyContinue
 
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $args = "-NoProfile -ExecutionPolicy Bypass -File `"$autoTestScript`" -DurationMinutes $DurationMinutes"
 
-    $proc = Start-Process -FilePath $psExe `
-        -ArgumentList $args `
-        -Wait `
-        -PassThru `
-        -NoNewWindow `
-        -RedirectStandardOutput $stdoutLog `
-        -RedirectStandardError $stderrLog
+    $childArgs = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $autoTestScript,
+        '-DurationMinutes', $DurationMinutes
+    )
 
-    Write-LauncherLog "auto_stress_test.ps1 finished with exit code $($proc.ExitCode)"
+    Write-LauncherLog "Starting auto_stress_test.ps1 in current console..."
 
-    if ($proc.ExitCode -eq 0) {
+    & $psExe @childArgs
+    $exitCode = $LASTEXITCODE
+
+    if ($null -eq $exitCode) {
+        $exitCode = 0
+    }
+
+    Write-LauncherLog "auto_stress_test.ps1 finished with exit code $exitCode"
+
+    if ($exitCode -eq 0) {
         (Get-Date).ToString('o') | Out-File -FilePath $finishedFile -Encoding ascii -Force
         Exit-Cleanly 0
     }
 
-    "Stress test failed with exit code $($proc.ExitCode) at $(Get-Date -Format 's')" | Out-File -FilePath $failedFile -Encoding utf8 -Force
-    Write-LauncherLog "ERROR: Stress test failed. See $stdoutLog and $stderrLog"
-    Exit-Cleanly $proc.ExitCode
+    "Stress test failed with exit code $exitCode at $(Get-Date -Format 's')" | Out-File -FilePath $failedFile -Encoding utf8 -Force
+    Write-LauncherLog "ERROR: Stress test failed with exit code $exitCode"
+    Exit-Cleanly $exitCode
 }
 catch {
     Write-LauncherLog "FATAL ERROR: $($_.Exception.Message)"
