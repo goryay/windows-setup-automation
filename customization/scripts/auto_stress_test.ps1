@@ -212,6 +212,88 @@ function Test-IsMegaRaidLikeDisk {
     return $false
 }
 
+function Invoke-StorCliSafe {
+    param(
+        [Parameter(Mandatory)] [string]$StorCliPath,
+        [Parameter(Mandatory)] [string[]]$Arguments,
+        [int]$TimeoutSeconds = 20
+    )
+
+    $outFile = Join-Path $env:TEMP ("storcli_out_{0}.txt" -f ([guid]::NewGuid().ToString('N')))
+    $errFile = Join-Path $env:TEMP ("storcli_err_{0}.txt" -f ([guid]::NewGuid().ToString('N')))
+
+    try {
+        Write-RaidLog ("Running StorCLI with timeout {0}s: {1} {2}" -f $TimeoutSeconds, $StorCliPath, ($Arguments -join ' '))
+        Write-ColorOutput ("  Running StorCLI: {0}" -f ($Arguments -join ' ')) 'Gray'
+
+        $proc = Start-Process -FilePath $StorCliPath `
+            -ArgumentList $Arguments `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput $outFile `
+            -RedirectStandardError $errFile
+
+        $finished = $proc.WaitForExit($TimeoutSeconds * 1000)
+
+        if (-not $finished) {
+            Write-ColorOutput "  StorCLI timeout after $TimeoutSeconds sec. Skipping StorCLI check." 'Yellow'
+            Write-RaidLog "StorCLI timeout. Killing process PID=$($proc.Id)"
+
+            try {
+                $proc.Kill()
+            } catch {
+                Write-RaidLog "Failed to kill StorCLI process: $_"
+            }
+
+            return [pscustomobject]@{
+                Success  = $false
+                TimedOut = $true
+                ExitCode = 9999
+                Output   = ''
+                Error    = "StorCLI timeout after $TimeoutSeconds sec"
+            }
+        }
+
+        $stdout = ''
+        $stderr = ''
+
+        if (Test-Path -LiteralPath $outFile) {
+            $stdout = Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue
+        }
+
+        if (Test-Path -LiteralPath $errFile) {
+            $stderr = Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue
+        }
+
+        Write-RaidLog "StorCLI exit code: $($proc.ExitCode)"
+        if ($stdout) { Write-RaidLog $stdout }
+        if ($stderr) { Write-RaidLog "STDERR: $stderr" }
+
+        return [pscustomobject]@{
+            Success  = ($proc.ExitCode -eq 0)
+            TimedOut = $false
+            ExitCode = $proc.ExitCode
+            Output   = $stdout
+            Error    = $stderr
+        }
+    }
+    catch {
+        Write-RaidLog "StorCLI failed: $_"
+
+        return [pscustomobject]@{
+            Success  = $false
+            TimedOut = $false
+            ExitCode = 1
+            Output   = ''
+            Error    = "$_"
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-MegaRaidVirtualDriveState {
     param([string]$StorCliPath)
 
@@ -223,27 +305,42 @@ function Get-MegaRaidVirtualDriveState {
     Write-ColorOutput "  StorCLI found: $StorCliPath" 'Gray'
     Write-RaidLog "StorCLI found: $StorCliPath"
 
-    try {
-        Write-RaidLog 'Running: storcli /call show'
-        $controllers = & $StorCliPath '/call' 'show' 2>&1 | Out-String
-        Write-RaidLog $controllers
+    $controllerResult = Invoke-StorCliSafe `
+        -StorCliPath $StorCliPath `
+        -Arguments @('/c0', 'show') `
+        -TimeoutSeconds 20
 
-        Write-RaidLog 'Running: storcli /call/vall show all'
-        $virtualDrives = & $StorCliPath '/call/vall' 'show' 'all' 2>&1 | Out-String
-        Write-RaidLog $virtualDrives
-
-        if ($virtualDrives -match '(?i)RAID|Virtual Drive|VD LIST|Optimal|Optl|Dgrd|Degraded') {
-            Write-ColorOutput '  MegaRAID virtual drive detected by StorCLI.' 'Green'
-            Write-RaidLog 'MegaRAID virtual drive detected by StorCLI.'
-            return $true
-        }
-
-        Write-RaidLog 'StorCLI did not report virtual drives.'
-        return $false
-    } catch {
-        Write-RaidLog "StorCLI check failed: $_"
+    if ($controllerResult.TimedOut) {
+        Write-RaidLog 'StorCLI /c0 show timed out. Continuing without controller-level RAID check.'
         return $false
     }
+
+    $vdResult = Invoke-StorCliSafe `
+        -StorCliPath $StorCliPath `
+        -Arguments @('/c0/vall', 'show', 'all') `
+        -TimeoutSeconds 20
+
+    if ($vdResult.TimedOut) {
+        Write-RaidLog 'StorCLI /c0/vall show all timed out. Continuing without controller-level RAID check.'
+        return $false
+    }
+
+    $allText = @(
+        $controllerResult.Output
+        $controllerResult.Error
+        $vdResult.Output
+        $vdResult.Error
+    ) -join "`n"
+
+    if ($allText -match '(?i)RAID|Virtual Drive|VD LIST|Optimal|Optl|Dgrd|Degraded') {
+        Write-ColorOutput '  MegaRAID virtual drive detected by StorCLI.' 'Green'
+        Write-RaidLog 'MegaRAID virtual drive detected by StorCLI.'
+        return $true
+    }
+
+    Write-ColorOutput '  StorCLI did not report virtual drives. Continuing with Windows disk detection.' 'Yellow'
+    Write-RaidLog 'StorCLI did not report virtual drives.'
+    return $false
 }
 
 function Ensure-DataDiskHasDriveLetter {
