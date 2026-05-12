@@ -47,6 +47,7 @@ function Test-FurMarkGpuAvailable {
 
     if (-not (Test-Path $script:FurMarkFullPath)) { return $false }
 
+    # Пауза перед probe каждой следующей GPU — FurMark освобождает Vulkan не мгновенно
     if ($GpuIndex -gt 0) {
         Write-Host "  Waiting 10s before probing GPU $GpuIndex (Vulkan context release)..." -ForegroundColor DarkGray
         Start-Sleep -Seconds 10
@@ -60,12 +61,11 @@ function Test-FurMarkGpuAvailable {
         '--max-time', '5',
         '--no-score-box',
         '--disable-demo-options',
-        "--gpu-index=$GpuIndex"
+        "--gpu-index", "$GpuIndex"
     )
 
     try {
-        $proc = Start-Process -FilePath $script:FurMarkFullPath `
-            -ArgumentList $probeArgs -WindowStyle Hidden -Wait -PassThru
+        $proc = Start-Process -FilePath $script:FurMarkFullPath -ArgumentList $probeArgs -WindowStyle Hidden -Wait -PassThru
         if ($proc.ExitCode -eq 0) {
             Write-Host "  GPU $GpuIndex available (exit 0)" -ForegroundColor Green
             return $true
@@ -167,8 +167,7 @@ function Start-FurMarkConsole {
     ) -join ' & '
 
     Write-Host "Launching FurMark GPU $GpuIndex"
-    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/v:on', '/k', $cmdLine) `
-        -WindowStyle Normal -PassThru
+    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/v:on', '/k', $cmdLine) -WindowStyle Normal -PassThru
     return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; GpuIndex = $GpuIndex }
 }
 
@@ -232,7 +231,9 @@ if ($tests -contains 'AIDA') {
     $includeGPU = -not ($tests -contains 'FURMARK')
     $aidaProcess = Start-AidaTest -hours $hours -includeGPU $includeGPU
     Write-Host "AIDA64 started (PID: $($aidaProcess.Id))"
-    Start-Sleep -Seconds 20
+    # 90 сек — AIDA64 должна полностью запустить стресс-тест прежде чем стартует FurMark
+    Write-Host "  Waiting 90s for AIDA64 to fully start stress test..."
+    Start-Sleep -Seconds 90
 }
 
 if ($tests -contains 'FURMARK' -and $usableGpus.Count -gt 0) {
@@ -241,10 +242,10 @@ if ($tests -contains 'FURMARK' -and $usableGpus.Count -gt 0) {
         $launch = Start-FurMarkConsole -DurationSeconds $totalSeconds -GpuIndex $gpu
         if ($launch) {
             $furmarkStarted += $launch
-            if ($gpu -lt ($usableGpus[-1])) {
-                Write-Host "  Waiting 15s before launching next GPU..."
-                Start-Sleep -Seconds 15
-            }
+            # 15 сек пауза — GPU должна поднять окно и захватить Vulkan
+            # прежде чем следующая GPU начнёт инициализацию
+            Write-Host "  Waiting 15s for GPU $gpu to initialize before next launch..."
+            Start-Sleep -Seconds 15
         }
     }
 }
