@@ -58,18 +58,52 @@ function Test-FurMarkGpuAvailable {
         "--gpu-index=$GpuIndex"
     )
 
+    # Перехватываем stdout+stderr в файл, чтобы поймать "not supported" даже при exit 0
+    $logFile = Join-Path $env:TEMP "furmark_probe_gpu${GpuIndex}_$(New-Guid).txt"
     try {
-        $proc = Start-Process -FilePath $script:FurMarkFullPath -ArgumentList $probeArgs -WindowStyle Hidden -Wait -PassThru
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $script:FurMarkFullPath
+        $psi.Arguments = $probeArgs -join ' '
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.UseShellExecute = $false
+
+        $proc = [System.Diagnostics.Process]::new()
+        $proc.StartInfo = $psi
+
+        $outBuf = [System.Text.StringBuilder]::new()
+        $errBuf = [System.Text.StringBuilder]::new()
+        $proc.OutputDataReceived += { param($s,$e) if ($e.Data) { $null = $outBuf.AppendLine($e.Data) } }
+        $proc.ErrorDataReceived  += { param($s,$e) if ($e.Data) { $null = $errBuf.AppendLine($e.Data) } }
+
+        $null = $proc.Start()
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+        $proc.WaitForExit()
+
+        $combined = $outBuf.ToString() + $errBuf.ToString()
+
+        # FurMark выдаёт "is not supported" или "not supported" при недопустимом gpu-index
+        if ($combined -match 'not supported') {
+            Write-Warning "  GPU $GpuIndex probe output contains 'not supported' — skipping GPU $GpuIndex."
+            Write-Host    "  Probe output: $($combined.Trim())" -ForegroundColor DarkGray
+            return $false
+        }
+
         if ($proc.ExitCode -eq 0) {
             Write-Host "  GPU $GpuIndex available (exit 0)" -ForegroundColor Green
             return $true
         } else {
             Write-Warning "  GPU $GpuIndex NOT available (exit $($proc.ExitCode)). Will be skipped."
+            Write-Host    "  Probe output: $($combined.Trim())" -ForegroundColor DarkGray
             return $false
         }
     } catch {
         Write-Warning "  GPU $GpuIndex probe error: $_"
         return $false
+    } finally {
+        Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue
     }
 }
 
