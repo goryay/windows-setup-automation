@@ -185,7 +185,7 @@ function Invoke-StorageRescan {
 
         if ($hasMegaRaid) {
             Write-RaidLog 'MegaRAID controller detected (VEN_1000). Skipping diskpart rescan to prevent bus reset.'
-            Write-ColorOutput '  MegaRAID detected — skipping diskpart rescan (prevents bus reset).' 'Yellow'
+            Write-ColorOutput '  MegaRAID detected - skipping diskpart rescan (prevents bus reset).' 'Yellow'
         } else {
             try {
                 $diskpartScript = Join-Path $env:TEMP 'ipdrom_diskpart_rescan.txt'
@@ -323,7 +323,7 @@ function Get-MegaRaidVirtualDriveState {
 
     if ($msmService) {
         Write-RaidLog "MSM service is running ($($msmService.Name)). StorCLI would conflict with exclusive access. Using Windows disk detection only."
-        Write-ColorOutput "  MSM running ($($msmService.Name)) — skipping StorCLI, using Windows disk detection." 'Yellow'
+        Write-ColorOutput "  MSM running ($($msmService.Name)) - skipping StorCLI, using Windows disk detection." 'Yellow'
         return $true
     }
 
