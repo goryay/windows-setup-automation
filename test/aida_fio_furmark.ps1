@@ -47,19 +47,25 @@ function Test-FurMarkGpuAvailable {
 
     if (-not (Test-Path $script:FurMarkFullPath)) { return $false }
 
-    Write-Host "  Checking GPU $GpuIndex (8 sec FurMark probe)..." -ForegroundColor DarkGray
+    if ($GpuIndex -gt 0) {
+        Write-Host "  Waiting 10s before probing GPU $GpuIndex (Vulkan context release)..." -ForegroundColor DarkGray
+        Start-Sleep -Seconds 10
+    }
+
+    Write-Host "  Checking GPU $GpuIndex (5 sec FurMark probe)..." -ForegroundColor DarkGray
     $probeArgs = @(
         '--demo', 'furmark-vk',
-        '--width', '1920',
-        '--height', '1080',
-        '--max-time', '8',
+        '--width', '1280',
+        '--height', '720',
+        '--max-time', '5',
         '--no-score-box',
         '--disable-demo-options',
         "--gpu-index=$GpuIndex"
     )
 
     try {
-        $proc = Start-Process -FilePath $script:FurMarkFullPath -ArgumentList $probeArgs -WindowStyle Hidden -Wait -PassThru
+        $proc = Start-Process -FilePath $script:FurMarkFullPath `
+            -ArgumentList $probeArgs -WindowStyle Hidden -Wait -PassThru
         if ($proc.ExitCode -eq 0) {
             Write-Host "  GPU $GpuIndex available (exit 0)" -ForegroundColor Green
             return $true
@@ -150,7 +156,7 @@ function Start-FurMarkConsole {
     $cmdLine = @(
         "title ${baseTitle}_RUNNING",
         "echo Starting FurMark GPU $GpuIndex...",
-        "`"$script:FurMarkFullPath`" --demo furmark-vk --width 1920 --height 1080 --max-time $DurationSeconds --no-score-box --disable-demo-options --gpu-index=$GpuIndex",
+        "`"$script:FurMarkFullPath`" --demo furmark-vk --width 1920 --height 1080 --max-time $DurationSeconds --no-score-box --disable-demo-options --gpu-index $GpuIndex",
         'set IPDROM_RC=!ERRORLEVEL!',
         "echo.",
         "echo ========================================",
@@ -161,7 +167,8 @@ function Start-FurMarkConsole {
     ) -join ' & '
 
     Write-Host "Launching FurMark GPU $GpuIndex"
-    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/v:on', '/k', $cmdLine) -WindowStyle Normal -PassThru
+    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/v:on', '/k', $cmdLine) `
+        -WindowStyle Normal -PassThru
     return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; GpuIndex = $GpuIndex }
 }
 
@@ -234,7 +241,10 @@ if ($tests -contains 'FURMARK' -and $usableGpus.Count -gt 0) {
         $launch = Start-FurMarkConsole -DurationSeconds $totalSeconds -GpuIndex $gpu
         if ($launch) {
             $furmarkStarted += $launch
-            Start-Sleep -Seconds 3
+            if ($gpu -lt ($usableGpus[-1])) {
+                Write-Host "  Waiting 15s before launching next GPU..."
+                Start-Sleep -Seconds 15
+            }
         }
     }
 }
