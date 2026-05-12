@@ -11,6 +11,9 @@ $ErrorActionPreference = 'Stop'
 $afterRebootTask = 'IPDROM_AutoStressTest_AfterReboot'
 Unregister-ScheduledTask -TaskName $afterRebootTask -Confirm:$false -ErrorAction SilentlyContinue
 
+# Снести осиротевший watchdog от предыдущего краша (BSOD не запускает finally-блок)
+Unregister-ScheduledTask -TaskName 'IPDROM_Watchdog_Reboot' -Confirm:$false -ErrorAction SilentlyContinue
+
 function Write-ColorOutput {
     param([string]$Message, [string]$Color = 'White')
     Write-Host $Message -ForegroundColor $Color
@@ -789,6 +792,16 @@ if (Test-Path $softwareReportScript) {
     Write-ColorOutput '  Software report generated.' 'Green'
 } else {
     Write-Warning '  Generate_SoftwareReport.ps1 not found'
+}
+
+Write-ColorOutput '[4.6/7] Generating SMART report...' 'Yellow'
+$smartScript = Join-Path $testFolder 'smart.ps1'
+if (Test-Path $smartScript) {
+    & $psExe -NoProfile -ExecutionPolicy Bypass -File $smartScript `
+        -ComputerName $computerName -OutputFolder $reportsDir -NoPause
+    Write-ColorOutput '  SMART report generated.' 'Green'
+} else {
+    Write-Warning '  smart.ps1 not found in test folder'
 }
 
 Write-ColorOutput '[5/7] Cancelling watchdog...' 'Yellow'

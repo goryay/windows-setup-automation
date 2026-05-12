@@ -310,13 +310,21 @@ if ($tests -contains 'AIDA') {
 }
 
 if ($furmarkStarted.Count -gt 0) {
+    foreach ($launch in $furmarkStarted) {
+        try { $launch.Process.Refresh() } catch {}
+        if ($launch.Process.HasExited) {
+            Write-Warning "FurMark GPU $($launch.GpuIndex) exited early (cmd exit: $($launch.Process.ExitCode)). Crash or driver failure suspected."
+        }
+    }
     & $invokeScreen 'FurMarkFinal'
-    # Закрываем окна FurMark после скриншотов
     Get-Process -Name 'furmark' -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 
 if ($fioStarted.Count -gt 0) {
     & $invokeScreen 'FioFinal'
+    foreach ($launch in $fioStarted) {
+        Remove-Item -LiteralPath $launch.JobFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 & $invokeScreen 'DesktopFinal'
