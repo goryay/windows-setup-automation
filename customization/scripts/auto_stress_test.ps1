@@ -158,6 +158,10 @@ function Install-MegaRaidDriverIfPresent {
 }
 
 function Invoke-StorageRescan {
+    param(
+        [bool]$SkipDiskpart = $false
+    )
+
     Write-ColorOutput '  Rescanning storage...' 'Gray'
     Write-RaidLog 'Storage rescan started.'
 
@@ -175,15 +179,27 @@ function Invoke-StorageRescan {
         Write-RaidLog "Update-HostStorageCache failed: $_"
     }
 
-    try {
-        $diskpartScript = Join-Path $env:TEMP 'ipdrom_diskpart_rescan.txt'
-        Set-Content -Path $diskpartScript -Value 'rescan' -Encoding ASCII
-        & diskpart.exe /s $diskpartScript 2>&1 | ForEach-Object {
-            Write-RaidLog $_
+    if (-not $SkipDiskpart) {
+        $hasMegaRaid = Get-PnpDevice -Class SCSIAdapter -ErrorAction SilentlyContinue |
+                       Where-Object { $_.InstanceId -match 'VEN_1000' }
+
+        if ($hasMegaRaid) {
+            Write-RaidLog 'MegaRAID controller detected (VEN_1000). Skipping diskpart rescan to prevent bus reset.'
+            Write-ColorOutput '  MegaRAID detected — skipping diskpart rescan (prevents bus reset).' 'Yellow'
+        } else {
+            try {
+                $diskpartScript = Join-Path $env:TEMP 'ipdrom_diskpart_rescan.txt'
+                Set-Content -Path $diskpartScript -Value 'rescan' -Encoding ASCII
+                & diskpart.exe /s $diskpartScript 2>&1 | ForEach-Object {
+                    Write-RaidLog $_
+                }
+                Remove-Item $diskpartScript -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-RaidLog "diskpart rescan failed: $_"
+            }
         }
-        Remove-Item $diskpartScript -Force -ErrorAction SilentlyContinue
-    } catch {
-        Write-RaidLog "diskpart rescan failed: $_"
+    } else {
+        Write-RaidLog 'diskpart rescan explicitly skipped (SkipDiskpart=$true).'
     }
 
     Start-Sleep -Seconds 5
@@ -302,8 +318,20 @@ function Get-MegaRaidVirtualDriveState {
         return $false
     }
 
+    $msmService = Get-Service -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -match 'vivaldiMSMService|MSMService|MegaRAID' -and $_.Status -eq 'Running' }
+
+    if ($msmService) {
+        Write-RaidLog "MSM service is running ($($msmService.Name)). StorCLI would conflict with exclusive access. Using Windows disk detection only."
+        Write-ColorOutput "  MSM running ($($msmService.Name)) — skipping StorCLI, using Windows disk detection." 'Yellow'
+        return $true
+    }
+
     Write-ColorOutput "  StorCLI found: $StorCliPath" 'Gray'
     Write-RaidLog "StorCLI found: $StorCliPath"
+
+    Write-RaidLog 'Waiting 5s before StorCLI query to let controller settle.'
+    Start-Sleep -Seconds 5
 
     $controllerResult = Invoke-StorCliSafe `
         -StorCliPath $StorCliPath `
@@ -437,10 +465,20 @@ function Get-FioTargetDriveLetters {
 
     Install-MegaRaidDriverIfPresent -UsbRoot $UsbRoot
 
+    $megaRaidPnp = Get-PnpDevice -Class SCSIAdapter -ErrorAction SilentlyContinue |
+                   Where-Object { $_.InstanceId -match 'VEN_1000' }
+
+    if ($megaRaidPnp) {
+        Write-RaidLog "MegaRAID controller detected on PCI bus (VEN_1000). Waiting 20s before rescan to let controller settle."
+        Write-ColorOutput '  MegaRAID controller detected. Waiting 20s for controller to settle before rescan...' 'Yellow'
+        Start-Sleep -Seconds 20
+    }
+
     $storCli = Find-StorCliPath -UsbRoot $UsbRoot
     $megaRaidVdExists = Get-MegaRaidVirtualDriveState -StorCliPath $storCli
 
-    Invoke-StorageRescan
+    $skipDiskpart = [bool]$megaRaidPnp
+    Invoke-StorageRescan -SkipDiskpart $skipDiskpart
 
     $candidateDisks = @(
         Get-Disk -ErrorAction SilentlyContinue |
@@ -473,7 +511,7 @@ function Get-FioTargetDriveLetters {
         $preparedLetters += Ensure-DataDiskHasDriveLetter -Disk $disk -AllowCreatePartition:$allowCreate
     }
 
-    Invoke-StorageRescan
+    Invoke-StorageRescan -SkipDiskpart $skipDiskpart
 
     $finalLetters = @(
         Get-Disk -ErrorAction SilentlyContinue |
