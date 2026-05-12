@@ -771,8 +771,7 @@ finally {
 }
 
 if ($testExitCode -ne 0) {
-    Write-ColorOutput "  Test finished with exit code $testExitCode" 'Red'
-    throw "Stress test child script failed with exit code $testExitCode"
+    Write-ColorOutput "  Test finished with exit code $testExitCode (non-zero) - continuing to reports and archive." 'Red'
 } else {
     Write-ColorOutput '  Test completed successfully' 'Green'
 }

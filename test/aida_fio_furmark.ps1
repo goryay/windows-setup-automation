@@ -47,21 +47,15 @@ function Test-FurMarkGpuAvailable {
 
     if (-not (Test-Path $script:FurMarkFullPath)) { return $false }
 
-    # Пауза перед probe каждой следующей GPU — FurMark освобождает Vulkan не мгновенно
-    if ($GpuIndex -gt 0) {
-        Write-Host "  Waiting 10s before probing GPU $GpuIndex (Vulkan context release)..." -ForegroundColor DarkGray
-        Start-Sleep -Seconds 10
-    }
-
-    Write-Host "  Checking GPU $GpuIndex (5 sec FurMark probe)..." -ForegroundColor DarkGray
+    Write-Host "  Checking GPU $GpuIndex (8 sec FurMark probe)..." -ForegroundColor DarkGray
     $probeArgs = @(
         '--demo', 'furmark-vk',
-        '--width', '1280',
-        '--height', '720',
-        '--max-time', '5',
+        '--width', '1920',
+        '--height', '1080',
+        '--max-time', '8',
         '--no-score-box',
         '--disable-demo-options',
-        "--gpu-index", "$GpuIndex"
+        "--gpu-index=$GpuIndex"
     )
 
     try {
@@ -156,7 +150,7 @@ function Start-FurMarkConsole {
     $cmdLine = @(
         "title ${baseTitle}_RUNNING",
         "echo Starting FurMark GPU $GpuIndex...",
-        "`"$script:FurMarkFullPath`" --demo furmark-vk --width 1920 --height 1080 --max-time $DurationSeconds --no-score-box --disable-demo-options --gpu-index $GpuIndex",
+        "`"$script:FurMarkFullPath`" --demo furmark-vk --width 1920 --height 1080 --max-time $DurationSeconds --no-score-box --disable-demo-options --gpu-index=$GpuIndex",
         'set IPDROM_RC=!ERRORLEVEL!',
         "echo.",
         "echo ========================================",
@@ -231,9 +225,7 @@ if ($tests -contains 'AIDA') {
     $includeGPU = -not ($tests -contains 'FURMARK')
     $aidaProcess = Start-AidaTest -hours $hours -includeGPU $includeGPU
     Write-Host "AIDA64 started (PID: $($aidaProcess.Id))"
-    # 90 сек — AIDA64 должна полностью запустить стресс-тест прежде чем стартует FurMark
-    Write-Host "  Waiting 90s for AIDA64 to fully start stress test..."
-    Start-Sleep -Seconds 90
+    Start-Sleep -Seconds 20
 }
 
 if ($tests -contains 'FURMARK' -and $usableGpus.Count -gt 0) {
@@ -242,10 +234,7 @@ if ($tests -contains 'FURMARK' -and $usableGpus.Count -gt 0) {
         $launch = Start-FurMarkConsole -DurationSeconds $totalSeconds -GpuIndex $gpu
         if ($launch) {
             $furmarkStarted += $launch
-            # 15 сек пауза — GPU должна поднять окно и захватить Vulkan
-            # прежде чем следующая GPU начнёт инициализацию
-            Write-Host "  Waiting 15s for GPU $gpu to initialize before next launch..."
-            Start-Sleep -Seconds 15
+            Start-Sleep -Seconds 3
         }
     }
 }
@@ -271,13 +260,24 @@ $invokeScreen = {
 
     if (Test-Path $screenScript) {
         try {
-            Invoke-PowerShellFile -FilePath $screenScript -ExtraArguments @('-Mode', $Mode) -Hidden
-            Write-Host "Screenshot $Mode completed." -ForegroundColor Green
+            $engine = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+            if (-not $engine) { $engine = Get-Command powershell.exe -ErrorAction SilentlyContinue }
+            $psExePath = $engine.Source
+
+            $proc = Start-Process -FilePath $psExePath `
+                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $screenScript, '-Mode', $Mode) `
+                -WindowStyle Hidden -Wait -PassThru
+
+            if ($proc.ExitCode -eq 0) {
+                Write-Host "Screenshot $Mode completed." -ForegroundColor Green
+            } else {
+                Write-Warning "Screenshot $Mode exited with code $($proc.ExitCode) — continuing."
+            }
         } catch {
-            Write-Warning "Screenshot $Mode failed: $_"
+            Write-Warning "Screenshot $Mode failed: $_ — continuing."
         }
     } else {
-        Write-Warning "screen.ps1 not found at $screenScript"
+        Write-Warning "screen.ps1 not found at $screenScript — skipping screenshot."
     }
 }
 
