@@ -181,22 +181,28 @@ function Start-FurMarkConsole {
     if (-not (Test-Path $script:FurMarkFullPath)) { return $null }
 
     $baseTitle = "IPDROM_FURMARK_GPU${GpuIndex}"
-    $cmdLine = @(
-        "title ${baseTitle}_RUNNING",
-        "echo Starting FurMark GPU $GpuIndex...",
-        "`"$script:FurMarkFullPath`" --demo furmark-vk --width 1920 --height 1080 --max-time $DurationSeconds --no-score-box --disable-demo-options --gpu-index=$GpuIndex",
-        'set IPDROM_RC=!ERRORLEVEL!',
-        "echo.",
-        "echo ========================================",
-        "echo FurMark GPU $GpuIndex completed (exit !IPDROM_RC!)",
-        "echo ========================================",
-        "title ${baseTitle}_FINAL",
-        "pause > nul"
-    ) -join ' & '
+
+    # Используем .bat-файл — это единственный надёжный способ передать составную команду
+    # с путями в кавычках через Start-Process без поломки кавычек при сборке строки аргументов.
+    $batFile = Join-Path $env:TEMP "ipdrom_furmark_gpu${GpuIndex}_$(New-Guid).bat"
+    $batContent = @"
+@echo off
+title ${baseTitle}_RUNNING
+echo Starting FurMark GPU $GpuIndex...
+"$($script:FurMarkFullPath)" --demo furmark-vk --width 1920 --height 1080 --max-time $DurationSeconds --no-score-box --disable-demo-options --gpu-index=$GpuIndex
+set IPDROM_RC=%ERRORLEVEL%
+echo.
+echo ========================================
+echo FurMark GPU $GpuIndex completed (exit %IPDROM_RC%)
+echo ========================================
+title ${baseTitle}_FINAL
+pause > nul
+"@
+    Set-Content -Path $batFile -Value $batContent -Encoding ASCII
 
     Write-Host "Launching FurMark GPU $GpuIndex"
-    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/v:on', '/k', $cmdLine) -WindowStyle Normal -PassThru
-    return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; GpuIndex = $GpuIndex }
+    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/k', "`"$batFile`"") -WindowStyle Normal -PassThru
+    return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; GpuIndex = $GpuIndex; BatFile = $batFile }
 }
 
 function Start-FioConsole {
@@ -231,22 +237,25 @@ rw=rw
     Set-Content -Path $jobFile -Value $jobContent -Encoding ASCII
 
     $baseTitle = "IPDROM_FIO_${DriveLetter}"
-    $cmdLine = @(
-        "title ${baseTitle}_RUNNING",
-        "echo Starting FIO on drive $DriveLetter...",
-        "`"$script:FioFullPath`" `"$jobFile`"",
-        'set IPDROM_RC=!ERRORLEVEL!',
-        "echo.",
-        "echo ========================================",
-        "echo FIO $DriveLetter completed (exit !IPDROM_RC!)",
-        "echo ========================================",
-        "title ${baseTitle}_FINAL",
-        "pause > nul"
-    ) -join ' & '
+    $batFile = Join-Path $env:TEMP "ipdrom_fio_${DriveLetter}_$(New-Guid).bat"
+    $batContent = @"
+@echo off
+title ${baseTitle}_RUNNING
+echo Starting FIO on drive $DriveLetter...
+"$($script:FioFullPath)" "$jobFile"
+set IPDROM_RC=%ERRORLEVEL%
+echo.
+echo ========================================
+echo FIO $DriveLetter completed (exit %IPDROM_RC%)
+echo ========================================
+title ${baseTitle}_FINAL
+pause > nul
+"@
+    Set-Content -Path $batFile -Value $batContent -Encoding ASCII
 
     Write-Host "Launching FIO on $DriveLetter"
-    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/v:on', '/k', $cmdLine) -WindowStyle Normal -PassThru
-    return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; Drive = $DriveLetter; JobFile = $jobFile }
+    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/k', "`"$batFile`"") -WindowStyle Normal -PassThru
+    return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; Drive = $DriveLetter; JobFile = $jobFile; BatFile = $batFile }
 }
 
 # ===================== ЗАПУСК ТЕСТОВ =====================
@@ -298,9 +307,12 @@ $invokeScreen = {
             if (-not $engine) { $engine = Get-Command powershell.exe -ErrorAction SilentlyContinue }
             $psExePath = $engine.Source
 
+            # Minimized (не Hidden) — только из видимого процесса SetForegroundWindow разрешён Windows.
+            # Hidden-процессы заблокированы от SetForegroundWindow, что вызывает мигание Пуска
+            # и неверные CopyFromScreen-снимки.
             $proc = Start-Process -FilePath $psExePath `
                 -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $screenScript, '-Mode', $Mode) `
-                -WindowStyle Hidden -Wait -PassThru
+                -WindowStyle Minimized -Wait -PassThru
 
             if ($proc.ExitCode -eq 0) {
                 Write-Host "Screenshot $Mode completed." -ForegroundColor Green
@@ -352,12 +364,16 @@ if ($furmarkStarted.Count -gt 0) {
     }
     & $invokeScreen 'FurMarkFinal'
     Get-Process -Name 'furmark' -ErrorAction SilentlyContinue | Stop-Process -Force
+    foreach ($launch in $furmarkStarted) {
+        Remove-Item -LiteralPath $launch.BatFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if ($fioStarted.Count -gt 0) {
     & $invokeScreen 'FioFinal'
     foreach ($launch in $fioStarted) {
         Remove-Item -LiteralPath $launch.JobFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $launch.BatFile -Force -ErrorAction SilentlyContinue
     }
 }
 
