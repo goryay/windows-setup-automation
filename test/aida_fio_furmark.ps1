@@ -47,63 +47,41 @@ function Test-FurMarkGpuAvailable {
 
     if (-not (Test-Path $script:FurMarkFullPath)) { return $false }
 
-    Write-Host "  Checking GPU $GpuIndex (8 sec FurMark probe)..." -ForegroundColor DarkGray
+    # Probe duration: if FurMark exits in under 2 sec, the --gpu-index option was rejected
+    # ("option(N) --gpu-index=X is not supported"). A working GPU runs for the full $probeSec.
+    $probeSec = 6
+    Write-Host "  Checking GPU $GpuIndex ($probeSec sec FurMark probe)..." -ForegroundColor DarkGray
     $probeArgs = @(
         '--demo', 'furmark-vk',
         '--width', '1920',
         '--height', '1080',
-        '--max-time', '8',
+        "--max-time=$probeSec",
         '--no-score-box',
         '--disable-demo-options',
         "--gpu-index=$GpuIndex"
     )
 
-    # Перехватываем stdout+stderr в файл, чтобы поймать "not supported" даже при exit 0
-    $logFile = Join-Path $env:TEMP "furmark_probe_gpu${GpuIndex}_$(New-Guid).txt"
     try {
-        $psi = [System.Diagnostics.ProcessStartInfo]::new()
-        $psi.FileName = $script:FurMarkFullPath
-        $psi.Arguments = $probeArgs -join ' '
-        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError  = $true
-        $psi.UseShellExecute = $false
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $proc = Start-Process -FilePath $script:FurMarkFullPath -ArgumentList $probeArgs -WindowStyle Hidden -Wait -PassThru
+        $sw.Stop()
+        $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 
-        $proc = [System.Diagnostics.Process]::new()
-        $proc.StartInfo = $psi
-
-        $outBuf = [System.Text.StringBuilder]::new()
-        $errBuf = [System.Text.StringBuilder]::new()
-        $proc.OutputDataReceived += { param($s,$e) if ($e.Data) { $null = $outBuf.AppendLine($e.Data) } }
-        $proc.ErrorDataReceived  += { param($s,$e) if ($e.Data) { $null = $errBuf.AppendLine($e.Data) } }
-
-        $null = $proc.Start()
-        $proc.BeginOutputReadLine()
-        $proc.BeginErrorReadLine()
-        $proc.WaitForExit()
-
-        $combined = $outBuf.ToString() + $errBuf.ToString()
-
-        # FurMark выдаёт "is not supported" или "not supported" при недопустимом gpu-index
-        if ($combined -match 'not supported') {
-            Write-Warning "  GPU $GpuIndex probe output contains 'not supported' — skipping GPU $GpuIndex."
-            Write-Host    "  Probe output: $($combined.Trim())" -ForegroundColor DarkGray
+        if ($elapsed -lt 2.0) {
+            Write-Warning "  GPU $GpuIndex exited after ${elapsed}s — '--gpu-index=$GpuIndex' not supported. Skipping."
             return $false
         }
 
         if ($proc.ExitCode -eq 0) {
-            Write-Host "  GPU $GpuIndex available (exit 0)" -ForegroundColor Green
+            Write-Host "  GPU $GpuIndex available (runtime ${elapsed}s, exit 0)" -ForegroundColor Green
             return $true
         } else {
-            Write-Warning "  GPU $GpuIndex NOT available (exit $($proc.ExitCode)). Will be skipped."
-            Write-Host    "  Probe output: $($combined.Trim())" -ForegroundColor DarkGray
+            Write-Warning "  GPU $GpuIndex NOT available (runtime ${elapsed}s, exit $($proc.ExitCode)). Skipping."
             return $false
         }
     } catch {
         Write-Warning "  GPU $GpuIndex probe error: $_"
         return $false
-    } finally {
-        Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue
     }
 }
 
