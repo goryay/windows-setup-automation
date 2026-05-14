@@ -98,7 +98,7 @@ function Start-FurMark {
 @echo off
 title ${baseTitle}_RUNNING
 echo Starting FurMark GPU $GpuIndex ($totalSeconds sec)...
-"$($script:FurMarkFullPath)" --demo furmark-vk --width 1920 --height 1080 --max-time $totalSeconds --no-score-box --disable-demo-options --gpu-index=$GpuIndex
+"$($script:FurMarkFullPath)" --demo furmark-vk --width 1280 --height 720 --max-time $totalSeconds --no-score-box --disable-demo-options --gpu-index=$GpuIndex
 set IPDROM_RC=%ERRORLEVEL%
 echo.
 echo ========================================
