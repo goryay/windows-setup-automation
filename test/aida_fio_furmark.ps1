@@ -279,29 +279,36 @@ if ($tests -contains 'FIO') {
 $invokeScreen = {
     param([string]$Mode)
 
-    if (Test-Path $screenScript) {
-        try {
-            $engine = Get-Command pwsh.exe -ErrorAction SilentlyContinue
-            if (-not $engine) { $engine = Get-Command powershell.exe -ErrorAction SilentlyContinue }
-            $psExePath = $engine.Source
-
-            # Minimized (не Hidden) — только из видимого процесса SetForegroundWindow разрешён Windows.
-            # Hidden-процессы заблокированы от SetForegroundWindow, что вызывает мигание Пуска
-            # и неверные CopyFromScreen-снимки.
-            $proc = Start-Process -FilePath $psExePath `
-                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $screenScript, '-Mode', $Mode) `
-                -WindowStyle Minimized -Wait -PassThru
-
-            if ($proc.ExitCode -eq 0) {
-                Write-Host "Screenshot $Mode completed." -ForegroundColor Green
-            } else {
-                Write-Warning "Screenshot $Mode exited with code $($proc.ExitCode) — continuing."
-            }
-        } catch {
-            Write-Warning "Screenshot $Mode failed: $_ — continuing."
-        }
-    } else {
+    if (-not (Test-Path $screenScript)) {
         Write-Warning "screen.ps1 not found at $screenScript — skipping screenshot."
+        return
+    }
+
+    try {
+        $engine = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+        if (-not $engine) { $engine = Get-Command powershell.exe -ErrorAction SilentlyContinue }
+        $psExePath = $engine.Source
+
+        # Launch WITHOUT -Wait — we manage the timeout manually.
+        # PrintWindow can hang indefinitely when AIDA64 is at 100% CPU load.
+        # 90-second hard timeout prevents the watchdog from firing due to a stuck screenshot.
+        $proc = Start-Process -FilePath $psExePath `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $screenScript, '-Mode', $Mode) `
+            -WindowStyle Minimized -PassThru
+
+        $timeoutMs = 90000  # 90 seconds
+        $finished  = $proc.WaitForExit($timeoutMs)
+
+        if (-not $finished) {
+            Write-Warning "Screenshot $Mode timed out after 90s — killing screen.ps1 and continuing."
+            $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+        } elseif ($proc.ExitCode -eq 0) {
+            Write-Host "Screenshot $Mode completed." -ForegroundColor Green
+        } else {
+            Write-Warning "Screenshot $Mode exited with code $($proc.ExitCode) — continuing."
+        }
+    } catch {
+        Write-Warning "Screenshot $Mode failed: $_ — continuing."
     }
 }
 
