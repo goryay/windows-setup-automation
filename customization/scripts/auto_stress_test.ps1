@@ -11,11 +11,18 @@ $ErrorActionPreference = 'Stop'
 $afterRebootTask = 'IPDROM_AutoStressTest_AfterReboot'
 Unregister-ScheduledTask -TaskName $afterRebootTask -Confirm:$false -ErrorAction SilentlyContinue
 
-# Снести осиротевший watchdog от предыдущего краша (BSOD не запускает finally-блок)
+# Remove orphaned watchdog from previous crash (BSOD does not run finally block)
 Unregister-ScheduledTask -TaskName 'IPDROM_Watchdog_Reboot' -Confirm:$false -ErrorAction SilentlyContinue
+
+# ===================== LOGGING =====================
+$script:StressLogDir  = Join-Path $env:ProgramData 'IPDROM\Logs'
+$script:StressLogFile = Join-Path $script:StressLogDir ("auto_stress_test_{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+New-Item -ItemType Directory -Force -Path $script:StressLogDir | Out-Null
 
 function Write-ColorOutput {
     param([string]$Message, [string]$Color = 'White')
+    $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+    try { $line | Out-File -FilePath $script:StressLogFile -Encoding UTF8 -Append } catch {}
     Write-Host $Message -ForegroundColor $Color
 }
 
@@ -546,7 +553,9 @@ if (-not (Test-IsAdmin)) {
 
 Write-ColorOutput "`n========================================" 'Cyan'
 Write-ColorOutput '   AUTOMATIC STRESS TEST' 'Cyan'
+Write-ColorOutput "   DurationMinutes: $DurationMinutes" 'Cyan'
 Write-ColorOutput '========================================' 'Cyan'
+Write-ColorOutput "Log file: $script:StressLogFile" 'DarkGray'
 Write-Host ''
 
 Write-ColorOutput '[1/7] Disabling power saving...' 'Yellow'
@@ -717,6 +726,7 @@ if ($driveLetters.Count -gt 0) {
 }
 $testArgs += "$DurationMinutes"
 Write-ColorOutput "  Arguments: $($testArgs -join ' ')" 'Green'
+Write-ColorOutput "  Full aida_fio_furmark call: $testScript $($testArgs -join ' ')" 'DarkGray'
 
 Write-ColorOutput '[3/7] Setting up watchdog...' 'Yellow'
 
@@ -765,11 +775,15 @@ Write-ColorOutput "  PowerShell engine: $psExe" 'Gray'
 Write-ColorOutput "  Test script: $testScript" 'Gray'
 Write-ColorOutput "  Full command: `"$psExe`" $($argumentList -join ' ')" 'Gray'
 
+Write-ColorOutput "  Launching: $psExe $($argumentList -join ' ')" 'DarkGray'
+$testStartTime = Get-Date
 try {
     & $psExe @argumentList
     $testExitCode = $LASTEXITCODE
 }
 finally {
+    $testDuration = [math]::Round(((Get-Date) - $testStartTime).TotalMinutes, 1)
+    Write-ColorOutput "  aida_fio_furmark.ps1 returned after ${testDuration} min, exit code: $testExitCode" 'Gray'
     Unregister-ScheduledTask -TaskName $watchdogTaskName -Confirm:$false -ErrorAction SilentlyContinue
 }
 
