@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
     Stress test launcher: AIDA64 + FurMark + FIO.
-    Exact launch order per hardware case, no GPU probing.
+    All tools receive the same N-minute duration from their own start time.
+    Staggered launch prevents simultaneous load spike.
 
     Case 1 - no GPU, no FIO  : AIDA64 (with GPU stress)
     Case 2 - 1 GPU, no FIO   : AIDA64 -> 120s -> FurMark GPU0
@@ -9,6 +10,9 @@
     Case 4 - no GPU, has FIO  : AIDA64 (with GPU stress) -> 120s -> FIO
     Case 5 - 1 GPU, has FIO   : AIDA64 -> 120s -> FurMark GPU0 -> 30s -> FIO
     Case 6 - 2 GPU, has FIO   : AIDA64 -> 120s -> FurMark GPU0 -> 15s -> GPU1 -> 30s -> FIO
+
+    After AIDA finishes, wait for FurMark/FIO to also finish (they started later),
+    then 80s for console windows to print final status, then screenshots.
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -74,30 +78,27 @@ function Start-Aida {
     }
     $gpuPart = if ($IncludeGPU) { ',GPU' } else { '' }
     $argStr  = "/SST CPU,FPU,Cache,RAM,Disk$gpuPart /SSTDUR $durationMin"
-    Write-Log "Starting AIDA64 (IncludeGPU=$IncludeGPU): $script:Aida64FullPath $argStr" 'Yellow'
+    Write-Log "Starting AIDA64 (IncludeGPU=$IncludeGPU) duration=${durationMin}min" 'Yellow'
     $proc = Start-Process -FilePath $script:Aida64FullPath -ArgumentList $argStr -PassThru
     Write-Log "AIDA64 started (PID: $($proc.Id))" 'Green'
     return $proc
 }
 
 function Start-FurMark {
-    param([int]$GpuIndex, [int]$DurationSeconds)
+    param([int]$GpuIndex)
     if (-not (Test-Path $script:FurMarkFullPath)) {
         Write-Log "FurMark not found: $script:FurMarkFullPath" 'Red'
-        return $null
-    }
-    if ($DurationSeconds -lt 10) {
-        Write-Log "FurMark GPU $GpuIndex: remaining time too short (${DurationSeconds}s), skipping." 'Yellow'
         return $null
     }
 
     $baseTitle  = "IPDROM_FURMARK_GPU${GpuIndex}"
     $batFile    = Join-Path $env:TEMP "ipdrom_furmark_gpu${GpuIndex}_$(New-Guid).bat"
+    # Each tool gets the full $totalSeconds from its own launch moment
     $batContent = @"
 @echo off
 title ${baseTitle}_RUNNING
-echo Starting FurMark GPU $GpuIndex (max-time $DurationSeconds s)...
-"$($script:FurMarkFullPath)" --demo furmark-vk --width 1920 --height 1080 --max-time $DurationSeconds --no-score-box --disable-demo-options --gpu-index=$GpuIndex
+echo Starting FurMark GPU $GpuIndex ($totalSeconds sec)...
+"$($script:FurMarkFullPath)" --demo furmark-vk --width 1920 --height 1080 --max-time $totalSeconds --no-score-box --disable-demo-options --gpu-index=$GpuIndex
 set IPDROM_RC=%ERRORLEVEL%
 echo.
 echo ========================================
@@ -107,20 +108,16 @@ title ${baseTitle}_FINAL
 pause > nul
 "@
     Set-Content -Path $batFile -Value $batContent -Encoding ASCII
-    Write-Log "Starting FurMark GPU $GpuIndex (${DurationSeconds}s)..." 'Yellow'
+    Write-Log "Starting FurMark GPU $GpuIndex (duration=${totalSeconds}s from now)..." 'Yellow'
     $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/k', "`"$batFile`"") -WindowStyle Normal -PassThru
     Write-Log "FurMark GPU $GpuIndex started (cmd PID: $($proc.Id))" 'Green'
     return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; GpuIndex = $GpuIndex; BatFile = $batFile }
 }
 
 function Start-Fio {
-    param([string]$DriveLetter, [int]$DurationSeconds)
+    param([string]$DriveLetter)
     if (-not (Test-Path $script:FioFullPath)) {
         Write-Log "fio.exe not found: $script:FioFullPath" 'Red'
-        return $null
-    }
-    if ($DurationSeconds -lt 10) {
-        Write-Log "FIO ${DriveLetter}: remaining time too short (${DurationSeconds}s), skipping." 'Yellow'
         return $null
     }
 
@@ -137,7 +134,7 @@ filename=$testFile
 size=1g
 direct=1
 time_based
-runtime=$DurationSeconds
+runtime=$totalSeconds
 loops=1
 thread
 stonewall
@@ -156,7 +153,7 @@ rw=rw
     $batContent = @"
 @echo off
 title ${baseTitle}_RUNNING
-echo Starting FIO on drive $DriveLetter (runtime $DurationSeconds s)...
+echo Starting FIO on drive $DriveLetter ($totalSeconds sec)...
 "$($script:FioFullPath)" "$jobFile"
 set IPDROM_RC=%ERRORLEVEL%
 echo.
@@ -167,7 +164,7 @@ title ${baseTitle}_FINAL
 pause > nul
 "@
     Set-Content -Path $batFile -Value $batContent -Encoding ASCII
-    Write-Log "Starting FIO drive $DriveLetter (${DurationSeconds}s)..." 'Yellow'
+    Write-Log "Starting FIO drive $DriveLetter (duration=${totalSeconds}s from now)..." 'Yellow'
     $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/k', "`"$batFile`"") -WindowStyle Normal -PassThru
     Write-Log "FIO $DriveLetter started (cmd PID: $($proc.Id))" 'Green'
     return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; Drive = $DriveLetter; JobFile = $jobFile; BatFile = $batFile }
@@ -193,12 +190,12 @@ $invokeScreen = {
         return
     }
     try {
-        $engine = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+        $engine   = Get-Command pwsh.exe -ErrorAction SilentlyContinue
         if (-not $engine) { $engine = Get-Command powershell.exe -ErrorAction SilentlyContinue }
-        $proc      = Start-Process -FilePath $engine.Source `
-                         -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $screenScript, '-Mode', $Mode) `
-                         -WindowStyle Minimized -PassThru
-        $finished  = $proc.WaitForExit(90000)
+        $proc     = Start-Process -FilePath $engine.Source `
+                        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $screenScript, '-Mode', $Mode) `
+                        -WindowStyle Minimized -PassThru
+        $finished = $proc.WaitForExit(90000)
         if (-not $finished) {
             Write-Log "Screenshot $Mode timed out after 90s — killing." 'Red'
             $proc | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -212,20 +209,23 @@ $invokeScreen = {
     }
 }
 
-# ===================== LAUNCH SEQUENCE (by case) =====================
-$aidaProc      = $null
+# ===================== LAUNCH SEQUENCE =====================
+$aidaProc       = $null
 $furmarkStarted = @()
 $fioStarted     = @()
 $testStartTime  = Get-Date
 
-function Get-RemainingSeconds {
-    return [int]($totalSeconds - ((Get-Date) - $testStartTime).TotalSeconds)
-}
+# Tracks offset (seconds from testStartTime) at which the LAST tool was launched.
+# Used after AIDA finishes to know how long to wait for the last tool to also finish.
+$lastLaunchOffsetSec = 0
+
+function Get-ElapsedSec { return [int]((Get-Date) - $testStartTime).TotalSeconds }
 
 if ($gpuCount -eq 0 -and -not $hasFio) {
     # ---- CASE 1: AIDA only (with GPU stress) ----
     Write-Log "=== Case 1: AIDA64 only (GPU stress ON) ===" 'Cyan'
     $aidaProc = Start-Aida -IncludeGPU $true
+    $lastLaunchOffsetSec = Get-ElapsedSec
 }
 elseif ($gpuCount -eq 1 -and -not $hasFio) {
     # ---- CASE 2: AIDA + FurMark GPU0 ----
@@ -233,8 +233,9 @@ elseif ($gpuCount -eq 1 -and -not $hasFio) {
     $aidaProc = Start-Aida -IncludeGPU $false
     Write-Log "Waiting 120s for AIDA64 to fully start..."
     Start-Sleep -Seconds 120
-    $fm = Start-FurMark -GpuIndex 0 -DurationSeconds (Get-RemainingSeconds)
+    $fm = Start-FurMark -GpuIndex 0
     if ($fm) { $furmarkStarted += $fm }
+    $lastLaunchOffsetSec = Get-ElapsedSec
 }
 elseif ($gpuCount -ge 2 -and -not $hasFio) {
     # ---- CASE 3: AIDA + FurMark GPU0 + FurMark GPU1 ----
@@ -242,12 +243,13 @@ elseif ($gpuCount -ge 2 -and -not $hasFio) {
     $aidaProc = Start-Aida -IncludeGPU $false
     Write-Log "Waiting 120s for AIDA64 to fully start..."
     Start-Sleep -Seconds 120
-    $fm = Start-FurMark -GpuIndex 0 -DurationSeconds (Get-RemainingSeconds)
+    $fm = Start-FurMark -GpuIndex 0
     if ($fm) { $furmarkStarted += $fm }
     Write-Log "Waiting 15s before FurMark GPU1..."
     Start-Sleep -Seconds 15
-    $fm = Start-FurMark -GpuIndex 1 -DurationSeconds (Get-RemainingSeconds)
+    $fm = Start-FurMark -GpuIndex 1
     if ($fm) { $furmarkStarted += $fm }
+    $lastLaunchOffsetSec = Get-ElapsedSec
 }
 elseif ($gpuCount -eq 0 -and $hasFio) {
     # ---- CASE 4: AIDA (GPU stress) + FIO ----
@@ -256,9 +258,10 @@ elseif ($gpuCount -eq 0 -and $hasFio) {
     Write-Log "Waiting 120s for AIDA64 to fully start..."
     Start-Sleep -Seconds 120
     foreach ($drive in $fioDrives) {
-        $fio = Start-Fio -DriveLetter $drive -DurationSeconds (Get-RemainingSeconds)
+        $fio = Start-Fio -DriveLetter $drive
         if ($fio) { $fioStarted += $fio }
     }
+    $lastLaunchOffsetSec = Get-ElapsedSec
 }
 elseif ($gpuCount -eq 1 -and $hasFio) {
     # ---- CASE 5: AIDA + FurMark GPU0 + FIO ----
@@ -266,14 +269,15 @@ elseif ($gpuCount -eq 1 -and $hasFio) {
     $aidaProc = Start-Aida -IncludeGPU $false
     Write-Log "Waiting 120s for AIDA64 to fully start..."
     Start-Sleep -Seconds 120
-    $fm = Start-FurMark -GpuIndex 0 -DurationSeconds (Get-RemainingSeconds)
+    $fm = Start-FurMark -GpuIndex 0
     if ($fm) { $furmarkStarted += $fm }
     Write-Log "Waiting 30s before FIO..."
     Start-Sleep -Seconds 30
     foreach ($drive in $fioDrives) {
-        $fio = Start-Fio -DriveLetter $drive -DurationSeconds (Get-RemainingSeconds)
+        $fio = Start-Fio -DriveLetter $drive
         if ($fio) { $fioStarted += $fio }
     }
+    $lastLaunchOffsetSec = Get-ElapsedSec
 }
 else {
     # ---- CASE 6: AIDA + FurMark GPU0 + FurMark GPU1 + FIO ----
@@ -281,66 +285,75 @@ else {
     $aidaProc = Start-Aida -IncludeGPU $false
     Write-Log "Waiting 120s for AIDA64 to fully start..."
     Start-Sleep -Seconds 120
-    $fm = Start-FurMark -GpuIndex 0 -DurationSeconds (Get-RemainingSeconds)
+    $fm = Start-FurMark -GpuIndex 0
     if ($fm) { $furmarkStarted += $fm }
     Write-Log "Waiting 15s before FurMark GPU1..."
     Start-Sleep -Seconds 15
-    $fm = Start-FurMark -GpuIndex 1 -DurationSeconds (Get-RemainingSeconds)
+    $fm = Start-FurMark -GpuIndex 1
     if ($fm) { $furmarkStarted += $fm }
     Write-Log "Waiting 30s before FIO..."
     Start-Sleep -Seconds 30
     foreach ($drive in $fioDrives) {
-        $fio = Start-Fio -DriveLetter $drive -DurationSeconds (Get-RemainingSeconds)
+        $fio = Start-Fio -DriveLetter $drive
         if ($fio) { $fioStarted += $fio }
     }
+    $lastLaunchOffsetSec = Get-ElapsedSec
 }
 
-# ===================== WAIT FOR TESTS =====================
-$remaining = Get-RemainingSeconds
-Write-Log "All tests running. ~$([math]::Round($remaining/60,1)) min remaining until AIDA64 finishes..." 'Cyan'
+Write-Log "All tests launched. Last tool started at offset +${lastLaunchOffsetSec}s." 'Cyan'
+Write-Log "AIDA64 will finish at $(($testStartTime.AddSeconds($totalSeconds)).ToString('HH:mm:ss'))" 'Cyan'
+Write-Log "Last tool  will finish at $(($testStartTime.AddSeconds($totalSeconds + $lastLaunchOffsetSec)).ToString('HH:mm:ss'))" 'Cyan'
 
-if ($remaining -gt 300) {
-    $autoShotDelay = $remaining - 300
+# ===================== WAIT FOR AIDA (with auto screenshot 5 min before end) =====================
+$aida_remaining = $totalSeconds - (Get-ElapsedSec)
+
+if ($aida_remaining -gt 300) {
+    $autoShotDelay = $aida_remaining - 300
     Write-Log "Waiting ${autoShotDelay}s then AidaAuto screenshot (at $(((Get-Date).AddSeconds($autoShotDelay)).ToString('HH:mm:ss')))..."
     Start-Sleep -Seconds $autoShotDelay
-    Write-Log "Taking AidaAuto screenshot (5 min before end)..." 'Yellow'
+    Write-Log "Taking AidaAuto screenshot (5 min before AIDA end)..." 'Yellow'
     & $invokeScreen 'AidaAuto'
-    Write-Log "Waiting final 300s..."
+    Write-Log "Waiting final 300s for AIDA to finish..."
     Start-Sleep -Seconds 300
-} elseif ($remaining -gt 0) {
-    Write-Log "Less than 5 min remaining, skipping AidaAuto. Waiting ${remaining}s..."
-    Start-Sleep -Seconds $remaining
+} elseif ($aida_remaining -gt 0) {
+    Write-Log "Less than 5 min remaining for AIDA, skipping AidaAuto. Waiting ${aida_remaining}s..."
+    Start-Sleep -Seconds $aida_remaining
 }
 
-# ===================== POST-TEST SEQUENCE =====================
+# ===================== WAIT FOR FURMARK / FIO TO ALSO FINISH =====================
+# They started $lastLaunchOffsetSec seconds later than AIDA,
+# so they finish $lastLaunchOffsetSec seconds after AIDA.
+if ($lastLaunchOffsetSec -gt 0) {
+    $waitForLast = $lastLaunchOffsetSec + 10   # +10s buffer
+    Write-Log "AIDA finished. Waiting ${waitForLast}s for FurMark/FIO to also finish..." 'Cyan'
+    Start-Sleep -Seconds $waitForLast
+}
 
-# Step 3: 80 sec pause for console windows to print final status
-Write-Log "Waiting 80s for console windows to show final status..."
+# ===================== 80 SEC FOR CONSOLE FINAL STATUS =====================
+Write-Log "Waiting 80s for console windows to print final status (_FINAL title)..."
 Start-Sleep -Seconds 80
 
-# Step 4: Screenshot AIDA64 final
+# ===================== SCREENSHOTS =====================
 Write-Log "Taking final screenshots..." 'Yellow'
+
 Write-Log "  -> AidaFinal..."
 & $invokeScreen 'AidaFinal'
 
-# Step 5: Screenshot FurMark final
 if ($furmarkStarted.Count -gt 0) {
     Write-Log "  -> FurMarkFinal..."
     & $invokeScreen 'FurMarkFinal'
 }
 
-# Step 6: Screenshot FIO final
 if ($fioStarted.Count -gt 0) {
     Write-Log "  -> FioFinal..."
     & $invokeScreen 'FioFinal'
 }
 
-# Step 7: Screenshot desktop
 Write-Log "  -> DesktopFinal..."
 & $invokeScreen 'DesktopFinal'
 
-# Step 8: Close FurMark and FIO windows
-Write-Log "Closing FurMark and FIO windows..." 'Yellow'
+# ===================== CLOSE WINDOWS =====================
+Write-Log "Closing FurMark windows..." 'Yellow'
 Get-Process -Name 'furmark' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 foreach ($launch in $furmarkStarted) {
     try { $launch.Process.Refresh() } catch {}
@@ -349,6 +362,8 @@ foreach ($launch in $furmarkStarted) {
     }
     Remove-Item -LiteralPath $launch.BatFile -Force -ErrorAction SilentlyContinue
 }
+
+Write-Log "Closing FIO windows..." 'Yellow'
 foreach ($launch in $fioStarted) {
     try { $launch.Process.Refresh() } catch {}
     if (-not $launch.Process.HasExited) {
@@ -362,19 +377,17 @@ foreach ($launch in $fioStarted) {
     Remove-Item -LiteralPath $launch.BatFile -Force -ErrorAction SilentlyContinue
 }
 
-# Step 9: Close AIDA64 stress instance
 Write-Log "Closing AIDA64..." 'Yellow'
-Close-ProcessByName -name 'AIDA64Port'            -waitSeconds 15
-Close-ProcessByName -name 'aida64'                -waitSeconds 5
+Close-ProcessByName -name 'AIDA64Port'             -waitSeconds 15
+Close-ProcessByName -name 'aida64'                 -waitSeconds 5
 Close-ProcessByName -name 'AIDA64BusinessPortable' -waitSeconds 5
 
-# Step 10: Generate AIDA64 HTML report
+# ===================== AIDA64 HTML REPORT =====================
 Write-Log "Generating AIDA64 HTML report..." 'Yellow'
 if (Test-Path $script:Aida64FullPath) {
-    $desktop     = [Environment]::GetFolderPath('Desktop')
-    $reportsDir  = Join-Path (Join-Path $desktop $env:COMPUTERNAME) 'Reports'
+    $reportsDir = Join-Path (Join-Path ([Environment]::GetFolderPath('Desktop')) $env:COMPUTERNAME) 'Reports'
     New-Item -ItemType Directory -Force -Path $reportsDir | Out-Null
-    $reportPath  = Join-Path $reportsDir 'SystemReport.html'
+    $reportPath = Join-Path $reportsDir 'SystemReport.html'
 
     Start-Process -FilePath $script:Aida64FullPath `
         -ArgumentList @('/R', $reportPath, '/ALL', '/SUM', '/HW', '/SW', '/AUDIT', '/HTML') `
