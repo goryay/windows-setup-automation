@@ -93,15 +93,13 @@ function Start-FurMark {
 
     $baseTitle  = "IPDROM_FURMARK_GPU${GpuIndex}"
     $batFile    = Join-Path $env:TEMP "ipdrom_furmark_gpu${GpuIndex}_$(New-Guid).bat"
-    # Each tool gets the full $totalSeconds from its own launch moment
-    # VULKAN_DEVICE_SELECT selects Vulkan physical device index (0=first GPU, 1=second GPU)
-    # --gpu-index is NOT supported in FurMark 2.x CLI for VK demo — use env var instead
+    # Each tool gets the full $totalSeconds from its own launch moment.
+    # --gpu-index (space, not '=') reliably routes Vulkan demo to chosen GPU in FurMark 2.10.
     $batContent = @"
 @echo off
 title ${baseTitle}_RUNNING
 echo Starting FurMark GPU $GpuIndex ($totalSeconds sec)...
-set VULKAN_DEVICE_SELECT=$GpuIndex
-"$($script:FurMarkFullPath)" --demo furmark-vk --width 1280 --height 720 --max-time $totalSeconds --no-score-box --disable-demo-options
+"$($script:FurMarkFullPath)" --demo furmark-vk --gpu-index $GpuIndex --width 1280 --height 720 --max-time $totalSeconds --no-score-box --disable-demo-options
 set IPDROM_RC=%ERRORLEVEL%
 echo.
 echo ========================================
