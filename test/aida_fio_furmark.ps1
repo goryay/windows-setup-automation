@@ -171,6 +171,43 @@ pause > nul
     return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; Drive = $DriveLetter; JobFile = $jobFile; BatFile = $batFile }
 }
 
+function Bring-AidaToFront {
+    # Поднимает окно AIDA64 на передний план перед скриншотом,
+    # чтобы не получить пустой рабочий стол / окно FurMark поверх AIDA.
+    try {
+        if (-not ('IPDROM.WinFG' -as [type])) {
+            Add-Type -Namespace IPDROM -Name WinFG -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool BringWindowToTop(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetWindowPos(System.IntPtr hWnd, System.IntPtr hWndAfter, int X, int Y, int cx, int cy, uint uFlags);
+'@
+        }
+        $names = @('AIDA64Port','aida64','AIDA64BusinessPortable')
+        $aida  = $null
+        foreach ($n in $names) {
+            $aida = Get-Process -Name $n -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+            if ($aida) { break }
+        }
+        if (-not $aida) { Write-Log "Bring-AidaToFront: AIDA window not found." 'Yellow'; return }
+
+        $h = $aida.MainWindowHandle
+        # SW_RESTORE = 9 — разворачивает из трея/свёрнутого
+        [IPDROM.WinFG]::ShowWindow($h, 9) | Out-Null
+        # HWND_TOPMOST = -1, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW = 0x0043
+        [IPDROM.WinFG]::SetWindowPos($h, [System.IntPtr]::new(-1), 0, 0, 0, 0, 0x0043) | Out-Null
+        [IPDROM.WinFG]::BringWindowToTop($h)  | Out-Null
+        [IPDROM.WinFG]::SetForegroundWindow($h) | Out-Null
+        # Снимаем topmost, но окно остаётся поверх остальных (HWND_NOTOPMOST = -2)
+        Start-Sleep -Milliseconds 500
+        [IPDROM.WinFG]::SetWindowPos($h, [System.IntPtr]::new(-2), 0, 0, 0, 0, 0x0043) | Out-Null
+        Start-Sleep -Seconds 1   # дать DWM перерисовать
+        Write-Log "AIDA window brought to front (hwnd=$h)." 'DarkGray'
+    } catch {
+        Write-Log "Bring-AidaToFront error: $_" 'Yellow'
+    }
+}
+
 function Close-ProcessByName {
     param([string]$name, [int]$waitSeconds = 10)
     $p = Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -317,11 +354,13 @@ if ($aida_remaining -gt 300) {
     Write-Log "Waiting ${autoShotDelay}s then AidaAuto screenshot (at $(((Get-Date).AddSeconds($autoShotDelay)).ToString('HH:mm:ss')))..."
     Start-Sleep -Seconds $autoShotDelay
     Write-Log "Taking AidaAuto screenshot (5 min before AIDA end)..." 'Yellow'
+    Bring-AidaToFront
     & $invokeScreen 'AidaAuto'
 
     Write-Log "Waiting 270s until 30s before AIDA end..."
     Start-Sleep -Seconds 270
     Write-Log "Taking AidaFinal screenshot (30s before AIDA end, window still open)..." 'Yellow'
+    Bring-AidaToFront
     & $invokeScreen 'AidaFinal'
 
     Write-Log "Waiting final 30s for AIDA stress test to actually end..."
@@ -330,10 +369,12 @@ if ($aida_remaining -gt 300) {
     Write-Log "Less than 5 min remaining, skipping AidaAuto. Waiting $($aida_remaining - 30)s..."
     Start-Sleep -Seconds ($aida_remaining - 30)
     Write-Log "Taking AidaFinal screenshot (30s before AIDA end)..." 'Yellow'
+    Bring-AidaToFront
     & $invokeScreen 'AidaFinal'
     Start-Sleep -Seconds 30
 } elseif ($aida_remaining -gt 0) {
     Write-Log "Less than 30s remaining, taking AidaFinal immediately..."
+    Bring-AidaToFront
     & $invokeScreen 'AidaFinal'
     Start-Sleep -Seconds $aida_remaining
 }

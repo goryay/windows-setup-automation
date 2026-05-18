@@ -563,6 +563,21 @@ powercfg /change standby-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 powercfg /change monitor-timeout-ac 0
 
+# Pagefile: switch to system-managed. Fixes STATUS_COMMITMENT_LIMIT (0xC000012D)
+# when running AIDA64 + 2x FurMark + FIO on systems with default 4 GB pagefile.
+# Takes full effect after reboot, but Windows starts extending the file immediately.
+try {
+    $cs = Get-CimInstance Win32_ComputerSystem
+    if (-not $cs.AutomaticManagedPagefile) {
+        $cs | Set-CimInstance -Property @{ AutomaticManagedPagefile = $true }
+        Write-ColorOutput '  Pagefile switched to system-managed (full effect after next reboot).' 'Green'
+    } else {
+        Write-ColorOutput '  Pagefile already system-managed.' 'DarkGray'
+    }
+} catch {
+    Write-ColorOutput "  Failed to set pagefile to system-managed: $_" 'Yellow'
+}
+
 $flagFile = "$env:ProgramData\IPDROM_StressTest_Completed.flag"
 if (Test-Path $flagFile) {
     Write-ColorOutput 'Stress test already completed. Exiting.' 'Green'
