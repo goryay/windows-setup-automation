@@ -94,11 +94,14 @@ function Start-FurMark {
     $baseTitle  = "IPDROM_FURMARK_GPU${GpuIndex}"
     $batFile    = Join-Path $env:TEMP "ipdrom_furmark_gpu${GpuIndex}_$(New-Guid).bat"
     # Each tool gets the full $totalSeconds from its own launch moment
+    # VULKAN_DEVICE_SELECT selects Vulkan physical device index (0=first GPU, 1=second GPU)
+    # --gpu-index is NOT supported in FurMark 2.x CLI for VK demo — use env var instead
     $batContent = @"
 @echo off
 title ${baseTitle}_RUNNING
 echo Starting FurMark GPU $GpuIndex ($totalSeconds sec)...
-"$($script:FurMarkFullPath)" --demo furmark-vk --width 1280 --height 720 --max-time $totalSeconds --no-score-box --disable-demo-options --gpu-index=$GpuIndex
+set VULKAN_DEVICE_SELECT=$GpuIndex
+"$($script:FurMarkFullPath)" --demo furmark-vk --width 1280 --height 720 --max-time $totalSeconds --no-score-box --disable-demo-options
 set IPDROM_RC=%ERRORLEVEL%
 echo.
 echo ========================================
@@ -304,7 +307,11 @@ Write-Log "All tests launched. Last tool started at offset +${lastLaunchOffsetSe
 Write-Log "AIDA64 will finish at $(($testStartTime.AddSeconds($totalSeconds)).ToString('HH:mm:ss'))" 'Cyan'
 Write-Log "Last tool  will finish at $(($testStartTime.AddSeconds($totalSeconds + $lastLaunchOffsetSec)).ToString('HH:mm:ss'))" 'Cyan'
 
-# ===================== WAIT FOR AIDA (with auto screenshot 5 min before end) =====================
+# ===================== WAIT FOR AIDA =====================
+#  Sequence (from end of AIDA timer backwards):
+#    T - 300s : AidaAuto  screenshot
+#    T -  30s : AidaFinal screenshot  (AIDA окно ТОЧНО ещё открыто)
+#    T        : AIDA stress test ends
 $aida_remaining = $totalSeconds - (Get-ElapsedSec)
 
 if ($aida_remaining -gt 300) {
@@ -313,18 +320,31 @@ if ($aida_remaining -gt 300) {
     Start-Sleep -Seconds $autoShotDelay
     Write-Log "Taking AidaAuto screenshot (5 min before AIDA end)..." 'Yellow'
     & $invokeScreen 'AidaAuto'
-    Write-Log "Waiting final 300s for AIDA to finish..."
-    Start-Sleep -Seconds 300
+
+    Write-Log "Waiting 270s until 30s before AIDA end..."
+    Start-Sleep -Seconds 270
+    Write-Log "Taking AidaFinal screenshot (30s before AIDA end, window still open)..." 'Yellow'
+    & $invokeScreen 'AidaFinal'
+
+    Write-Log "Waiting final 30s for AIDA stress test to actually end..."
+    Start-Sleep -Seconds 30
+} elseif ($aida_remaining -gt 30) {
+    Write-Log "Less than 5 min remaining, skipping AidaAuto. Waiting $($aida_remaining - 30)s..."
+    Start-Sleep -Seconds ($aida_remaining - 30)
+    Write-Log "Taking AidaFinal screenshot (30s before AIDA end)..." 'Yellow'
+    & $invokeScreen 'AidaFinal'
+    Start-Sleep -Seconds 30
 } elseif ($aida_remaining -gt 0) {
-    Write-Log "Less than 5 min remaining for AIDA, skipping AidaAuto. Waiting ${aida_remaining}s..."
+    Write-Log "Less than 30s remaining, taking AidaFinal immediately..."
+    & $invokeScreen 'AidaFinal'
     Start-Sleep -Seconds $aida_remaining
 }
 
 # ===================== WAIT FOR FURMARK / FIO TO ALSO FINISH =====================
-# They started $lastLaunchOffsetSec seconds later than AIDA,
-# so they finish $lastLaunchOffsetSec seconds after AIDA.
+# AidaFinal уже сделан выше (за 30s до конца AIDA).
+# FurMark/FIO стартовали $lastLaunchOffsetSec секунд после AIDA — столько же и финишируют после неё.
 if ($lastLaunchOffsetSec -gt 0) {
-    $waitForLast = $lastLaunchOffsetSec + 10   # +10s buffer
+    $waitForLast = $lastLaunchOffsetSec + 10   # +10s буфер
     Write-Log "AIDA finished. Waiting ${waitForLast}s for FurMark/FIO to also finish..." 'Cyan'
     Start-Sleep -Seconds $waitForLast
 }
@@ -333,11 +353,8 @@ if ($lastLaunchOffsetSec -gt 0) {
 Write-Log "Waiting 80s for console windows to print final status (_FINAL title)..."
 Start-Sleep -Seconds 80
 
-# ===================== SCREENSHOTS =====================
+# ===================== FINAL SCREENSHOTS (FurMark / FIO / Desktop) =====================
 Write-Log "Taking final screenshots..." 'Yellow'
-
-Write-Log "  -> AidaFinal..."
-& $invokeScreen 'AidaFinal'
 
 if ($furmarkStarted.Count -gt 0) {
     Write-Log "  -> FurMarkFinal..."
