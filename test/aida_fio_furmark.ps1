@@ -172,39 +172,138 @@ pause > nul
 }
 
 function Bring-AidaToFront {
-    # Поднимает окно AIDA64 на передний план перед скриншотом,
-    # чтобы не получить пустой рабочий стол / окно FurMark поверх AIDA.
+    # Поднимает окно AIDA64 на передний план перед скриншотом.
+    # Win32 SetForegroundWindow имеет foreground-lock, который обходится
+    # эмуляцией нажатия Alt (keybd_event) — стандартный хак.
+    # Окно ищем по заголовку, потому что в трее MainWindowHandle ненадёжен.
     try {
         if (-not ('IPDROM.WinFG' -as [type])) {
             Add-Type -Namespace IPDROM -Name WinFG -MemberDefinition @'
+public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpfn, System.IntPtr lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode)] public static extern int GetWindowText(System.IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern int GetWindowTextLength(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint lpdwProcessId);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindowAsync(System.IntPtr hWnd, int nCmdShow);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hWnd);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool BringWindowToTop(System.IntPtr hWnd);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetWindowPos(System.IntPtr hWnd, System.IntPtr hWndAfter, int X, int Y, int cx, int cy, uint uFlags);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, System.UIntPtr dwExtraInfo);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
 '@
         }
-        $names = @('AIDA64Port','aida64','AIDA64BusinessPortable')
-        $aida  = $null
-        foreach ($n in $names) {
-            $aida = Get-Process -Name $n -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-            if ($aida) { break }
-        }
-        if (-not $aida) { Write-Log "Bring-AidaToFront: AIDA window not found." 'Yellow'; return }
 
-        $h = $aida.MainWindowHandle
-        # SW_RESTORE = 9 — разворачивает из трея/свёрнутого
-        [IPDROM.WinFG]::ShowWindow($h, 9) | Out-Null
+        # AIDA-процессы для фильтрации (по PID)
+        $aidaProcs = @()
+        foreach ($n in @('AIDA64Port','aida64','AIDA64BusinessPortable')) {
+            $aidaProcs += Get-Process -Name $n -ErrorAction SilentlyContinue
+        }
+        if ($aidaProcs.Count -eq 0) { Write-Log "Bring-AidaToFront: AIDA process not running." 'Yellow'; return }
+        $aidaPids = $aidaProcs.Id
+
+        # Собираем все top-level окна AIDA, фильтруем по PID и видимости/заголовку
+        $found = [System.Collections.Generic.List[object]]::new()
+        $cb = [IPDROM.WinFG+EnumWindowsProc]{
+            param($hWnd, $lParam)
+            $pid2 = 0
+            [void][IPDROM.WinFG]::GetWindowThreadProcessId($hWnd, [ref]$pid2)
+            if ($aidaPids -contains [int]$pid2) {
+                $len = [IPDROM.WinFG]::GetWindowTextLength($hWnd)
+                if ($len -gt 0) {
+                    $sb = New-Object System.Text.StringBuilder ($len + 2)
+                    [void][IPDROM.WinFG]::GetWindowText($hWnd, $sb, $sb.Capacity)
+                    $title = $sb.ToString()
+                    if ($title -match 'AIDA64|System Stability') {
+                        $found.Add([pscustomobject]@{ HWnd = $hWnd; Title = $title; Visible = [IPDROM.WinFG]::IsWindowVisible($hWnd) }) | Out-Null
+                    }
+                }
+            }
+            return $true
+        }
+        [void][IPDROM.WinFG]::EnumWindows($cb, [System.IntPtr]::Zero)
+
+        if ($found.Count -eq 0) { Write-Log "Bring-AidaToFront: AIDA window not found by title." 'Yellow'; return }
+
+        # Берём первое подходящее окно — обычно "System Stability Test - AIDA64"
+        $target = $found | Where-Object { $_.Title -match 'System Stability' } | Select-Object -First 1
+        if (-not $target) { $target = $found[0] }
+        $h = $target.HWnd
+        Write-Log "Bring-AidaToFront: found '$($target.Title)' (visible=$($target.Visible))" 'DarkGray'
+
+        # SW_RESTORE = 9 — для свёрнутого; SW_SHOW = 5 — для скрытого
+        [IPDROM.WinFG]::ShowWindowAsync($h, 9) | Out-Null
+        [IPDROM.WinFG]::ShowWindowAsync($h, 5) | Out-Null
+
+        # Foreground-lock bypass: имитируем нажатие Alt в текущем потоке
+        # VK_MENU=0x12, KEYEVENTF_KEYUP=0x0002
+        [IPDROM.WinFG]::keybd_event(0x12, 0, 0, [System.UIntPtr]::Zero)
+        [IPDROM.WinFG]::keybd_event(0x12, 0, 0x0002, [System.UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 50
+
+        # Дополнительно — AttachThreadInput trick
+        $fgHwnd  = [IPDROM.WinFG]::GetForegroundWindow()
+        $fgPid   = 0
+        $fgTid   = [IPDROM.WinFG]::GetWindowThreadProcessId($fgHwnd, [ref]$fgPid)
+        $selfTid = [IPDROM.WinFG]::GetCurrentThreadId()
+        $attached = $false
+        if ($fgTid -ne 0 -and $fgTid -ne $selfTid) {
+            $attached = [IPDROM.WinFG]::AttachThreadInput($selfTid, $fgTid, $true)
+        }
         # HWND_TOPMOST = -1, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW = 0x0043
         [IPDROM.WinFG]::SetWindowPos($h, [System.IntPtr]::new(-1), 0, 0, 0, 0, 0x0043) | Out-Null
-        [IPDROM.WinFG]::BringWindowToTop($h)  | Out-Null
+        [IPDROM.WinFG]::BringWindowToTop($h)    | Out-Null
         [IPDROM.WinFG]::SetForegroundWindow($h) | Out-Null
-        # Снимаем topmost, но окно остаётся поверх остальных (HWND_NOTOPMOST = -2)
+        if ($attached) { [void][IPDROM.WinFG]::AttachThreadInput($selfTid, $fgTid, $false) }
+
         Start-Sleep -Milliseconds 500
+        # Снимаем topmost (HWND_NOTOPMOST = -2), окно остаётся поверх остальных
         [IPDROM.WinFG]::SetWindowPos($h, [System.IntPtr]::new(-2), 0, 0, 0, 0, 0x0043) | Out-Null
         Start-Sleep -Seconds 1   # дать DWM перерисовать
-        Write-Log "AIDA window brought to front (hwnd=$h)." 'DarkGray'
+
+        $nowFg = [IPDROM.WinFG]::GetForegroundWindow()
+        if ($nowFg -eq $h) {
+            Write-Log "AIDA brought to foreground OK (hwnd=$h)." 'DarkGray'
+        } else {
+            Write-Log "AIDA SetForegroundWindow returned, but foreground hwnd=$nowFg (expected $h). Screenshot may still capture wrong window." 'Yellow'
+        }
     } catch {
         Write-Log "Bring-AidaToFront error: $_" 'Yellow'
+    }
+}
+
+function Save-AidaScreenshotInline {
+    # Снимает AIDA без вызова screen.ps1 — без IPC, child-процессов, таймаутов.
+    # 1) Bring-AidaToFront уже сделал окно foreground.
+    # 2) CopyFromScreen по primary screen (AIDA в фуллскрине занимает её всю).
+    # 3) Сохраняем PNG в Desktop\<PC>\Screens с тем же именованием, что и screen.ps1.
+    param([Parameter(Mandatory)][string]$Prefix)
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+
+        # Папка как у screen.ps1: Desktop\COMPUTERNAME\Screens
+        $screensDir = Join-Path (Join-Path ([Environment]::GetFolderPath('Desktop')) $env:COMPUTERNAME) 'Screens'
+        New-Item -ItemType Directory -Force -Path $screensDir | Out-Null
+
+        $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+        $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+        try {
+            $gfx.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bmp.Size)
+            $ts   = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+            $path = Join-Path $screensDir ("{0}_{1}.png" -f $Prefix, $ts)
+            $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+            Write-Log "Inline screenshot saved: $path" 'Green'
+        } finally {
+            $gfx.Dispose()
+            $bmp.Dispose()
+        }
+    } catch {
+        Write-Log "Save-AidaScreenshotInline error: $_" 'Red'
     }
 }
 
@@ -342,42 +441,53 @@ Write-Log "All tests launched. Last tool started at offset +${lastLaunchOffsetSe
 Write-Log "AIDA64 will finish at $(($testStartTime.AddSeconds($totalSeconds)).ToString('HH:mm:ss'))" 'Cyan'
 Write-Log "Last tool  will finish at $(($testStartTime.AddSeconds($totalSeconds + $lastLaunchOffsetSec)).ToString('HH:mm:ss'))" 'Cyan'
 
-# ===================== WAIT FOR AIDA =====================
-#  Sequence (from end of AIDA timer backwards):
-#    T - 300s : AidaAuto  screenshot
-#    T -  30s : AidaFinal screenshot  (AIDA окно ТОЧНО ещё открыто)
-#    T        : AIDA stress test ends
-$aida_remaining = $totalSeconds - (Get-ElapsedSec)
+# ===================== WAIT FOR AIDA (ABSOLUTE TIMING) =====================
+# Используем абсолютные моменты времени, а не накопительные Start-Sleep.
+# Иначе зависший на 90с screen.ps1 сдвинет все последующие шаги и AidaFinal
+# попадёт уже после конца стресс-таймера AIDA — окно закроется и скриншот
+# поймает то, что под AIDA-окном (FurMark/FIO).
+$aidaEndTime   = $testStartTime.AddSeconds($totalSeconds)
+$autoShotTime  = $aidaEndTime.AddSeconds(-300)   # T - 5 min : AidaAuto
+$finalShotTime = $aidaEndTime.AddSeconds(-30)    # T - 30 s  : AidaFinal (AIDA ТОЧНО ещё открыта)
 
-if ($aida_remaining -gt 300) {
-    $autoShotDelay = $aida_remaining - 300
-    Write-Log "Waiting ${autoShotDelay}s then AidaAuto screenshot (at $(((Get-Date).AddSeconds($autoShotDelay)).ToString('HH:mm:ss')))..."
-    Start-Sleep -Seconds $autoShotDelay
+function Wait-Until {
+    param([datetime]$Target, [string]$Label)
+    $now = Get-Date
+    if ($Target -le $now) {
+        Write-Log "  ${Label}: target $($Target.ToString('HH:mm:ss')) already passed (now $($now.ToString('HH:mm:ss'))), skipping wait." 'DarkGray'
+        return
+    }
+    $sec = [int]($Target - $now).TotalSeconds
+    Write-Log "  Waiting ${sec}s until $($Target.ToString('HH:mm:ss')) for ${Label}..." 'DarkGray'
+    Start-Sleep -Seconds $sec
+}
+
+# --- AidaAuto (T-300s) — только если до него ещё есть запас
+if ((Get-Date) -lt $autoShotTime) {
+    Wait-Until -Target $autoShotTime -Label 'AidaAuto'
     Write-Log "Taking AidaAuto screenshot (5 min before AIDA end)..." 'Yellow'
     Bring-AidaToFront
-    & $invokeScreen 'AidaAuto'
-
-    Write-Log "Waiting 270s until 30s before AIDA end..."
-    Start-Sleep -Seconds 270
-    Write-Log "Taking AidaFinal screenshot (30s before AIDA end, window still open)..." 'Yellow'
-    Bring-AidaToFront
-    & $invokeScreen 'AidaFinal'
-
-    Write-Log "Waiting final 30s for AIDA stress test to actually end..."
-    Start-Sleep -Seconds 30
-} elseif ($aida_remaining -gt 30) {
-    Write-Log "Less than 5 min remaining, skipping AidaAuto. Waiting $($aida_remaining - 30)s..."
-    Start-Sleep -Seconds ($aida_remaining - 30)
-    Write-Log "Taking AidaFinal screenshot (30s before AIDA end)..." 'Yellow'
-    Bring-AidaToFront
-    & $invokeScreen 'AidaFinal'
-    Start-Sleep -Seconds 30
-} elseif ($aida_remaining -gt 0) {
-    Write-Log "Less than 30s remaining, taking AidaFinal immediately..."
-    Bring-AidaToFront
-    & $invokeScreen 'AidaFinal'
-    Start-Sleep -Seconds $aida_remaining
+    Save-AidaScreenshotInline -Prefix 'AIDA64_auto'
+} else {
+    Write-Log "AidaAuto window missed (we are already past T-300s). Skipping AidaAuto." 'Yellow'
 }
+
+# --- AidaFinal (T-30s) — ЭТОТ скриншот критичен, делаем всегда, пока AIDA жива
+if ((Get-Date) -lt $finalShotTime) {
+    Wait-Until -Target $finalShotTime -Label 'AidaFinal'
+}
+# Если уже после T-30, всё равно пытаемся: AIDA, скорее всего, ещё открыта
+# (она закрывается через несколько секунд ПОСЛЕ конца таймера).
+if ((Get-Date) -lt $aidaEndTime.AddSeconds(10)) {
+    Write-Log "Taking AidaFinal screenshot..." 'Yellow'
+    Bring-AidaToFront
+    Save-AidaScreenshotInline -Prefix 'AIDA64_final'
+} else {
+    Write-Log "AidaFinal window missed (we are already past AIDA end). Skipping AidaFinal." 'Red'
+}
+
+# Досыпаем до фактического конца AIDA
+Wait-Until -Target $aidaEndTime -Label 'AIDA end'
 
 # ===================== WAIT FOR FURMARK / FIO TO ALSO FINISH =====================
 # AidaFinal уже сделан выше (за 30s до конца AIDA).

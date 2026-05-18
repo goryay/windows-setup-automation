@@ -106,6 +106,93 @@ function Get-FreeDriveLetter {
     throw 'No free drive letters available.'
 }
 
+function Get-RaidConfig {
+    # Reads optional G:\customization\raid_config.json. Returns $null if file
+    # missing/invalid. Schema:
+    # {
+    #   "raid": {
+    #     "create_if_missing": true,
+    #     "controller": 0,
+    #     "level": "r0",
+    #     "drives": "all",
+    #     "strip_size_kb": 256,
+    #     "init_if_present_but_raw": true
+    #   },
+    #   "raw_disks": {
+    #     "init_all": true
+    #   }
+    # }
+    param([Parameter(Mandatory)][string]$UsbRoot)
+    $cfgPath = Join-Path $UsbRoot 'customization\raid_config.json'
+    if (-not (Test-Path $cfgPath)) {
+        Write-RaidLog "No raid_config.json at $cfgPath. Using defaults (no auto-RAID, no auto-init of plain raw disks)."
+        return $null
+    }
+    try {
+        $cfg = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        Write-RaidLog "Loaded raid_config.json from $cfgPath."
+        return $cfg
+    } catch {
+        Write-ColorOutput "  raid_config.json found but failed to parse: $_" 'Yellow'
+        Write-RaidLog "raid_config.json parse error: $_"
+        return $null
+    }
+}
+
+function New-MegaRaidVirtualDriveFromConfig {
+    # Creates a MegaRAID VD via StorCLI when no VD exists and config asks for it.
+    # Returns $true if a new VD was created, $false otherwise.
+    param(
+        [Parameter(Mandatory)][string]$StorCliPath,
+        [Parameter(Mandatory)]$RaidConfig
+    )
+    if (-not $RaidConfig -or -not $RaidConfig.raid) { return $false }
+    if (-not $RaidConfig.raid.create_if_missing) { return $false }
+
+    $ctrl  = if ($null -ne $RaidConfig.raid.controller) { [int]$RaidConfig.raid.controller } else { 0 }
+    $level = "$($RaidConfig.raid.level)".ToLower()
+    if ($level -notmatch '^r(0|1|5|6|10)$') {
+        Write-ColorOutput "  raid_config: invalid level '$level'. Skipping RAID creation." 'Yellow'
+        return $false
+    }
+    $drives = if ($RaidConfig.raid.drives) { "$($RaidConfig.raid.drives)" } else { 'all' }
+    $strip  = if ($RaidConfig.raid.strip_size_kb) { [int]$RaidConfig.raid.strip_size_kb } else { 256 }
+
+    if ($drives -ieq 'all') {
+        $pdQuery = Invoke-StorCliCommand -StorCliPath $StorCliPath -Arguments @("/c$ctrl/eall/sall", 'show') -TimeoutSeconds 30
+        if (-not $pdQuery.Success) {
+            Write-ColorOutput '  Cannot enumerate physical drives for RAID creation. Skipping.' 'Yellow'
+            return $false
+        }
+        $eidSlots = @()
+        foreach ($line in ($pdQuery.Output -split "`r?`n")) {
+            if ($line -match '^\s*(\d+):(\d+)\s') { $eidSlots += "$($Matches[1]):$($Matches[2])" }
+        }
+        if ($eidSlots.Count -eq 0) {
+            Write-ColorOutput '  StorCLI found no physical drives to build RAID. Skipping.' 'Yellow'
+            return $false
+        }
+        $drivesArg = $eidSlots -join ','
+    } else {
+        $drivesArg = $drives
+    }
+
+    Write-ColorOutput "  Creating MegaRAID VD: level=$level drives=$drivesArg strip=$strip..." 'Yellow'
+    Write-RaidLog "Creating MegaRAID VD: /c$ctrl add vd type=$level drives=$drivesArg strip=$strip"
+
+    $result = Invoke-StorCliCommand -StorCliPath $StorCliPath -Arguments @("/c$ctrl", 'add', 'vd', "type=$level", "drives=$drivesArg", "strip=$strip") -TimeoutSeconds 90
+    if ($result.Success -and ($result.Output -match 'Success|Operation\s+\:\s*Success')) {
+        Write-ColorOutput '  MegaRAID VD created.' 'Green'
+        Write-RaidLog 'MegaRAID VD created successfully.'
+        Start-Sleep -Seconds 10   # wait for VD to come up
+        return $true
+    } else {
+        Write-ColorOutput "  StorCLI VD creation reported failure. Output: $($result.Output)" 'Yellow'
+        Write-RaidLog "StorCLI VD creation failed. Output: $($result.Output)"
+        return $false
+    }
+}
+
 function Find-StorCliPath {
     param([Parameter(Mandatory)][string]$UsbRoot)
 
@@ -485,7 +572,16 @@ function Get-FioTargetDriveLetters {
     }
 
     $storCli = Find-StorCliPath -UsbRoot $UsbRoot
+    $raidCfg = Get-RaidConfig -UsbRoot $UsbRoot
     $megaRaidVdExists = Get-MegaRaidVirtualDriveState -StorCliPath $storCli
+
+    # If config says "create_if_missing" and no VD detected — create it via StorCLI
+    if ($storCli -and -not $megaRaidVdExists -and $raidCfg -and $raidCfg.raid -and $raidCfg.raid.create_if_missing) {
+        $created = New-MegaRaidVirtualDriveFromConfig -StorCliPath $storCli -RaidConfig $raidCfg
+        if ($created) {
+            $megaRaidVdExists = $true
+        }
+    }
 
     $skipDiskpart = [bool]$megaRaidPnp
     Invoke-StorageRescan -SkipDiskpart $skipDiskpart
@@ -508,15 +604,28 @@ function Get-FioTargetDriveLetters {
 
     $preparedLetters = @()
 
+    # Extra safety: only fixed buses can be auto-initialised.
+    # Plain raw disks initialised only if config explicitly opts in via raw_disks.init_all.
+    $safeFixedBuses   = @('SATA','NVMe','SAS','RAID','ATA','SCSI','iSCSI','Fibre Channel','SD')
+    $initRawDisksAuto = [bool]($raidCfg -and $raidCfg.raw_disks -and $raidCfg.raw_disks.init_all)
+    $initRaidVdIfRaw  = [bool]($raidCfg -and $raidCfg.raid -and $raidCfg.raid.init_if_present_but_raw)
+
     foreach ($disk in $candidateDisks) {
         $isMegaRaidLike = Test-IsMegaRaidLikeDisk -Disk $disk
+        $busType        = $disk.BusType.ToString()
+        $isSafeBus      = ($safeFixedBuses -contains $busType)
 
         $allowCreate = $false
-        if ($isMegaRaidLike) {
+        if ($isMegaRaidLike -and $initRaidVdIfRaw) {
             $allowCreate = $true
-        } elseif ($megaRaidVdExists -and $candidateDisks.Count -eq 1) {
+        } elseif ($megaRaidVdExists -and $candidateDisks.Count -eq 1 -and $initRaidVdIfRaw) {
+            $allowCreate = $true
+        } elseif ($initRawDisksAuto -and $isSafeBus -and -not $isMegaRaidLike) {
+            # Plain (non-RAID) disk on a fixed bus — init only if config explicitly says so
             $allowCreate = $true
         }
+
+        Write-RaidLog "Disk $($disk.Number): bus=$busType, megaRaidLike=$isMegaRaidLike, safeBus=$isSafeBus, allowCreate=$allowCreate"
 
         $preparedLetters += Ensure-DataDiskHasDriveLetter -Disk $disk -AllowCreatePartition:$allowCreate
     }
