@@ -672,19 +672,26 @@ powercfg /change standby-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 powercfg /change monitor-timeout-ac 0
 
-# Pagefile: switch to system-managed. Fixes STATUS_COMMITMENT_LIMIT (0xC000012D)
-# when running AIDA64 + 2x FurMark + FIO on systems with default 4 GB pagefile.
-# Takes full effect after reboot, but Windows starts extending the file immediately.
+# Pagefile sanity check. Основной фикс размера pagefile живёт в setup_apps_and_theme.ps1
+# (этап FirstLogon, ставит 16-32 GB ДО того, как стресс-тест запускается; ребут после
+# FirstLogon применяет настройку).
+# Здесь — только информационная проверка: если pagefile внезапно мал, печатаем
+# чёткое предупреждение и идём дальше. Никаких автоматических ребутов — чтобы
+# случайный ручной запуск не перезагрузил систему оператора.
 try {
-    $cs = Get-CimInstance Win32_ComputerSystem
-    if (-not $cs.AutomaticManagedPagefile) {
-        $cs | Set-CimInstance -Property @{ AutomaticManagedPagefile = $true }
-        Write-ColorOutput '  Pagefile switched to system-managed (full effect after next reboot).' 'Green'
+    $currentPagefile = Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue | Select-Object -First 1
+    $pfMB = if ($currentPagefile) { [int]$currentPagefile.AllocatedBaseSize } else { 0 }
+
+    if ($pfMB -lt 8192) {
+        Write-ColorOutput "  WARNING: pagefile is only ${pfMB} MB. AIDA64 + 2x FurMark needs ≥16 GB." 'Red'
+        Write-ColorOutput "  Stress test will likely fail with Out-of-virtual-memory (Event 2004)." 'Red'
+        Write-ColorOutput "  To fix: run setup_apps_and_theme.ps1 (sets fixed 16-32 GB pagefile, requires reboot)." 'Yellow'
+        Write-ColorOutput "  Continuing anyway, but expect AIDA/FurMark to die mid-test." 'Yellow'
     } else {
-        Write-ColorOutput '  Pagefile already system-managed.' 'DarkGray'
+        Write-ColorOutput "  Pagefile OK ($pfMB MB)." 'Green'
     }
 } catch {
-    Write-ColorOutput "  Failed to set pagefile to system-managed: $_" 'Yellow'
+    Write-ColorOutput "  Pagefile size check failed: $_" 'Yellow'
 }
 
 $flagFile = "$env:ProgramData\IPDROM_StressTest_Completed.flag"
