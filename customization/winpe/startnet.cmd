@@ -107,12 +107,12 @@ set DETAIL=%TEMP%\dp_detail_out.txt
 diskpart /s "%DPSCRIPT%" > "%DETAIL%" 2>&1
 type "%DETAIL%" >> "%IPDROM_LOG%"
 
-:: Parse "Disk ###" line — column with number
-for /f "tokens=2" %%i in ('findstr /R "^[ ]*\* Disk" "%DETAIL%" 2^>nul') do set IPDROM_SYSDISK=%%i
-if not defined IPDROM_SYSDISK (
-    for /f "tokens=2" %%i in ('findstr /R "Disk [0-9]" "%DETAIL%" 2^>nul') do (
-        if not defined IPDROM_SYSDISK set IPDROM_SYSDISK=%%i
-    )
+:: Parse selected disk row — locale-independent.
+:: detail volume marks the disk row containing the selected volume with "*".
+:: Format (RU): "* Диск N    В сети ..."  /  (EN): "* Disk N    Online ..."
+:: We grep for lines starting with "*" then take 3rd whitespace token (the number).
+for /f "tokens=3" %%i in ('findstr /R "^[ ]*\*" "%DETAIL%" 2^>nul') do (
+    if not defined IPDROM_SYSDISK set IPDROM_SYSDISK=%%i
 )
 
 if not defined IPDROM_SYSDISK (
@@ -137,11 +137,8 @@ set DETAIL2=%TEMP%\dp_target_out.txt
 diskpart /s "%DPSCRIPT2%" > "%DETAIL2%" 2>&1
 
 set IPDROM_TGTDISK=
-for /f "tokens=2" %%i in ('findstr /R "^[ ]*\* Disk" "%DETAIL2%" 2^>nul') do set IPDROM_TGTDISK=%%i
-if not defined IPDROM_TGTDISK (
-    for /f "tokens=2" %%i in ('findstr /R "Disk [0-9]" "%DETAIL2%" 2^>nul') do (
-        if not defined IPDROM_TGTDISK set IPDROM_TGTDISK=%%i
-    )
+for /f "tokens=3" %%i in ('findstr /R "^[ ]*\*" "%DETAIL2%" 2^>nul') do (
+    if not defined IPDROM_TGTDISK set IPDROM_TGTDISK=%%i
 )
 
 if defined IPDROM_TGTDISK (
