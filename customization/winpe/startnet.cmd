@@ -91,27 +91,11 @@ exit /b 2
 :found_sys
 echo System drive letter: %IPDROM_SYSDRV% >> "%IPDROM_LOG%"
 
-:: --- Map drive letter to physical disk index via diskpart ---
-echo list disk > "%TEMP%\dp_list.txt"
-echo exit >> "%TEMP%\dp_list.txt"
-diskpart /s "%TEMP%\dp_list.txt" >> "%IPDROM_LOG%" 2>&1
-
-:: Find disk that contains the system drive. PowerShell-free method via diskpart:
-:: SELECT VOLUME (letter) → DETAIL VOLUME shows Disk ###
-set DPSCRIPT=%TEMP%\dp_detail.txt
-echo select volume %IPDROM_SYSDRV:~0,1% > "%DPSCRIPT%"
-echo detail volume >> "%DPSCRIPT%"
-echo exit >> "%DPSCRIPT%"
-
-set DETAIL=%TEMP%\dp_detail_out.txt
-diskpart /s "%DPSCRIPT%" > "%DETAIL%" 2>&1
-type "%DETAIL%" >> "%IPDROM_LOG%"
-
-:: Parse selected disk row — locale-independent.
-:: detail volume marks the disk row containing the selected volume with "*".
-:: Format (RU): "* Диск N    В сети ..."  /  (EN): "* Disk N    Online ..."
-:: We grep for lines starting with "*" then take 3rd whitespace token (the number).
-for /f "tokens=3" %%i in ('findstr /R "^[ ]*\*" "%DETAIL%" 2^>nul') do (
+:: --- Map drive letter to physical disk index via PowerShell ---
+:: PowerShell is available in WinPE and handles Unicode/locale correctly.
+:: Avoid diskpart text parsing which is fragile on RU-locale and UTF-16 output.
+echo Querying system disk number via PowerShell... >> "%IPDROM_LOG%"
+for /f "tokens=*" %%i in ('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "(Get-Partition -DriveLetter '%IPDROM_SYSDRV:~0,1%' -ErrorAction SilentlyContinue).DiskNumber" 2^>nul') do (
     if not defined IPDROM_SYSDISK set IPDROM_SYSDISK=%%i
 )
 
@@ -128,16 +112,9 @@ echo System disk number: %IPDROM_SYSDISK% >> "%IPDROM_LOG%"
 echo System disk: PhysicalDrive%IPDROM_SYSDISK%
 
 :: --- Sanity check: don't capture the IpdromREC USB itself ---
-:: Get disk number for the IpdromREC partition for comparison
-set DPSCRIPT2=%TEMP%\dp_check_target.txt
-echo select volume %IPDROM_TARGET:~0,1% > "%DPSCRIPT2%"
-echo detail volume >> "%DPSCRIPT2%"
-echo exit >> "%DPSCRIPT2%"
-set DETAIL2=%TEMP%\dp_target_out.txt
-diskpart /s "%DPSCRIPT2%" > "%DETAIL2%" 2>&1
-
+:: Get disk number for the IpdromREC partition via PowerShell (locale-independent)
 set IPDROM_TGTDISK=
-for /f "tokens=3" %%i in ('findstr /R "^[ ]*\*" "%DETAIL2%" 2^>nul') do (
+for /f "tokens=*" %%i in ('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "(Get-Partition -DriveLetter '%IPDROM_TARGET:~0,1%' -ErrorAction SilentlyContinue).DiskNumber" 2^>nul') do (
     if not defined IPDROM_TGTDISK set IPDROM_TGTDISK=%%i
 )
 
