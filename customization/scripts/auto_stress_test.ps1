@@ -1000,24 +1000,50 @@ if (Test-Path $baseDir) {
     Write-Warning "  Results folder not found: $baseDir"
 }
 
-Write-ColorOutput '[6.5/7] Creating full system backup...' 'Yellow'
-$backupScript = Join-Path $scriptDir 'Create-FullBackup.ps1'
-if (Test-Path $backupScript) {
+Write-ColorOutput '[6.5/7] Creating FFU recovery image (reboot into WinPE)...' 'Yellow'
+$prepareScript = Join-Path $scriptDir 'Prepare-IpdromRecFlash.ps1'
+$triggerScript = Join-Path $scriptDir 'Invoke-FfuCaptureReboot.ps1'
+
+# Step 1: prepare the IpdromREC flash (FRESH or REFRESH)
+$flashReady = $false
+if (Test-Path $prepareScript) {
     try {
-        & $backupScript -BackupLabel 'IpdromREC'
+        & $prepareScript
         if ($LASTEXITCODE -eq 0) {
-            Write-ColorOutput '  Full backup completed.' 'Green'
+            Write-ColorOutput '  IpdromREC flash prepared.' 'Green'
+            $flashReady = $true
         } else {
-            Write-Warning "  Full backup script exited with code $LASTEXITCODE"
+            Write-Warning "  Prepare-IpdromRecFlash.ps1 exited with code $LASTEXITCODE — skipping capture."
         }
     } catch {
-        Write-Warning "  Full backup failed: $_"
+        Write-Warning "  Prepare-IpdromRecFlash failed: $_"
     }
 } else {
-    Write-Warning "  Create-FullBackup.ps1 not found next to auto_stress_test.ps1"
+    Write-Warning "  Prepare-IpdromRecFlash.ps1 not found — falling back to legacy Create-FullBackup.ps1"
+    $backupScript = Join-Path $scriptDir 'Create-FullBackup.ps1'
+    if (Test-Path $backupScript) {
+        try { & $backupScript -BackupLabel 'IpdromREC' } catch { Write-Warning $_ }
+    }
 }
 
-New-Item -Path $flagFile -ItemType File -Force | Out-Null
+# Step 2: arm BootNext and reboot into WinPE (only if flash is ready)
+if ($flashReady -and (Test-Path $triggerScript)) {
+    Write-ColorOutput '  Arming BootNext and rebooting into WinPE for FFU capture...' 'Yellow'
+    # Trigger writes the IPDROM_StressTest_Completed.flag itself before reboot,
+    # so we don't need to write it here.
+    & $triggerScript
+    # If trigger returned (didn't reboot), something went wrong — log and continue
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "  Invoke-FfuCaptureReboot returned exit code $LASTEXITCODE (no reboot)."
+    }
+}
+
+# Fallback: if we got here without rebooting (no flash / trigger failed), mark the
+# test as complete so the launcher won't loop. The trigger script writes this flag
+# itself when it rebooots, but on a no-reboot path we need to do it ourselves.
+if (-not (Test-Path $flagFile)) {
+    New-Item -Path $flagFile -ItemType File -Force | Out-Null
+}
 Write-ColorOutput "`n========================================" 'Green'
 Write-ColorOutput '   STRESS TEST COMPLETED!' 'Green'
 Write-ColorOutput '========================================' 'Green'
