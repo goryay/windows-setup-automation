@@ -26,12 +26,27 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string]$SourceWim,
-    [Parameter(Mandatory)][string]$OutputWim,
+    # По умолчанию — забэндленный в репо boot.wim:
+    #   D:\TestISO\customization\winpe\boot.wim
+    [string]$SourceWim,
+    # По умолчанию — рядом с source, имя boot_patched.wim:
+    #   D:\TestISO\customization\winpe\boot_patched.wim
+    [string]$OutputWim,
     [int]$Index = 1,
     [string]$WinpeFiles,
     [string]$LogPath
 )
+
+# ===================== APPLY DEFAULTS =====================
+if (-not $WinpeFiles) {
+    $WinpeFiles = Join-Path (Split-Path $PSScriptRoot -Parent) 'winpe'
+}
+if (-not $SourceWim) {
+    $SourceWim = Join-Path $WinpeFiles 'boot.wim'
+}
+if (-not $OutputWim) {
+    $OutputWim = Join-Path $WinpeFiles 'boot_patched.wim'
+}
 
 $ErrorActionPreference = 'Stop'
 
@@ -61,9 +76,6 @@ if (-not (Test-Path $SourceWim)) {
     exit 2
 }
 
-if (-not $WinpeFiles) {
-    $WinpeFiles = Join-Path (Split-Path $PSScriptRoot -Parent) 'winpe'
-}
 $startnetSrc  = Join-Path $WinpeFiles 'startnet.cmd'
 $winpeshlSrc  = Join-Path $WinpeFiles 'winpeshl.ini'
 
