@@ -668,9 +668,28 @@ Write-ColorOutput "Log file: $script:StressLogFile" 'DarkGray'
 Write-Host ''
 
 Write-ColorOutput '[1/7] Disabling power saving...' 'Yellow'
+# Standard timeouts
 powercfg /change standby-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 powercfg /change monitor-timeout-ac 0
+powercfg /change disk-timeout-ac 0
+
+# CRITICAL: "System unattended sleep timeout". Default = 2 min on AC.
+# When PowerShell sits in Start-Sleep with no user input, Windows treats
+# the session as "unattended" and suspends to S3/S0ix anyway, even with
+# standby-timeout-ac=0. Caused 8-minute schedule drift in stress runs.
+# This setting is hidden by default — first unmask it via -attributes.
+powercfg -attributes SUB_SLEEP 7bc4a2f9-d8fc-4469-b07b-33eb785aaca0 -ATTRIB_HIDE
+powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP 7bc4a2f9-d8fc-4469-b07b-33eb785aaca0 0
+powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_SLEEP 7bc4a2f9-d8fc-4469-b07b-33eb785aaca0 0
+# USB selective suspend off (мы пишем на флешку IpdromREC/Ventoy + FIO target диски)
+powercfg /SETACVALUEINDEX SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
+powercfg /SETDCVALUEINDEX SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
+# PCIe ASPM off (мы стрессим PCIe-устройства: GPU, MegaRAID)
+powercfg /SETACVALUEINDEX SCHEME_CURRENT 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0
+powercfg /SETDCVALUEINDEX SCHEME_CURRENT 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0
+# Apply changes
+powercfg /SETACTIVE SCHEME_CURRENT
 
 # Pagefile sanity check. Основной фикс размера pagefile живёт в setup_apps_and_theme.ps1
 # (этап FirstLogon, ставит 16-32 GB ДО того, как стресс-тест запускается; ребут после

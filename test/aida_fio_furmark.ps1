@@ -35,6 +35,31 @@ function Write-Log {
     Write-Host $Message -ForegroundColor $Color
 }
 
+# ===================== KEEP SYSTEM AWAKE =====================
+# SetThreadExecutionState — официальный Windows API «не засыпай, я работаю».
+# Это страховка на случай, если powercfg-настройки в [1/7] не сработали
+# (BIOS override, Modern Standby policies и т.п.). Действует на время жизни
+# текущего потока PowerShell. При завершении скрипта Windows автоматически
+# снимет блокировку (флаг ES_CONTINUOUS).
+try {
+    if (-not ('IPDROM.Power' -as [type])) {
+        Add-Type -Namespace IPDROM -Name Power -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern uint SetThreadExecutionState(uint esFlags);
+public const uint ES_CONTINUOUS       = 0x80000000;
+public const uint ES_SYSTEM_REQUIRED  = 0x00000001;
+public const uint ES_DISPLAY_REQUIRED = 0x00000002;
+'@
+    }
+    $flags = [IPDROM.Power]::ES_CONTINUOUS -bor `
+             [IPDROM.Power]::ES_SYSTEM_REQUIRED -bor `
+             [IPDROM.Power]::ES_DISPLAY_REQUIRED
+    [IPDROM.Power]::SetThreadExecutionState($flags) | Out-Null
+    Write-Log "Power keep-alive engaged (SetThreadExecutionState SYSTEM+DISPLAY)." 'DarkGray'
+} catch {
+    Write-Log "Power keep-alive failed: $_" 'Yellow'
+}
+
 # ===================== PATHS =====================
 if (-not $UsbRoot) { $UsbRoot = [System.IO.Path]::GetPathRoot($PSScriptRoot) }
 $script:Aida64FullPath  = Join-Path $UsbRoot 'SoftForTest\AIDA64\AIDA64Port.exe'
@@ -580,5 +605,13 @@ if (Test-Path $script:Aida64FullPath) {
 } else {
     Write-Log "AIDA64 not found at $script:Aida64FullPath, report skipped." 'Yellow'
 }
+
+# Release power keep-alive — system can resume normal sleep behavior now
+try {
+    if ('IPDROM.Power' -as [type]) {
+        [IPDROM.Power]::SetThreadExecutionState([IPDROM.Power]::ES_CONTINUOUS) | Out-Null
+        Write-Log "Power keep-alive released." 'DarkGray'
+    }
+} catch {}
 
 Write-Log "========== aida_fio_furmark.ps1 completed ==========" 'Green'
