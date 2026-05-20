@@ -502,7 +502,8 @@ if ($lastLaunchOffsetSec -gt 0) {
 Write-Log "Waiting 80s for console windows to print final status (_FINAL title)..."
 Start-Sleep -Seconds 80
 
-# ===================== FINAL SCREENSHOTS (FurMark / FIO / Desktop) =====================
+# ===================== TOOL-SPECIFIC FINAL SCREENSHOTS =====================
+# FurMark/FIO консоли нужны открытыми с _FINAL заголовком, иначе их не найти.
 Write-Log "Taking final screenshots..." 'Yellow'
 
 if ($furmarkStarted.Count -gt 0) {
@@ -515,10 +516,8 @@ if ($fioStarted.Count -gt 0) {
     & $invokeScreen 'FioFinal'
 }
 
-Write-Log "  -> DesktopFinal..."
-& $invokeScreen 'DesktopFinal'
-
 # ===================== CLOSE WINDOWS =====================
+# Закрываем ДО DesktopFinal, чтобы скриншот рабочего стола был чистым.
 Write-Log "Closing FurMark windows..." 'Yellow'
 Get-Process -Name 'furmark' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 foreach ($launch in $furmarkStarted) {
@@ -547,6 +546,20 @@ Write-Log "Closing AIDA64..." 'Yellow'
 Close-ProcessByName -name 'AIDA64Port'             -waitSeconds 15
 Close-ProcessByName -name 'aida64'                 -waitSeconds 5
 Close-ProcessByName -name 'AIDA64BusinessPortable' -waitSeconds 5
+
+# ===================== CLEAN DESKTOP SCREENSHOT =====================
+# Все окна стресс-теста закрыты. Минимизируем остатки (PowerShell-консоль скрипта,
+# проводник и т.п.) и снимаем чистый рабочий стол.
+Write-Log "Waiting 3s for DWM to redraw after window close..." 'DarkGray'
+Start-Sleep -Seconds 3
+try {
+    (New-Object -ComObject Shell.Application).MinimizeAll()
+    Start-Sleep -Seconds 2
+} catch {
+    Write-Log "MinimizeAll failed: $_" 'Yellow'
+}
+Write-Log "  -> DesktopFinal..."
+& $invokeScreen 'DesktopFinal'
 
 # ===================== AIDA64 HTML REPORT =====================
 Write-Log "Generating AIDA64 HTML report..." 'Yellow'

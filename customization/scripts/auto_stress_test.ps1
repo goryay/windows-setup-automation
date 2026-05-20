@@ -985,7 +985,7 @@ Write-ColorOutput '[6.5/7] Creating full system backup...' 'Yellow'
 $backupScript = Join-Path $scriptDir 'Create-FullBackup.ps1'
 if (Test-Path $backupScript) {
     try {
-        & $backupScript -BackupLabel 'IPDROM_BACKUP'
+        & $backupScript -BackupLabel 'IpdromREC'
         if ($LASTEXITCODE -eq 0) {
             Write-ColorOutput '  Full backup completed.' 'Green'
         } else {
