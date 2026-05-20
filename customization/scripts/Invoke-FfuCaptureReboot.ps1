@@ -157,12 +157,15 @@ $candidates = @()
 $flashModelTokens = @($flashDisk.FriendlyName -split '\s+' | Where-Object { $_.Length -gt 2 })
 
 foreach ($block in $blocks) {
-    if ($block -notmatch 'identifier\s+(\{[a-f0-9-]+\})') { continue }
+    # Locale-independent: first GUID in the block IS the identifier
+    # (bcdedit always puts identifier as the first field, regardless of language)
+    if ($block -notmatch '(\{[a-f0-9-]+\})') { continue }
     $id = $matches[1]
     if ($id -ieq '{bootmgr}' -or $id -ieq '{fwbootmgr}') { continue }
 
+    # "description" remains English in all locales
     $desc = ''
-    if ($block -match '(?im)^description\s+(.+?)\s*$') { $desc = $matches[1].Trim() }
+    if ($block -match '(?im)^\s*description\s+(.+?)\s*$') { $desc = $matches[1].Trim() }
 
     $isUsb = $false
     if ($desc -match '(?i)\bUSB\b') { $isUsb = $true }
@@ -171,10 +174,20 @@ foreach ($block in $blocks) {
     }
 
     if ($isUsb) {
-        $candidates += [pscustomobject]@{ Id = $id; Description = $desc }
-        Write-Log "  candidate: $id  '$desc'" 'Gray'
+        # Score by partition number — prefer "Partition 1" (= ESP with bootloader)
+        $partNum = 99
+        if ($desc -match '(?i)Partition\s+(\d+)') { $partNum = [int]$matches[1] }
+        $candidates += [pscustomobject]@{
+            Id              = $id
+            Description     = $desc
+            PartitionNumber = $partNum
+        }
+        Write-Log "  candidate: $id  '$desc'  (partition=$partNum)" 'Gray'
     }
 }
+
+# Prefer lower partition number (Partition 1 = bootable ESP usually)
+$candidates = @($candidates | Sort-Object PartitionNumber)
 
 if ($candidates.Count -eq 0) {
     Write-Log "No UEFI boot entry matching the IpdromREC USB. Cannot set BootNext." 'Red'
