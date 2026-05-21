@@ -171,14 +171,14 @@ function Invoke-CaptureAida {
     Start-Sleep -Seconds 3
     $aida = Get-AidaWindowProcess
     if (-not $aida) {
-        Write-Warning "AIDA64 window not found — taking full desktop as fallback"
+        Write-Warning "AIDA64 window not found - taking full desktop as fallback"
         New-DesktopScreenshot -OutputFolder $screensDir -OutputName "${Prefix}_desktop_fallback" | Out-Null
         return
     }
     # Use CopyFromScreen (full desktop) instead of PrintWindow for AIDA.
     # PrintWindow sends WM_PRINT to the target window and blocks until the window
     # processes the message. When AIDA64 is running at 100% CPU load its UI thread
-    # is starved and never processes WM_PRINT — causing an infinite hang.
+    # is starved and never processes WM_PRINT - causing an infinite hang.
     # Since AIDA64 is always maximized during the test, a full-screen CopyFromScreen
     # gives the same result without any risk of hanging.
     Activate-Window -Process $aida -Maximize | Out-Null

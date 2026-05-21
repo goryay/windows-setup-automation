@@ -83,7 +83,7 @@ foreach ($p in @($ffuNewPath, $wimNewPath)) {
 $ffuName = "IPDROM-$env:COMPUTERNAME-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 $ffuDesc = "Captured $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') on $env:COMPUTERNAME after stress test"
 
-Write-Log "Attempt 1: DISM /Capture-Ffu (may fail on running OS — that's expected)" 'Cyan'
+Write-Log "Attempt 1: DISM /Capture-Ffu (may fail on running OS - that's expected)" 'Cyan'
 Write-Log "  -> $dism /Capture-Ffu /ImageFile:$ffuNewPath /CaptureDrive:$capturePath /Name:`"$ffuName`" /Description:`"$ffuDesc`""
 
 $ffuOk = $false

@@ -26,10 +26,10 @@
 #>
 [CmdletBinding()]
 param(
-    # По умолчанию — забэндленный в репо boot.wim:
+    # По умолчанию - забэндленный в репо boot.wim:
     #   D:\TestISO\customization\winpe\boot.wim
     [string]$SourceWim,
-    # По умолчанию — рядом с source, имя boot_patched.wim:
+    # По умолчанию - рядом с source, имя boot_patched.wim:
     #   D:\TestISO\customization\winpe\boot_patched.wim
     [string]$OutputWim,
     [int]$Index = 1,
@@ -134,7 +134,7 @@ $mounted = $true
 try {
     $system32 = Join-Path $mountDir 'Windows\System32'
     if (-not (Test-Path $system32)) {
-        throw "Mounted WIM does not have Windows\System32 — wrong index?"
+        throw "Mounted WIM does not have Windows\System32 - wrong index?"
     }
 
     # Backup originals before overwrite (for forensics)

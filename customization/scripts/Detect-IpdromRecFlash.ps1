@@ -72,9 +72,9 @@ Write-Log "PlatformBat:   $PlatformBat" 'Gray'
 Write-Log "Size range:    ${MinSizeGB}..${MaxSizeGB} GB" 'Gray'
 Write-Log "Log:           $LogPath" 'Gray'
 
-# Excluded labels — pipeline volumes that must never be touched
+# Excluded labels - pipeline volumes that must never be touched
 $excludedLabels = @('Ventoy', 'VTOYEFI', 'IPDROM_Recovery', 'IPDROM_RECOVERY')
-# Reserved good labels — these mean the flash is ALREADY our IpdromREC
+# Reserved good labels - these mean the flash is ALREADY our IpdromREC
 $ourLabels = @('IpdromREC', 'WINRE', 'WinRE')
 
 $allDisks = @(Get-Disk -ErrorAction SilentlyContinue | Sort-Object Number)
@@ -129,7 +129,7 @@ foreach ($disk in $allDisks) {
     }
 
     if ($hasExcludedLabel) { [void]$reasons.Add("has excluded label ($($volumes.FileSystemLabel -join ','))") }
-    if ($hasIsoContent)    { [void]$reasons.Add("contains ISO/Ventoy/customization content — pipeline flash") }
+    if ($hasIsoContent)    { [void]$reasons.Add("contains ISO/Ventoy/customization content - pipeline flash") }
 
     # 5) Empty or already-ours?
     $isEmpty = ($partitions.Count -eq 0) -or ($disk.PartitionStyle -eq 'RAW')
@@ -182,7 +182,7 @@ if ($candidates.Count -eq 1) {
     Set-PlatformVar -Value 0
     exit 1
 } else {
-    Write-Log "DECISION: multiple ($($candidates.Count)) candidates found — REFUSING to choose automatically." 'Red'
+    Write-Log "DECISION: multiple ($($candidates.Count)) candidates found - REFUSING to choose automatically." 'Red'
     Write-Log "         Operator must unplug all but one IpdromREC candidate, then re-run." 'Red'
     Set-PlatformVar -Value 0
     exit 2

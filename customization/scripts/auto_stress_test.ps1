@@ -95,7 +95,7 @@ function Send-ArchiveToServer {
         if ($httpStatus) {
             Write-Warning "  curl upload returned HTTP $httpStatus (exit $curlExit). See body above for server error."
         } else {
-            Write-Warning "  curl upload failed (exit $curlExit, no HTTP status — connection problem?)."
+            Write-Warning "  curl upload failed (exit $curlExit, no HTTP status - connection problem?)."
         }
     }
 
@@ -610,7 +610,7 @@ function Get-FioTargetDriveLetters {
     $raidCfg = Get-RaidConfig -UsbRoot $UsbRoot
     $megaRaidVdExists = Get-MegaRaidVirtualDriveState -StorCliPath $storCli
 
-    # If config says "create_if_missing" and no VD detected — create it via StorCLI
+    # If config says "create_if_missing" and no VD detected - create it via StorCLI
     if ($storCli -and -not $megaRaidVdExists -and $raidCfg -and $raidCfg.raid -and $raidCfg.raid.create_if_missing) {
         $created = New-MegaRaidVirtualDriveFromConfig -StorCliPath $storCli -RaidConfig $raidCfg
         if ($created) {
@@ -656,7 +656,7 @@ function Get-FioTargetDriveLetters {
         } elseif ($megaRaidVdExists -and $candidateDisks.Count -eq 1 -and $initRaidVdIfRaw) {
             $allowCreate = $true
         } elseif ($initRawDisksAuto -and $isSafeBus -and -not $isMegaRaidLike) {
-            # Plain (non-RAID) disk on a fixed bus — init only if config explicitly says so
+            # Plain (non-RAID) disk on a fixed bus - init only if config explicitly says so
             $allowCreate = $true
         }
 
@@ -713,7 +713,7 @@ powercfg /change disk-timeout-ac 0
 # When PowerShell sits in Start-Sleep with no user input, Windows treats
 # the session as "unattended" and suspends to S3/S0ix anyway, even with
 # standby-timeout-ac=0. Caused 8-minute schedule drift in stress runs.
-# This setting is hidden by default — first unmask it via -attributes.
+# This setting is hidden by default - first unmask it via -attributes.
 powercfg -attributes SUB_SLEEP 7bc4a2f9-d8fc-4469-b07b-33eb785aaca0 -ATTRIB_HIDE
 powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP 7bc4a2f9-d8fc-4469-b07b-33eb785aaca0 0
 powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_SLEEP 7bc4a2f9-d8fc-4469-b07b-33eb785aaca0 0
@@ -729,8 +729,8 @@ powercfg /SETACTIVE SCHEME_CURRENT
 # Pagefile sanity check. Основной фикс размера pagefile живёт в setup_apps_and_theme.ps1
 # (этап FirstLogon, ставит 16-32 GB ДО того, как стресс-тест запускается; ребут после
 # FirstLogon применяет настройку).
-# Здесь — только информационная проверка: если pagefile внезапно мал, печатаем
-# чёткое предупреждение и идём дальше. Никаких автоматических ребутов — чтобы
+# Здесь - только информационная проверка: если pagefile внезапно мал, печатаем
+# чёткое предупреждение и идём дальше. Никаких автоматических ребутов - чтобы
 # случайный ручной запуск не перезагрузил систему оператора.
 try {
     $currentPagefile = Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -1048,13 +1048,13 @@ if (Test-Path $prepareScript) {
             Write-ColorOutput '  IpdromREC flash prepared.' 'Green'
             $flashReady = $true
         } else {
-            Write-Warning "  Prepare-IpdromRecFlash.ps1 exited with code $LASTEXITCODE — skipping capture."
+            Write-Warning "  Prepare-IpdromRecFlash.ps1 exited with code $LASTEXITCODE - skipping capture."
         }
     } catch {
         Write-Warning "  Prepare-IpdromRecFlash failed: $_"
     }
 } else {
-    Write-Warning "  Prepare-IpdromRecFlash.ps1 not found — falling back to legacy Create-FullBackup.ps1"
+    Write-Warning "  Prepare-IpdromRecFlash.ps1 not found - falling back to legacy Create-FullBackup.ps1"
     $backupScript = Join-Path $scriptDir 'Create-FullBackup.ps1'
     if (Test-Path $backupScript) {
         try { & $backupScript -BackupLabel 'IpdromREC' } catch { Write-Warning $_ }
@@ -1067,7 +1067,7 @@ if ($flashReady -and (Test-Path $triggerScript)) {
     # Trigger writes the IPDROM_StressTest_Completed.flag itself before reboot,
     # so we don't need to write it here.
     & $triggerScript
-    # If trigger returned (didn't reboot), something went wrong — log and continue
+    # If trigger returned (didn't reboot), something went wrong - log and continue
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "  Invoke-FfuCaptureReboot returned exit code $LASTEXITCODE (no reboot)."
     }

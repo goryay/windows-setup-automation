@@ -43,7 +43,7 @@ echo Target IpdromREC partition: %IPDROM_TARGET%
 :: SAFETY GATE: захват выполняется ТОЛЬКО при наличии маркера
 :: .capture_pending на IpdromREC. Маркер кладёт Windows-side скрипт
 :: непосредственно перед reboot'ом в WinPE.
-:: Если оператор случайно бутнулся с флешки без триггера из Windows —
+:: Если оператор случайно бутнулся с флешки без триггера из Windows -
 :: мы НИЧЕГО не делаем, просто перезагружаемся обратно.
 :: ==============================================================
 if not exist "%IPDROM_TARGET%\.capture_pending" (
@@ -55,7 +55,7 @@ if not exist "%IPDROM_TARGET%\.capture_pending" (
     exit /b 0
 )
 
-echo .capture_pending marker found — proceeding with auto-capture.
+echo .capture_pending marker found - proceeding with auto-capture.
 
 :: --- Prepare log directory and timestamped log file ---
 if not exist "%IPDROM_TARGET%\Logs" mkdir "%IPDROM_TARGET%\Logs"
@@ -173,7 +173,7 @@ if %DISM_EXIT% NEQ 0 (
 
 :: --- Success ---
 :: ВАЖНО: удаляем .capture_pending ПЕРВЫМ действием, чтобы даже если
-:: последующий код повиснет/прервётся — флешка не зациклится на повторном
+:: последующий код повиснет/прервётся - флешка не зациклится на повторном
 :: захвате при следующем boot'е.
 del /f /q "%IPDROM_TARGET%\.capture_pending"
 echo OK %DATE% %TIME% > "%IPDROM_TARGET%\.capture_done"

@@ -142,7 +142,7 @@ if (-not (Test-Path $stressFlag)) {
     Set-Content -LiteralPath $stressFlag -Value "Completed at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`nFFU capture triggered." -Encoding utf8
     Write-Log "Wrote $stressFlag (launcher will exit cleanly on next boot)." 'Green'
 } else {
-    Write-Log "Stress flag already present — launcher will exit on next boot." 'Gray'
+    Write-Log "Stress flag already present - launcher will exit on next boot." 'Gray'
 }
 
 # ===================== FIND UEFI BOOT ENTRY FOR THIS USB =====================
@@ -174,7 +174,7 @@ foreach ($block in $blocks) {
     }
 
     if ($isUsb) {
-        # Score by partition number — prefer "Partition 1" (= ESP with bootloader)
+        # Score by partition number - prefer "Partition 1" (= ESP with bootloader)
         $partNum = 99
         if ($desc -match '(?i)Partition\s+(\d+)') { $partNum = [int]$matches[1] }
         $candidates += [pscustomobject]@{
@@ -202,7 +202,7 @@ if ($candidates.Count -eq 0) {
 }
 
 if ($candidates.Count -gt 1) {
-    Write-Log "Multiple USB entries found. Picking first one — review log if wrong." 'Yellow'
+    Write-Log "Multiple USB entries found. Picking first one - review log if wrong." 'Yellow'
 }
 
 $chosen = $candidates[0]
@@ -224,7 +224,7 @@ Write-Log "BootNext armed. On next reboot, system will boot into IpdromREC WinPE
 
 # ===================== REBOOT =====================
 if ($NoReboot) {
-    Write-Log "NoReboot flag set — preparation complete, NOT rebooting." 'Yellow'
+    Write-Log "NoReboot flag set - preparation complete, NOT rebooting." 'Yellow'
     Write-Log "To execute capture manually: shutdown /r /t 0" 'Gray'
     exit 0
 }

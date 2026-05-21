@@ -173,7 +173,7 @@ if ($candidates.Count -eq 0) {
 }
 
 if ($candidates.Count -gt 1 -and -not $Force) {
-    Write-Log "Multiple candidates ($($candidates.Count)) — refuse to guess. Unplug extras and rerun (or use -Force)." 'Red'
+    Write-Log "Multiple candidates ($($candidates.Count)) - refuse to guess. Unplug extras and rerun (or use -Force)." 'Red'
     exit 5
 }
 
@@ -362,7 +362,7 @@ Layout:
   IpdromREC : NTFS, recovery image storage (restore.ffu after capture)
 
 To restore: boot from this flash in UEFI mode. The auto-capture WinPE will
-check for .capture_pending marker — if present, it captures the system disk;
+check for .capture_pending marker - if present, it captures the system disk;
 otherwise it reboots back to the default OS.
 "@
 Set-Content -LiteralPath (Join-Path $ipdromRoot 'README.txt') -Value $readme -Encoding utf8
@@ -371,5 +371,5 @@ Write-Log "=== FRESH preparation completed successfully ===" 'Green'
 Write-Log "Flash ready at Disk $($disk.Number):" 'Green'
 Write-Log "  WINRE:     $winreRoot" 'Green'
 Write-Log "  IpdromREC: $ipdromRoot" 'Green'
-Write-Log "Next step: capture trigger from Windows (Phase 4 — to be wired in [6.5/7])." 'Cyan'
+Write-Log "Next step: capture trigger from Windows (Phase 4 - to be wired in [6.5/7])." 'Cyan'
 exit 0

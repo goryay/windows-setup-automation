@@ -36,7 +36,7 @@ function Write-Log {
 }
 
 # ===================== KEEP SYSTEM AWAKE =====================
-# SetThreadExecutionState — официальный Windows API «не засыпай, я работаю».
+# SetThreadExecutionState - официальный Windows API «не засыпай, я работаю».
 # Это страховка на случай, если powercfg-настройки в [1/7] не сработали
 # (BIOS override, Modern Standby policies и т.п.). Действует на время жизни
 # текущего потока PowerShell. При завершении скрипта Windows автоматически
@@ -199,7 +199,7 @@ pause > nul
 function Bring-AidaToFront {
     # Поднимает окно AIDA64 на передний план перед скриншотом.
     # Win32 SetForegroundWindow имеет foreground-lock, который обходится
-    # эмуляцией нажатия Alt (keybd_event) — стандартный хак.
+    # эмуляцией нажатия Alt (keybd_event) - стандартный хак.
     # Окно ищем по заголовку, потому что в трее MainWindowHandle ненадёжен.
     try {
         if (-not ('IPDROM.WinFG' -as [type])) {
@@ -253,13 +253,13 @@ public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
 
         if ($found.Count -eq 0) { Write-Log "Bring-AidaToFront: AIDA window not found by title." 'Yellow'; return }
 
-        # Берём первое подходящее окно — обычно "System Stability Test - AIDA64"
+        # Берём первое подходящее окно - обычно "System Stability Test - AIDA64"
         $target = $found | Where-Object { $_.Title -match 'System Stability' } | Select-Object -First 1
         if (-not $target) { $target = $found[0] }
         $h = $target.HWnd
         Write-Log "Bring-AidaToFront: found '$($target.Title)' (visible=$($target.Visible))" 'DarkGray'
 
-        # SW_RESTORE = 9 — для свёрнутого; SW_SHOW = 5 — для скрытого
+        # SW_RESTORE = 9 - для свёрнутого; SW_SHOW = 5 - для скрытого
         [IPDROM.WinFG]::ShowWindowAsync($h, 9) | Out-Null
         [IPDROM.WinFG]::ShowWindowAsync($h, 5) | Out-Null
 
@@ -269,7 +269,7 @@ public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
         [IPDROM.WinFG]::keybd_event(0x12, 0, 0x0002, [System.UIntPtr]::Zero)
         Start-Sleep -Milliseconds 50
 
-        # Дополнительно — AttachThreadInput trick
+        # Дополнительно - AttachThreadInput trick
         $fgHwnd  = [IPDROM.WinFG]::GetForegroundWindow()
         $fgPid   = 0
         $fgTid   = [IPDROM.WinFG]::GetWindowThreadProcessId($fgHwnd, [ref]$fgPid)
@@ -301,7 +301,7 @@ public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
 }
 
 function Save-AidaScreenshotInline {
-    # Снимает AIDA без вызова screen.ps1 — без IPC, child-процессов, таймаутов.
+    # Снимает AIDA без вызова screen.ps1 - без IPC, child-процессов, таймаутов.
     # 1) Bring-AidaToFront уже сделал окно foreground.
     # 2) CopyFromScreen по primary screen (AIDA в фуллскрине занимает её всю).
     # 3) Сохраняем PNG в Desktop\<PC>\Screens с тем же именованием, что и screen.ps1.
@@ -359,7 +359,7 @@ $invokeScreen = {
                         -WindowStyle Minimized -PassThru
         $finished = $proc.WaitForExit(90000)
         if (-not $finished) {
-            Write-Log "Screenshot $Mode timed out after 90s — killing." 'Red'
+            Write-Log "Screenshot $Mode timed out after 90s - killing." 'Red'
             $proc | Stop-Process -Force -ErrorAction SilentlyContinue
         } elseif ($proc.ExitCode -eq 0) {
             Write-Log "Screenshot $Mode OK." 'Green'
@@ -469,7 +469,7 @@ Write-Log "Last tool  will finish at $(($testStartTime.AddSeconds($totalSeconds 
 # ===================== WAIT FOR AIDA (ABSOLUTE TIMING) =====================
 # Используем абсолютные моменты времени, а не накопительные Start-Sleep.
 # Иначе зависший на 90с screen.ps1 сдвинет все последующие шаги и AidaFinal
-# попадёт уже после конца стресс-таймера AIDA — окно закроется и скриншот
+# попадёт уже после конца стресс-таймера AIDA - окно закроется и скриншот
 # поймает то, что под AIDA-окном (FurMark/FIO).
 $aidaEndTime   = $testStartTime.AddSeconds($totalSeconds)
 $autoShotTime  = $aidaEndTime.AddSeconds(-300)   # T - 5 min : AidaAuto
@@ -487,7 +487,7 @@ function Wait-Until {
     Start-Sleep -Seconds $sec
 }
 
-# --- AidaAuto (T-300s) — только если до него ещё есть запас
+# --- AidaAuto (T-300s) - только если до него ещё есть запас
 if ((Get-Date) -lt $autoShotTime) {
     Wait-Until -Target $autoShotTime -Label 'AidaAuto'
     Write-Log "Taking AidaAuto screenshot (5 min before AIDA end)..." 'Yellow'
@@ -497,7 +497,7 @@ if ((Get-Date) -lt $autoShotTime) {
     Write-Log "AidaAuto window missed (we are already past T-300s). Skipping AidaAuto." 'Yellow'
 }
 
-# --- AidaFinal (T-30s) — ЭТОТ скриншот критичен, делаем всегда, пока AIDA жива
+# --- AidaFinal (T-30s) - ЭТОТ скриншот критичен, делаем всегда, пока AIDA жива
 if ((Get-Date) -lt $finalShotTime) {
     Wait-Until -Target $finalShotTime -Label 'AidaFinal'
 }
@@ -516,7 +516,7 @@ Wait-Until -Target $aidaEndTime -Label 'AIDA end'
 
 # ===================== WAIT FOR FURMARK / FIO TO ALSO FINISH =====================
 # AidaFinal уже сделан выше (за 30s до конца AIDA).
-# FurMark/FIO стартовали $lastLaunchOffsetSec секунд после AIDA — столько же и финишируют после неё.
+# FurMark/FIO стартовали $lastLaunchOffsetSec секунд после AIDA - столько же и финишируют после неё.
 if ($lastLaunchOffsetSec -gt 0) {
     $waitForLast = $lastLaunchOffsetSec + 10   # +10s буфер
     Write-Log "AIDA finished. Waiting ${waitForLast}s for FurMark/FIO to also finish..." 'Cyan'
@@ -606,7 +606,7 @@ if (Test-Path $script:Aida64FullPath) {
     Write-Log "AIDA64 not found at $script:Aida64FullPath, report skipped." 'Yellow'
 }
 
-# Release power keep-alive — system can resume normal sleep behavior now
+# Release power keep-alive - system can resume normal sleep behavior now
 try {
     if ('IPDROM.Power' -as [type]) {
         [IPDROM.Power]::SetThreadExecutionState([IPDROM.Power]::ES_CONTINUOUS) | Out-Null
