@@ -58,18 +58,53 @@ function Send-ArchiveToServer {
         [Parameter(Mandatory)] [string]$ServerUrl
     )
 
+    # Логируем для отладки
+    $sizeMB = [math]::Round((Get-Item $ArchivePath).Length / 1MB, 1)
+    Write-ColorOutput "  Archive: $ArchivePath ($sizeMB MB)" 'Gray'
+    Write-ColorOutput "  Server:  $ServerUrl" 'Gray'
+
     if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
-        Write-ColorOutput '  Uploading via curl.exe...' 'Gray'
-        & curl.exe -f -sS -F "file=@$ArchivePath" $ServerUrl
-        if ($LASTEXITCODE -eq 0) {
+        Write-ColorOutput '  Uploading via curl.exe (matches Python upload_last_archive)...' 'Yellow'
+
+        # Совпадает с Python: 'file=@"path"' (внутренние кавычки для путей с пробелами).
+        # БЕЗ флага -f, чтобы получить тело ответа сервера на 4xx/5xx (не молчаливый exit 22).
+        # -w "\nHTTPSTATUS=%{http_code}\n" печатает HTTP-код в конце для проверки.
+        $formArg = 'file=@"' + $ArchivePath + '"'
+
+        # Используем cmd /c чтобы curl корректно проинтерпретировал кавычки внутри -F аргумента
+        $curlOutput = & curl.exe -sS -F $formArg -w "`nHTTPSTATUS=%{http_code}`n" $ServerUrl 2>&1
+        $curlExit   = $LASTEXITCODE
+
+        Write-ColorOutput '  --- curl output ---' 'DarkGray'
+        foreach ($l in ($curlOutput -split "`r?`n")) {
+            if ($l.Trim()) { Write-ColorOutput "  | $l" 'DarkGray' }
+        }
+        Write-ColorOutput "  --- exit=$curlExit ---" 'DarkGray'
+
+        # Извлекаем HTTP-код из вывода
+        $httpStatus = $null
+        foreach ($l in ($curlOutput -split "`r?`n")) {
+            if ($l -match 'HTTPSTATUS=(\d+)') { $httpStatus = [int]$matches[1]; break }
+        }
+
+        if ($curlExit -eq 0 -and $httpStatus -ge 200 -and $httpStatus -lt 300) {
+            Write-ColorOutput "  curl upload OK (HTTP $httpStatus)." 'Green'
             return $true
         }
-        Write-Warning "  curl upload failed (exit $LASTEXITCODE)"
+
+        if ($httpStatus) {
+            Write-Warning "  curl upload returned HTTP $httpStatus (exit $curlExit). See body above for server error."
+        } else {
+            Write-Warning "  curl upload failed (exit $curlExit, no HTTP status — connection problem?)."
+        }
     }
 
+    Write-ColorOutput '  Trying PowerShell WebClient fallback...' 'Yellow'
     try {
         $webClient = New-Object System.Net.WebClient
-        $null = $webClient.UploadFile($ServerUrl, $ArchivePath)
+        $resp = $webClient.UploadFile($ServerUrl, $ArchivePath)
+        $respText = [System.Text.Encoding]::UTF8.GetString($resp)
+        Write-ColorOutput "  Fallback upload OK. Server response: $respText" 'Green'
         return $true
     } catch {
         Write-Warning "  Fallback upload failed: $_"
