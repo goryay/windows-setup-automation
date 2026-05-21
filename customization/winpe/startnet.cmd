@@ -172,14 +172,15 @@ if %DISM_EXIT% NEQ 0 (
 )
 
 :: --- Success ---
-if exist "%IPDROM_TARGET%\restore.old.ffu" del /f /q "%IPDROM_TARGET%\restore.old.ffu"
-echo OK %DATE% %TIME% > "%IPDROM_TARGET%\.capture_done"
-:: Удаляем pending маркер, чтобы при следующем boot'е с этой флешки
-:: WinPE сразу ушёл в reboot без повторного захвата
+:: ВАЖНО: удаляем .capture_pending ПЕРВЫМ действием, чтобы даже если
+:: последующий код повиснет/прервётся — флешка не зациклится на повторном
+:: захвате при следующем boot'е.
 del /f /q "%IPDROM_TARGET%\.capture_pending"
+echo OK %DATE% %TIME% > "%IPDROM_TARGET%\.capture_done"
+if exist "%IPDROM_TARGET%\restore.old.ffu" del /f /q "%IPDROM_TARGET%\restore.old.ffu"
 echo === Capture completed successfully === >> "%IPDROM_LOG%"
 echo === Capture completed successfully ===
-echo Reboot in 10 seconds...
-ping -n 11 127.0.0.1 > nul
+echo Reboot in 5 seconds...
+ping -n 6 127.0.0.1 > nul
 wpeutil reboot
 exit /b 0
