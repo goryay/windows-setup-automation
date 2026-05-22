@@ -726,6 +726,22 @@ powercfg /SETDCVALUEINDEX SCHEME_CURRENT 501a4d13-42af-4429-9fd1-a8218c268e20 ee
 # Apply changes
 powercfg /SETACTIVE SCHEME_CURRENT
 
+# Disable Automatic Maintenance & Modern Standby during stress.
+# Automatic Maintenance triggers TiWorker.exe, DirectX updater, etc. — these
+# can suspend our PowerShell process mid-Start-Sleep, breaking screenshot timing.
+# Modern Standby (S0ix) on capable hardware throttles user processes despite
+# our powercfg settings; PlatformAoAcOverride forces classic S3 sleep.
+try {
+    reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance" /v MaintenanceDisabled /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+    reg add "HKLM\System\CurrentControlSet\Control\Power" /v PlatformAoAcOverride /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+    schtasks /Change /TN "\Microsoft\Windows\TaskScheduler\Idle Maintenance" /DISABLE 2>&1 | Out-Null
+    schtasks /Change /TN "\Microsoft\Windows\TaskScheduler\Regular Maintenance" /DISABLE 2>&1 | Out-Null
+    schtasks /Change /TN "\Microsoft\Windows\Maintenance\WinSAT" /DISABLE 2>&1 | Out-Null
+    Write-ColorOutput '  Automatic Maintenance and Modern Standby override disabled.' 'Green'
+} catch {
+    Write-ColorOutput "  Failed to disable maintenance/standby: $_" 'Yellow'
+}
+
 # Pagefile sanity check. Основной фикс размера pagefile живёт в setup_apps_and_theme.ps1
 # (этап FirstLogon, ставит 16-32 GB ДО того, как стресс-тест запускается; ребут после
 # FirstLogon применяет настройку).

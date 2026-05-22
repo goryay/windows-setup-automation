@@ -476,15 +476,39 @@ $autoShotTime  = $aidaEndTime.AddSeconds(-300)   # T - 5 min : AidaAuto
 $finalShotTime = $aidaEndTime.AddSeconds(-30)    # T - 30 s  : AidaFinal (AIDA ТОЧНО ещё открыта)
 
 function Wait-Until {
+    # Resilient wait until $Target wall-clock time.
+    # Uses small (max 30s) Start-Sleep chunks in a loop so that if Windows
+    # suspends/throttles our process for any duration, we re-check the clock
+    # after wake-up and exit promptly (instead of sleeping past target).
     param([datetime]$Target, [string]$Label)
     $now = Get-Date
     if ($Target -le $now) {
         Write-Log "  ${Label}: target $($Target.ToString('HH:mm:ss')) already passed (now $($now.ToString('HH:mm:ss'))), skipping wait." 'DarkGray'
         return
     }
-    $sec = [int]($Target - $now).TotalSeconds
-    Write-Log "  Waiting ${sec}s until $($Target.ToString('HH:mm:ss')) for ${Label}..." 'DarkGray'
-    Start-Sleep -Seconds $sec
+    $totalSec = [int]($Target - $now).TotalSeconds
+    Write-Log "  Waiting ${totalSec}s until $($Target.ToString('HH:mm:ss')) for ${Label}..." 'DarkGray'
+
+    $lastLog = Get-Date
+    while ($true) {
+        $remaining = ($Target - (Get-Date)).TotalSeconds
+        if ($remaining -le 0) { break }
+        $chunk = [int][Math]::Min(30, $remaining)
+        if ($chunk -lt 1) { $chunk = 1 }
+        Start-Sleep -Seconds $chunk
+        # Heartbeat every 2 minutes so it's visible in log that we're alive
+        if (((Get-Date) - $lastLog).TotalSeconds -ge 120) {
+            $remNow = [int](($Target - (Get-Date)).TotalSeconds)
+            if ($remNow -gt 0) { Write-Log "    ...still waiting for ${Label}: ${remNow}s remaining (now $((Get-Date).ToString('HH:mm:ss')))" 'DarkGray' }
+            $lastLog = Get-Date
+        }
+    }
+    # After loop: log actual completion time vs target
+    $now = Get-Date
+    $skew = [int](($now - $Target).TotalSeconds)
+    if ($skew -gt 5) {
+        Write-Log "  ${Label}: woke up ${skew}s LATE (target $($Target.ToString('HH:mm:ss')), actual $($now.ToString('HH:mm:ss'))). System was suspended/throttled." 'Yellow'
+    }
 }
 
 # --- AidaAuto (T-300s) - только если до него ещё есть запас
