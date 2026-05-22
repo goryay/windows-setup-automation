@@ -230,33 +230,73 @@ public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
         if ($aidaProcs.Count -eq 0) { Write-Log "Bring-AidaToFront: AIDA process not running." 'Yellow'; return }
         $aidaPids = $aidaProcs.Id
 
-        # Собираем все top-level окна AIDA, фильтруем по PID и видимости/заголовку
-        $found = [System.Collections.Generic.List[object]]::new()
-        $cb = [IPDROM.WinFG+EnumWindowsProc]{
-            param($hWnd, $lParam)
-            $pid2 = 0
-            [void][IPDROM.WinFG]::GetWindowThreadProcessId($hWnd, [ref]$pid2)
-            if ($aidaPids -contains [int]$pid2) {
-                $len = [IPDROM.WinFG]::GetWindowTextLength($hWnd)
-                if ($len -gt 0) {
-                    $sb = New-Object System.Text.StringBuilder ($len + 2)
-                    [void][IPDROM.WinFG]::GetWindowText($hWnd, $sb, $sb.Capacity)
-                    $title = $sb.ToString()
-                    if ($title -match 'AIDA64|System Stability') {
-                        $found.Add([pscustomobject]@{ HWnd = $hWnd; Title = $title; Visible = [IPDROM.WinFG]::IsWindowVisible($hWnd) }) | Out-Null
+        # === ПРИОРИТЕТ 1: MainWindowHandle процесса (надёжно, независимо от title) ===
+        $h = [System.IntPtr]::Zero
+        $foundDesc = ''
+        foreach ($p in $aidaProcs) {
+            if ($p.MainWindowHandle -ne [System.IntPtr]::Zero) {
+                $h = $p.MainWindowHandle
+                $foundDesc = "process $($p.ProcessName) (PID=$($p.Id)) MainWindow"
+                Write-Log "Bring-AidaToFront: $foundDesc, hwnd=$h" 'DarkGray'
+                break
+            }
+        }
+
+        # === ПРИОРИТЕТ 2: EnumWindows по заголовку (fallback) ===
+        if ($h -eq [System.IntPtr]::Zero) {
+            $found = [System.Collections.Generic.List[object]]::new()
+            $cb = [IPDROM.WinFG+EnumWindowsProc]{
+                param($hWnd, $lParam)
+                $pid2 = 0
+                [void][IPDROM.WinFG]::GetWindowThreadProcessId($hWnd, [ref]$pid2)
+                if ($aidaPids -contains [int]$pid2) {
+                    $len = [IPDROM.WinFG]::GetWindowTextLength($hWnd)
+                    if ($len -gt 0) {
+                        $sb = New-Object System.Text.StringBuilder ($len + 2)
+                        [void][IPDROM.WinFG]::GetWindowText($hWnd, $sb, $sb.Capacity)
+                        $title = $sb.ToString()
+                        if ($title -match 'AIDA64|System Stability') {
+                            $found.Add([pscustomobject]@{ HWnd = $hWnd; Title = $title; Visible = [IPDROM.WinFG]::IsWindowVisible($hWnd) }) | Out-Null
+                        }
                     }
                 }
+                return $true
             }
-            return $true
+            [void][IPDROM.WinFG]::EnumWindows($cb, [System.IntPtr]::Zero)
+
+            if ($found.Count -gt 0) {
+                $target = $found | Where-Object { $_.Title -match 'System Stability' } | Select-Object -First 1
+                if (-not $target) { $target = $found[0] }
+                $h = $target.HWnd
+                $foundDesc = "EnumWindows title='$($target.Title)'"
+                Write-Log "Bring-AidaToFront: $foundDesc, hwnd=$h" 'DarkGray'
+            }
         }
-        [void][IPDROM.WinFG]::EnumWindows($cb, [System.IntPtr]::Zero)
 
-        if ($found.Count -eq 0) { Write-Log "Bring-AidaToFront: AIDA window not found by title." 'Yellow'; return }
+        # === ПРИОРИТЕТ 3: EnumWindows ЛЮБОЕ top-level окно от AIDA процесса (последний шанс) ===
+        if ($h -eq [System.IntPtr]::Zero) {
+            $any = [System.Collections.Generic.List[System.IntPtr]]::new()
+            $cb2 = [IPDROM.WinFG+EnumWindowsProc]{
+                param($hWnd, $lParam)
+                $pid2 = 0
+                [void][IPDROM.WinFG]::GetWindowThreadProcessId($hWnd, [ref]$pid2)
+                if ($aidaPids -contains [int]$pid2) {
+                    if ([IPDROM.WinFG]::IsWindowVisible($hWnd)) { $any.Add($hWnd) | Out-Null }
+                }
+                return $true
+            }
+            [void][IPDROM.WinFG]::EnumWindows($cb2, [System.IntPtr]::Zero)
+            if ($any.Count -gt 0) {
+                $h = $any[0]
+                $foundDesc = 'first visible window of AIDA process'
+                Write-Log "Bring-AidaToFront: $foundDesc, hwnd=$h" 'DarkGray'
+            }
+        }
 
-        # Берём первое подходящее окно - обычно "System Stability Test - AIDA64"
-        $target = $found | Where-Object { $_.Title -match 'System Stability' } | Select-Object -First 1
-        if (-not $target) { $target = $found[0] }
-        $h = $target.HWnd
+        if ($h -eq [System.IntPtr]::Zero) {
+            Write-Log "Bring-AidaToFront: no usable AIDA window found (process exists but window invisible/closed)." 'Yellow'
+            return
+        }
         Write-Log "Bring-AidaToFront: found '$($target.Title)' (visible=$($target.Visible))" 'DarkGray'
 
         # SW_RESTORE = 9 - для свёрнутого; SW_SHOW = 5 - для скрытого

@@ -1054,10 +1054,33 @@ if (Test-Path $baseDir) {
 Write-ColorOutput '[6.5/7] Creating FFU recovery image (reboot into WinPE)...' 'Yellow'
 $prepareScript = Join-Path $scriptDir 'Prepare-IpdromRecFlash.ps1'
 $triggerScript = Join-Path $scriptDir 'Invoke-FfuCaptureReboot.ps1'
+$patchScript   = Join-Path $scriptDir 'Patch-BootWim.ps1'
+$winpeFolder   = Join-Path (Split-Path $scriptDir -Parent) 'winpe'
+$patchedWim    = Join-Path $winpeFolder 'boot_patched.wim'
+
+# Step 0: auto-patch boot.wim if not yet patched on this Test ISO
+# (typical for first-ever run of a fresh Test ISO that ships with source boot.wim only)
+if (-not (Test-Path $patchedWim)) {
+    if (Test-Path $patchScript) {
+        Write-ColorOutput "  boot_patched.wim missing - running Patch-BootWim.ps1 first..." 'Yellow'
+        try {
+            & $patchScript
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $patchedWim)) {
+                Write-ColorOutput '  boot_patched.wim created.' 'Green'
+            } else {
+                Write-Warning "  Patch-BootWim failed (exit $LASTEXITCODE). FFU capture will be skipped."
+            }
+        } catch {
+            Write-Warning "  Patch-BootWim threw: $_"
+        }
+    } else {
+        Write-Warning "  Patch-BootWim.ps1 not found at $patchScript"
+    }
+}
 
 # Step 1: prepare the IpdromREC flash (FRESH or REFRESH)
 $flashReady = $false
-if (Test-Path $prepareScript) {
+if ((Test-Path $prepareScript) -and (Test-Path $patchedWim)) {
     try {
         & $prepareScript
         if ($LASTEXITCODE -eq 0) {
@@ -1069,6 +1092,8 @@ if (Test-Path $prepareScript) {
     } catch {
         Write-Warning "  Prepare-IpdromRecFlash failed: $_"
     }
+} elseif (-not (Test-Path $patchedWim)) {
+    Write-Warning "  boot_patched.wim still missing after auto-patch attempt - skipping capture."
 } else {
     Write-Warning "  Prepare-IpdromRecFlash.ps1 not found - falling back to legacy Create-FullBackup.ps1"
     $backupScript = Join-Path $scriptDir 'Create-FullBackup.ps1'
