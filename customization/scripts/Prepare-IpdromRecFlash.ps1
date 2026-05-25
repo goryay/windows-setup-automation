@@ -351,19 +351,55 @@ Remove-Item -LiteralPath $wimMount -Force -Recurse -ErrorAction SilentlyContinue
 # ===================== INITIALIZE IPDROMREC PARTITION =====================
 Write-Log "Initializing IpdromREC partition..." 'Yellow'
 New-Item -ItemType Directory -Force -Path (Join-Path $ipdromRoot 'Logs') | Out-Null
-# Create a hint file describing the flash purpose
+# Create a hint file describing the flash purpose and how to restore
 $readme = @"
 === IPDROM Recovery Flash ===
-This USB flash was prepared by Prepare-IpdromRecFlash.ps1 on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-on machine $env:COMPUTERNAME.
+Prepared by Prepare-IpdromRecFlash.ps1 on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+Source machine: $env:COMPUTERNAME
 
 Layout:
-  WINRE     : FAT32, bootable WinPE auto-capture environment
-  IpdromREC : NTFS, recovery image storage (restore.ffu after capture)
+  WINRE     : FAT32, bootable WinPE (auto-capture + restore mode)
+  IpdromREC : NTFS, holds restore.ffu (the recovery image)
 
-To restore: boot from this flash in UEFI mode. The auto-capture WinPE will
-check for .capture_pending marker - if present, it captures the system disk;
-otherwise it reboots back to the default OS.
+==============================================================
+HOW TO RESTORE THIS MACHINE FROM THE BACKUP
+==============================================================
+
+When the system is broken and needs to be restored to factory state:
+
+1. Plug this USB into the broken machine
+2. Power on, press F11/F12 (boot menu key varies by motherboard)
+3. Select "UEFI: <flash model>, Partition 1" from the boot menu
+4. WinPE will load and detect restore.ffu on this flash
+5. You will see:
+       RECOVERY MODE
+       Press R within 30 seconds to RESTORE
+       Any other key (or no key) - cancel and reboot
+6. Press R
+7. You will see a list of physical disks. Find the SYSTEM DISK
+   (usually the internal NVMe/SATA SSD, NOT this USB flash)
+8. Enter its Index number (e.g. 0 or 1) and press Enter
+9. Confirm with Y when asked
+10. Wait 5-30 minutes while DISM /Apply-Ffu writes the image
+11. When done, "RESTORE COMPLETED SUCCESSFULLY" appears
+12. Remove the USB and reboot - the machine boots into the restored Windows
+
+==============================================================
+MANUAL RESTORE (if WinPE menu doesn't work)
+==============================================================
+
+If the automatic menu doesn't work, in WinPE press Shift+F10 to open cmd, then:
+
+  diskpart
+  list disk         (find your IpdromREC USB letter and target system disk Index)
+  exit
+
+  dism /Apply-Ffu /ImageFile:Z:\restore.ffu /ApplyDrive:\\.\PhysicalDriveN
+
+Replace Z: with the IpdromREC drive letter and N with target disk number.
+DO NOT pick the USB flash itself as ApplyDrive - that would wipe the image.
+
+==============================================================
 "@
 Set-Content -LiteralPath (Join-Path $ipdromRoot 'README.txt') -Value $readme -Encoding utf8
 

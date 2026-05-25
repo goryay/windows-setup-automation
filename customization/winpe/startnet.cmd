@@ -40,22 +40,47 @@ if not defined IPDROM_TARGET (
 echo Target IpdromREC partition: %IPDROM_TARGET%
 
 :: ==============================================================
-:: SAFETY GATE: захват выполняется ТОЛЬКО при наличии маркера
-:: .capture_pending на IpdromREC. Маркер кладёт Windows-side скрипт
-:: непосредственно перед reboot'ом в WinPE.
-:: Если оператор случайно бутнулся с флешки без триггера из Windows -
-:: мы НИЧЕГО не делаем, просто перезагружаемся обратно.
+:: MODE GATE: что делать в WinPE
+::   .capture_pending  есть  → захват системного диска в FFU (auto-pipeline)
+::   .capture_pending  нет, restore.ffu есть → интерактивное ВОССТАНОВЛЕНИЕ
+::   .capture_pending  нет, restore.ffu нет  → выход (ничего не делаем)
 :: ==============================================================
-if not exist "%IPDROM_TARGET%\.capture_pending" (
-    echo No .capture_pending marker found on %IPDROM_TARGET%
-    echo This boot was not triggered by IPDROM auto-capture pipeline.
-    echo Rebooting back to default boot device in 5 seconds...
-    ping -n 6 127.0.0.1 > nul
-    wpeutil reboot
-    exit /b 0
+if exist "%IPDROM_TARGET%\.capture_pending" (
+    echo .capture_pending marker found - proceeding with auto-capture.
+    goto :do_capture
 )
 
-echo .capture_pending marker found - proceeding with auto-capture.
+if exist "%IPDROM_TARGET%\restore.ffu" (
+    echo.
+    echo ==============================================================
+    echo  RECOVERY MODE
+    echo ==============================================================
+    echo Found restore.ffu on %IPDROM_TARGET%
+    echo.
+    echo This will RESTORE the system disk from the recovery image.
+    echo ALL DATA on the system disk will be ERASED.
+    echo.
+    echo Press R within 30 seconds to RESTORE.
+    echo Any other key (or no key) - cancel and reboot.
+    echo ==============================================================
+    choice /c RC /n /t 30 /d C /m "Press [R]estore or [C]ancel (auto-cancel in 30s): "
+    if errorlevel 2 (
+        echo Cancelled by user/timeout. Rebooting in 5 seconds...
+        ping -n 6 127.0.0.1 > nul
+        wpeutil reboot
+        exit /b 0
+    )
+    echo User chose RESTORE. Proceeding...
+    goto :do_apply
+)
+
+echo No .capture_pending marker and no restore.ffu found on %IPDROM_TARGET%.
+echo Nothing to do. Rebooting in 5 seconds...
+ping -n 6 127.0.0.1 > nul
+wpeutil reboot
+exit /b 0
+
+:do_capture
 
 :: --- Prepare log directory and timestamped log file ---
 if not exist "%IPDROM_TARGET%\Logs" mkdir "%IPDROM_TARGET%\Logs"
@@ -182,5 +207,117 @@ echo === Capture completed successfully === >> "%IPDROM_LOG%"
 echo === Capture completed successfully ===
 echo Reboot in 5 seconds...
 ping -n 6 127.0.0.1 > nul
+wpeutil reboot
+exit /b 0
+
+:: ==============================================================
+:: RESTORE / APPLY MODE
+:: Применяет restore.ffu на физический диск (целевой системный диск).
+:: ОСТОРОЖНО: системный диск будет ПОЛНОСТЬЮ перезаписан.
+:: ==============================================================
+:do_apply
+echo.
+echo === Apply-Ffu mode starting ===
+
+:: --- Prepare log ---
+if not exist "%IPDROM_TARGET%\Logs" mkdir "%IPDROM_TARGET%\Logs"
+for /f "tokens=2 delims==" %%i in ('wmic os get LocalDateTime /value ^| find "="') do set DT=%%i
+set IPDROM_TIMESTAMP=%DT:~0,8%_%DT:~8,6%
+set IPDROM_LOG=%IPDROM_TARGET%\Logs\apply_%IPDROM_TIMESTAMP%.log
+echo === IPDROM apply-ffu started at %DATE% %TIME% === > "%IPDROM_LOG%"
+echo Target volume: %IPDROM_TARGET% >> "%IPDROM_LOG%"
+
+:: --- Show available disks for user to pick ---
+echo.
+echo Available physical disks:
+echo. >> "%IPDROM_LOG%"
+echo Available physical disks: >> "%IPDROM_LOG%"
+wmic diskdrive get Index,Model,Size,InterfaceType,MediaType /format:list | findstr /v "^$" >> "%IPDROM_LOG%" 2>&1
+wmic diskdrive get Index,Model,Size,InterfaceType,MediaType
+
+echo.
+echo Find the SYSTEM DISK (usually Index=0 or Index=1, the internal NVMe/SATA).
+echo DO NOT pick the IpdromREC USB - that would erase the recovery image itself.
+echo.
+
+set IPDROM_APPLYIDX=
+set /p IPDROM_APPLYIDX="Enter disk Index to APPLY recovery to (or just Enter to cancel): "
+
+if not defined IPDROM_APPLYIDX (
+    echo Cancelled by user. >> "%IPDROM_LOG%"
+    echo Cancelled. Rebooting...
+    ping -n 6 127.0.0.1 > nul
+    wpeutil reboot
+    exit /b 0
+)
+
+:: --- Safety check: don't apply to IpdromREC USB itself ---
+for /f "tokens=*" %%i in ('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "(Get-Partition -DriveLetter '%IPDROM_TARGET:~0,1%' -ErrorAction SilentlyContinue).DiskNumber" 2^>nul') do set IPDROM_TGTDISK=%%i
+if defined IPDROM_TGTDISK if "%IPDROM_APPLYIDX%"=="%IPDROM_TGTDISK%" (
+    echo ERROR: you picked Disk %IPDROM_APPLYIDX% which is the IpdromREC flash itself! >> "%IPDROM_LOG%"
+    echo ERROR: you picked Disk %IPDROM_APPLYIDX% which is the IpdromREC flash itself!
+    echo ABORT. Press any key to reboot.
+    pause > nul
+    wpeutil reboot
+    exit /b 4
+)
+
+:: --- Confirmation ---
+echo.
+echo ==============================================================
+echo  CONFIRMATION REQUIRED
+echo ==============================================================
+echo About to apply: %IPDROM_TARGET%\restore.ffu
+echo Target disk:    PhysicalDrive%IPDROM_APPLYIDX%
+echo.
+echo This will COMPLETELY ERASE Disk %IPDROM_APPLYIDX%.
+echo ALL data on it will be LOST.
+echo.
+choice /c YN /n /m "Type Y to proceed, N to cancel: "
+if errorlevel 2 (
+    echo Cancelled by user at confirmation. >> "%IPDROM_LOG%"
+    echo Cancelled. Rebooting...
+    ping -n 6 127.0.0.1 > nul
+    wpeutil reboot
+    exit /b 0
+)
+
+:: --- Run DISM /Apply-Ffu ---
+echo. >> "%IPDROM_LOG%"
+echo === Running DISM /Apply-Ffu === >> "%IPDROM_LOG%"
+echo Source : %IPDROM_TARGET%\restore.ffu >> "%IPDROM_LOG%"
+echo Target : PhysicalDrive%IPDROM_APPLYIDX% >> "%IPDROM_LOG%"
+echo. >> "%IPDROM_LOG%"
+
+echo.
+echo Applying image... this will take 5-30 minutes depending on disk speed.
+echo Progress is shown below.
+echo.
+
+dism /Apply-Ffu /ImageFile:"%IPDROM_TARGET%\restore.ffu" /ApplyDrive:\\.\PhysicalDrive%IPDROM_APPLYIDX% >> "%IPDROM_LOG%" 2>&1
+set DISM_EXIT=%ERRORLEVEL%
+
+echo. >> "%IPDROM_LOG%"
+echo DISM exit code: %DISM_EXIT% >> "%IPDROM_LOG%"
+
+if %DISM_EXIT% NEQ 0 (
+    echo APPLY FAILED with exit code %DISM_EXIT%. >> "%IPDROM_LOG%"
+    echo APPLY FAILED. See log: %IPDROM_LOG%
+    echo Press any key to reboot.
+    pause > nul
+    wpeutil reboot
+    exit /b %DISM_EXIT%
+)
+
+echo === Apply completed successfully === >> "%IPDROM_LOG%"
+echo.
+echo ==============================================================
+echo  RESTORE COMPLETED SUCCESSFULLY
+echo ==============================================================
+echo Remove the IpdromREC USB and reboot the machine.
+echo It will boot into the restored Windows.
+echo.
+echo Auto-reboot in 30 seconds (or press any key now).
+choice /c R /n /t 30 /d R > nul
 wpeutil reboot
 exit /b 0
