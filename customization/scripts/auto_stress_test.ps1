@@ -782,6 +782,18 @@ if (-not (Test-Path $testScript)) {
 }
 Write-ColorOutput "Test folder: $testFolder" 'Green'
 
+# Pipeline health tracking — если что-то критичное завалится, FFU не делается.
+# Это защита от отгрузки клиенту машины с неуспешными тестами.
+$script:PipelineHealthy = $true
+$script:PipelineFailures = New-Object System.Collections.ArrayList
+
+function Mark-PipelineFailure {
+    param([string]$Reason)
+    $script:PipelineHealthy = $false
+    [void]$script:PipelineFailures.Add($Reason)
+    Write-ColorOutput "  [PIPELINE-FAIL] $Reason" 'Red'
+}
+
 function Get-NvidiaSmiPath {
     $candidates = @(
         "$env:WINDIR\System32\nvidia-smi.exe",
@@ -990,6 +1002,7 @@ finally {
 
 if ($testExitCode -ne 0) {
     Write-ColorOutput "  Test finished with exit code $testExitCode (non-zero) - continuing to reports and archive." 'Red'
+    Mark-PipelineFailure "Stress test (aida_fio_furmark.ps1) exited with code $testExitCode"
 } else {
     Write-ColorOutput '  Test completed successfully' 'Green'
 }
@@ -1042,16 +1055,133 @@ if (Test-Path $baseDir) {
         if ($uploaded) {
             Write-ColorOutput '  Upload successful!' 'Green'
         } else {
-            Write-Warning '  Upload failed'
+            # Upload failure НЕ блокирует FFU — это серверная проблема.
+            # Только warning, пайплайн продолжается.
+            Write-Warning '  Upload failed (server-side issue, not a pipeline failure)'
         }
     } catch {
         Write-Warning "  Archive or upload error: $_"
+        Mark-PipelineFailure "Archive creation failed: $_"
     }
 } else {
     Write-Warning "  Results folder not found: $baseDir"
+    Mark-PipelineFailure "Results folder $baseDir not found - no reports were generated"
 }
 
-Write-ColorOutput '[6.5/7] Creating FFU recovery image (reboot into WinPE)...' 'Yellow'
+# ===================== [6.5/7] CLEANUP TEST ARTIFACTS =====================
+# Удаляем всё, что относится к процессу тестирования, перед FFU-захватом.
+# Цель: чтобы образ восстановления содержал чистую ОС без тестового мусора.
+Write-ColorOutput '[6.5/7] Cleaning up test artifacts before FFU capture...' 'Yellow'
+
+# 1. Деинсталляция тестовых утилит (fio, smartmontools)
+$uninstallScript = Join-Path $testFolder 'AllUnin.ps1'
+if (Test-Path $uninstallScript) {
+    try {
+        Write-ColorOutput "  Uninstalling test tools (fio, smartmontools)..." 'Gray'
+        & $psExe -NoProfile -ExecutionPolicy Bypass -File $uninstallScript
+        Write-ColorOutput '  Test tools uninstalled.' 'Green'
+    } catch {
+        Write-Warning "  AllUnin.ps1 failed: $_"
+    }
+} else {
+    Write-Warning "  AllUnin.ps1 not found at $uninstallScript - test tools not removed."
+}
+
+# 2. Удаляем архив с рабочего стола
+$desktopPath = [Environment]::GetFolderPath('Desktop')
+$archivePattern = "$env:COMPUTERNAME`_*.zip"
+$archives = Get-ChildItem -LiteralPath $desktopPath -Filter $archivePattern -File -ErrorAction SilentlyContinue
+foreach ($a in $archives) {
+    try {
+        Remove-Item -LiteralPath $a.FullName -Force -ErrorAction Stop
+        Write-ColorOutput "  Removed archive: $($a.Name)" 'Gray'
+    } catch {
+        Write-Warning "  Could not remove $($a.Name): $_"
+    }
+}
+
+# 3. Удаляем папку с отчётами и скринами
+$resultsFolder = Join-Path $desktopPath $env:COMPUTERNAME
+if (Test-Path $resultsFolder) {
+    try {
+        Remove-Item -LiteralPath $resultsFolder -Recurse -Force -ErrorAction Stop
+        Write-ColorOutput "  Removed reports folder: $resultsFolder" 'Gray'
+    } catch {
+        Write-Warning "  Could not remove $resultsFolder`: $_"
+    }
+}
+
+# 4. Очистка корзины (всех буков, на случай если что-то туда упало)
+try {
+    Clear-RecycleBin -Force -ErrorAction Stop
+    Write-ColorOutput "  Recycle Bin emptied." 'Gray'
+} catch {
+    # PS 5.1 без Clear-RecycleBin - используем COM
+    try {
+        $shell = New-Object -ComObject Shell.Application
+        $recycleBin = $shell.NameSpace(10)  # 0xA = Recycle Bin
+        $recycleBin.Items() | ForEach-Object { Remove-Item $_.Path -Recurse -Force -ErrorAction SilentlyContinue }
+        Write-ColorOutput "  Recycle Bin emptied (via COM)." 'Gray'
+    } catch {
+        Write-Warning "  Recycle Bin cleanup failed: $_"
+    }
+}
+
+# 5. Очистка временных файлов от стресса
+foreach ($tempPath in @(
+    "$env:TEMP",
+    "$env:WinDir\Temp"
+)) {
+    if (Test-Path $tempPath) {
+        Get-ChildItem -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^(ipdrom_|fio_job_|fio_test_)' } |
+            ForEach-Object {
+                try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+            }
+    }
+}
+Write-ColorOutput "  Temp files cleaned." 'Gray'
+
+Write-ColorOutput "[6.5/7] Cleanup completed. OS is clean for FFU capture." 'Green'
+
+# ===================== PIPELINE HEALTH GATE =====================
+# Не запускаем FFU-захват если что-то критичное завалилось.
+# Машину с битыми тестами или незавершёнными артефактами клиенту отгружать нельзя.
+if (-not $script:PipelineHealthy) {
+    Write-ColorOutput "`n========================================" 'Red'
+    Write-ColorOutput '   FFU CAPTURE BLOCKED' 'Red'
+    Write-ColorOutput '========================================' 'Red'
+    Write-ColorOutput 'Pipeline had failures - FFU recovery image will NOT be created:' 'Red'
+    foreach ($f in $script:PipelineFailures) {
+        Write-ColorOutput "  - $f" 'Red'
+    }
+    Write-ColorOutput "`nFix the issues above and either:" 'Yellow'
+    Write-ColorOutput '  1) Re-run the full pipeline from a clean install, OR' 'Yellow'
+    Write-ColorOutput '  2) Capture FFU manually after fixing (Prepare + Trigger).' 'Yellow'
+
+    # Записываем подробный маркер для оператора/диагностики
+    $failureMarker = Join-Path $env:ProgramData 'IPDROM_PipelineFailed.flag'
+    $marker = "Pipeline failure at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n"
+    $marker += "Failures:`r`n"
+    foreach ($f in $script:PipelineFailures) { $marker += "  - $f`r`n" }
+    Set-Content -LiteralPath $failureMarker -Value $marker -Encoding utf8 -Force
+    Write-ColorOutput "`nFailure details saved: $failureMarker" 'Gray'
+
+    # ВАЖНО: ставим Completed.flag чтобы launcher не зациклился на повторных стрессах.
+    # Если оператор хочет переделать - руками удаляет оба флага.
+    if (-not (Test-Path $flagFile)) {
+        New-Item -Path $flagFile -ItemType File -Force | Out-Null
+    }
+    Write-ColorOutput "`n========================================" 'Red'
+    Write-ColorOutput '   PIPELINE COMPLETED WITH FAILURES' 'Red'
+    Write-ColorOutput '========================================' 'Red'
+    exit 1
+}
+
+Write-ColorOutput '  Pipeline healthy - proceeding to FFU capture.' 'Green'
+
+# ===================== [6.7/7] FFU CAPTURE =====================
+Write-ColorOutput '[6.7/7] Creating FFU recovery image (reboot into WinPE)...' 'Yellow'
 $prepareScript = Join-Path $scriptDir 'Prepare-IpdromRecFlash.ps1'
 $triggerScript = Join-Path $scriptDir 'Invoke-FfuCaptureReboot.ps1'
 $patchScript   = Join-Path $scriptDir 'Patch-BootWim.ps1'
