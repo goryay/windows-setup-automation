@@ -1,0 +1,18 @@
+{
+  "raid": {
+    "create_if_missing": true,
+    "controller": 0,
+    "level": "r0",
+    "drives": "all",
+    "strip_size_kb": 256,
+    "target_letter": "E",
+    "label": "RAID_DATA",
+    "filesystem": "NTFS",
+    "init_if_present_but_raw": true
+  },
+  "raw_disks": {
+    "init_all": true,
+    "filesystem": "NTFS",
+    "skip_drives_smaller_than_gb": 50
+  }
+}
