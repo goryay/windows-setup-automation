@@ -341,28 +341,106 @@ public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
 }
 
 function Save-AidaScreenshotInline {
-    # Снимает AIDA без вызова screen.ps1 - без IPC, child-процессов, таймаутов.
-    # 1) Bring-AidaToFront уже сделал окно foreground.
-    # 2) CopyFromScreen по primary screen (AIDA в фуллскрине занимает её всю).
-    # 3) Сохраняем PNG в Desktop\<PC>\Screens с тем же именованием, что и screen.ps1.
+    # Снимает AIDA через PrintWindow - как в старом рабочем screen.ps1.
+    # PrintWindow рендерит окно ПРЯМО в наш bitmap, не глядя на foreground/visibility.
+    # Bring-AidaToFront уже отработал (на всякий случай AIDA активировано), но
+    # PrintWindow работает и без этого.
+    # Алгоритм:
+    #   1) Найти AIDA-окно по MainWindowHandle или EnumWindows
+    #   2) GetWindowRect → размеры окна
+    #   3) PrintWindow с flag=2 (PW_RENDERFULLCONTENT), fallback flag=0
+    #   4) Если PrintWindow не сработал - CopyFromScreen по rect окна
+    #   5) Если окна нет совсем - CopyFromScreen primary screen (последний fallback)
     param([Parameter(Mandatory)][string]$Prefix)
     try {
         Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 
-        # Папка как у screen.ps1: Desktop\COMPUTERNAME\Screens
+        # Inject Win32 types для PrintWindow / GetWindowRect (один раз на сессию)
+        if (-not ('IPDROM.AidaCap' -as [type])) {
+            Add-Type -Namespace IPDROM -Name AidaCap -MemberDefinition @'
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool GetWindowRect(System.IntPtr hWnd, out RECT rect);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool PrintWindow(System.IntPtr hWnd, System.IntPtr hdcBlt, int nFlags);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hWnd);
+'@
+        }
+
         $screensDir = Join-Path (Join-Path ([Environment]::GetFolderPath('Desktop')) $env:COMPUTERNAME) 'Screens'
         New-Item -ItemType Directory -Force -Path $screensDir | Out-Null
 
-        $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-        $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+        # Найти AIDA-окно - сначала MainWindowHandle, потом fallback
+        $aidaHwnd = [System.IntPtr]::Zero
+        $aidaSource = ''
+        foreach ($n in @('AIDA64Port','aida64','AIDA64BusinessPortable')) {
+            $p = Get-Process -Name $n -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [System.IntPtr]::Zero } | Select-Object -First 1
+            if ($p) {
+                $aidaHwnd   = $p.MainWindowHandle
+                $aidaSource = "$($p.ProcessName) (PID=$($p.Id)) MainWindowHandle"
+                break
+            }
+        }
+
+        $ts   = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+        $path = Join-Path $screensDir ("{0}_{1}.png" -f $Prefix, $ts)
+
+        if ($aidaHwnd -eq [System.IntPtr]::Zero) {
+            # Совсем нет окна AIDA → fallback: весь экран
+            Write-Log "Save-AidaScreenshotInline: AIDA window not found, capturing whole desktop as fallback." 'Yellow'
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+            $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+            try {
+                $gfx.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bmp.Size)
+                $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+                Write-Log "Inline screenshot saved (desktop fallback): $path" 'Yellow'
+            } finally { $gfx.Dispose(); $bmp.Dispose() }
+            return
+        }
+
+        Write-Log "Save-AidaScreenshotInline: capturing via $aidaSource (hwnd=$aidaHwnd)" 'DarkGray'
+
+        # GetWindowRect → размеры
+        $rect = New-Object IPDROM.AidaCap+RECT
+        if (-not [IPDROM.AidaCap]::GetWindowRect($aidaHwnd, [ref]$rect)) {
+            Write-Log "GetWindowRect failed, fallback to full desktop." 'Yellow'
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $w = $bounds.Width; $h = $bounds.Height
+            $rect.Left = $bounds.X; $rect.Top = $bounds.Y
+        } else {
+            $w = $rect.Right - $rect.Left
+            $h = $rect.Bottom - $rect.Top
+        }
+        if ($w -le 0 -or $h -le 0) {
+            Write-Log "Invalid window size (${w}x${h}), fallback to full desktop." 'Yellow'
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $w = $bounds.Width; $h = $bounds.Height
+            $rect.Left = $bounds.X; $rect.Top = $bounds.Y
+        }
+
+        $bmp = New-Object System.Drawing.Bitmap($w, $h)
         $gfx = [System.Drawing.Graphics]::FromImage($bmp)
         try {
-            $gfx.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bmp.Size)
-            $ts   = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
-            $path = Join-Path $screensDir ("{0}_{1}.png" -f $Prefix, $ts)
+            $hdc = $gfx.GetHdc()
+            $printed = $false
+            try {
+                # PW_RENDERFULLCONTENT (flag=2) - предпочтительный режим
+                $printed = [IPDROM.AidaCap]::PrintWindow($aidaHwnd, $hdc, 2)
+                if (-not $printed) {
+                    # Старый flag=0 fallback
+                    $printed = [IPDROM.AidaCap]::PrintWindow($aidaHwnd, $hdc, 0)
+                }
+            } finally { $gfx.ReleaseHdc($hdc) }
+
+            if (-not $printed) {
+                Write-Log "PrintWindow failed, CopyFromScreen by window rect." 'Yellow'
+                $gfx.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
+            }
+
             $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
-            Write-Log "Inline screenshot saved: $path" 'Green'
+            $method = if ($printed) { 'PrintWindow' } else { 'CopyFromScreen-rect' }
+            Write-Log "Inline screenshot saved ($method, ${w}x${h}): $path" 'Green'
         } finally {
             $gfx.Dispose()
             $bmp.Dispose()
