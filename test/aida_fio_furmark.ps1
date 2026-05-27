@@ -725,6 +725,18 @@ try {
 } catch {
     Write-Log "MinimizeAll failed: $_" 'Yellow'
 }
+# Shell.MinimizeAll() НЕ сворачивает консоль собственного процесса - её надо
+# свернуть отдельно через ShowWindow(SW_MINIMIZE=6), иначе DesktopFinal-скрин
+# покажет наш же запущенный PowerShell поверх рабочего стола.
+try {
+    $selfHwnd = (Get-Process -Id $PID).MainWindowHandle
+    if ($selfHwnd -ne [IntPtr]::Zero) {
+        [IPDROM.WinFG]::ShowWindow($selfHwnd, 6) | Out-Null
+        Start-Sleep -Seconds 1
+    }
+} catch {
+    Write-Log "Minimize self console failed: $_" 'Yellow'
+}
 Write-Log "  -> DesktopFinal..."
 & $invokeScreen 'DesktopFinal'
 
@@ -733,14 +745,20 @@ Write-Log "Generating AIDA64 HTML report..." 'Yellow'
 if (Test-Path $script:Aida64FullPath) {
     $reportsDir = Join-Path (Join-Path ([Environment]::GetFolderPath('Desktop')) $env:COMPUTERNAME) 'Reports'
     New-Item -ItemType Directory -Force -Path $reportsDir | Out-Null
-    $reportPath = Join-Path $reportsDir 'SystemReport.html'
+    # AIDA64 пишет HTML-отчёт с расширением .htm даже если в /R передать .html,
+    # поэтому сразу указываем .htm. Проверка ниже также ищет по маске SystemReport.htm*,
+    # чтобы оставаться корректной если в другой версии AIDA снова сменит расширение.
+    $reportPath = Join-Path $reportsDir 'SystemReport.htm'
 
     Start-Process -FilePath $script:Aida64FullPath `
         -ArgumentList @('/R', $reportPath, '/ALL', '/SUM', '/HW', '/SW', '/AUDIT', '/HTML') `
         -Wait -NoNewWindow
 
-    if (Test-Path $reportPath) {
-        Write-Log "AIDA64 report saved: $reportPath" 'Green'
+    $actualReport = Get-ChildItem -Path $reportsDir -Filter 'SystemReport.htm*' -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($actualReport) {
+        $sizeKb = [math]::Round($actualReport.Length / 1KB, 1)
+        Write-Log "AIDA64 report saved: $($actualReport.FullName) ($sizeKb KB)" 'Green'
     } else {
         Write-Log "AIDA64 report was NOT created." 'Red'
     }

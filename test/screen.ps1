@@ -158,6 +158,28 @@ function Close-WindowProcess {
 }
 
 function Minimize-AllWindows {
+    # Двухуровневая защита от "висящих" окон на DesktopFinal:
+    # 1) Win+D (Show Desktop) - агрессивно прячет всё, включая ghost-окна
+    #    от только что закрытых процессов (AIDA/FurMark/FIO)
+    # 2) Shell.Application.MinimizeAll() - страховка
+    # 3) Пауза для DWM redraw
+    try {
+        if (-not ('IPDROM.WinD' -as [type])) {
+            Add-Type -Namespace IPDROM -Name WinD -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, System.UIntPtr dwExtraInfo);
+'@
+        }
+        # VK_LWIN = 0x5B, VK_D = 0x44, KEYEVENTF_KEYUP = 0x0002
+        # Press LWin, press D, release D, release LWin -> Show Desktop
+        [IPDROM.WinD]::keybd_event(0x5B, 0, 0, [System.UIntPtr]::Zero)
+        [IPDROM.WinD]::keybd_event(0x44, 0, 0, [System.UIntPtr]::Zero)
+        [IPDROM.WinD]::keybd_event(0x44, 0, 0x0002, [System.UIntPtr]::Zero)
+        [IPDROM.WinD]::keybd_event(0x5B, 0, 0x0002, [System.UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 800
+    } catch {
+        Write-Warning "Win+D simulation failed: $_"
+    }
     try {
         (New-Object -ComObject Shell.Application).MinimizeAll()
         Start-Sleep -Seconds 2
