@@ -338,6 +338,28 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "bcdboot failed (exit $LASTEXITCODE)" }
 
     Write-Log "Bootloader installed on $winreRoot." 'Green'
+
+    # ===================== COPY boot.sdi (ramdisk descriptor) =====================
+    # bcdboot НЕ кладёт boot.sdi в \boot\ на USB - его надо взять руками из
+    # смонтированного boot.wim (после Unmount к нему доступа уже не будет).
+    # Без этого файла bootmgr не сможет разрезолвить ramdisk=[boot]\sources\boot.wim,{ramdiskoptions}.
+    Write-Log "Copying boot.sdi from mounted WIM..." 'Yellow'
+    $bootSdiSrc = $null
+    foreach ($rel in @('Windows\Boot\DVD\EFI\boot.sdi', 'Windows\Boot\DVD\PCAT\boot.sdi', 'Windows\System32\boot.sdi')) {
+        $p = Join-Path $wimMount $rel
+        if (Test-Path $p) { $bootSdiSrc = $p; break }
+    }
+    if ($bootSdiSrc) {
+        $bootSdiDst = Join-Path $winreRoot 'boot\boot.sdi'
+        New-Item -ItemType Directory -Force -Path (Split-Path $bootSdiDst -Parent) | Out-Null
+        Copy-Item -LiteralPath $bootSdiSrc -Destination $bootSdiDst -Force
+        $sdiSize = (Get-Item $bootSdiDst).Length
+        Write-Log "  boot.sdi copied: $bootSdiDst ($sdiSize bytes from $bootSdiSrc)" 'Green'
+    } else {
+        Write-Log "  boot.sdi NOT FOUND in mounted WIM - WinPE will fail to boot." 'Red'
+        Write-Log "  Searched paths: Windows\Boot\DVD\EFI\boot.sdi, Windows\Boot\DVD\PCAT\boot.sdi, Windows\System32\boot.sdi" 'Red'
+    }
+
 } catch {
     Write-Log "Bootloader install failed: $_" 'Red'
     & dism /Unmount-Wim "/MountDir:$wimMount" /Discard 2>&1 | Out-Null
@@ -347,6 +369,48 @@ try {
 
 & dism /Unmount-Wim "/MountDir:$wimMount" /Discard 2>&1 | ForEach-Object { Write-Log "  | $_" 'DarkGray' }
 Remove-Item -LiteralPath $wimMount -Force -Recurse -ErrorAction SilentlyContinue
+
+# ===================== FIX USB BCD STORE (CRITICAL) =====================
+# bcdboot $wimMount\Windows создаёт BCD на USB с device=unknown и абсолютным
+# путём к winload.efi в mount-каталоге Temp. После размонтирования путь
+# становится невалидным и bootmgr выдаёт 0xC0000225.
+# ИСПРАВЛЯЕМ {default} entry чтобы он указывал на ramdisk WinPE-boot:
+#   device      = ramdisk=[boot]\sources\boot.wim,{ramdiskoptions}
+#   osdevice    = то же самое
+#   path        = \windows\system32\winload.efi  (относительный, из boot.wim)
+#   systemroot  = \windows
+# И создаём {ramdiskoptions} который указывает на \boot\boot.sdi.
+Write-Log "Patching USB BCD store for WinPE ramdisk boot..." 'Yellow'
+$winreBcd = Join-Path $winreRoot 'EFI\Microsoft\Boot\BCD'
+if (-not (Test-Path $winreBcd)) {
+    Write-Log "BCD store NOT FOUND at $winreBcd - bootmgr won't work." 'Red'
+} else {
+    # 1. Создаём {ramdiskoptions}. /create {ramdiskoptions} - well-known GUID.
+    $rdOut = bcdedit /store "$winreBcd" /create '{ramdiskoptions}' /d "Ramdisk Options" 2>&1
+    foreach ($l in $rdOut) { Write-Log "  | create ramdiskoptions: $l" 'DarkGray' }
+    # Ошибка "уже существует" - не фатальна, продолжаем (это REFRESH case).
+
+    # 2. Настраиваем где лежит boot.sdi.
+    $r = bcdedit /store "$winreBcd" /set '{ramdiskoptions}' ramdisksdidevice boot 2>&1
+    foreach ($l in $r) { Write-Log "  | set ramdisksdidevice: $l" 'DarkGray' }
+    $r = bcdedit /store "$winreBcd" /set '{ramdiskoptions}' ramdisksdipath '\boot\boot.sdi' 2>&1
+    foreach ($l in $r) { Write-Log "  | set ramdisksdipath: $l" 'DarkGray' }
+
+    # 3. Переписываем {default} OS Loader для WinPE через ramdisk.
+    $r = bcdedit /store "$winreBcd" /set '{default}' device 'ramdisk=[boot]\sources\boot.wim,{ramdiskoptions}' 2>&1
+    foreach ($l in $r) { Write-Log "  | set default device: $l" 'DarkGray' }
+    $r = bcdedit /store "$winreBcd" /set '{default}' osdevice 'ramdisk=[boot]\sources\boot.wim,{ramdiskoptions}' 2>&1
+    foreach ($l in $r) { Write-Log "  | set default osdevice: $l" 'DarkGray' }
+    $r = bcdedit /store "$winreBcd" /set '{default}' path '\windows\system32\winload.efi' 2>&1
+    foreach ($l in $r) { Write-Log "  | set default path: $l" 'DarkGray' }
+    $r = bcdedit /store "$winreBcd" /set '{default}' systemroot '\windows' 2>&1
+    foreach ($l in $r) { Write-Log "  | set default systemroot: $l" 'DarkGray' }
+
+    # 4. Диагностический дамп после правок - чтобы в логе было видно итоговое состояние.
+    Write-Log "Final USB BCD content:" 'DarkGray'
+    $dump = bcdedit /store "$winreBcd" /enum all 2>&1
+    foreach ($l in $dump) { Write-Log "  | $l" 'DarkGray' }
+}
 
 # ===================== ENSURE FIRMWARE BOOT ENTRY EXISTS =====================
 # bcdboot ДОЛЖЕН был добавить запись в {fwbootmgr} (firmware NVRAM), указывающую
