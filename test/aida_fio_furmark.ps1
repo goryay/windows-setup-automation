@@ -607,6 +607,7 @@ Write-Log "Last tool  will finish at $(($testStartTime.AddSeconds($totalSeconds 
 # попадёт уже после конца стресс-таймера AIDA - окно закроется и скриншот
 # поймает то, что под AIDA-окном (FurMark/FIO).
 $aidaEndTime   = $testStartTime.AddSeconds($totalSeconds)
+$midShotTime   = $testStartTime.AddSeconds([int]($totalSeconds / 2))  # T/2 : AidaMid (середина теста, UI ещё может отвечать)
 $autoShotTime  = $aidaEndTime.AddSeconds(-300)   # T - 5 min : AidaAuto
 $finalShotTime = $aidaEndTime.AddSeconds(-30)    # T - 30 s  : AidaFinal (AIDA ТОЧНО ещё открыта)
 
@@ -644,6 +645,20 @@ function Wait-Until {
     if ($skew -gt 5) {
         Write-Log "  ${Label}: woke up ${skew}s LATE (target $($Target.ToString('HH:mm:ss')), actual $($now.ToString('HH:mm:ss'))). System was suspended/throttled." 'Yellow'
     }
+}
+
+# --- AidaMid (T/2) - середина теста: FurMark/FIO уже под нагрузкой минут 12-13,
+# AIDA-графики показывают реальные данные, но UI ещё имеет шанс ответить
+# (буферы сообщений Windows не успели переполниться, как ближе к концу).
+# Это страховка на случай если AidaAuto/AidaFinal упадут в desktop fallback из-за
+# зависшего UI AIDA-ы под пиковой нагрузкой.
+if ((Get-Date) -lt $midShotTime) {
+    Wait-Until -Target $midShotTime -Label 'AidaMid'
+    Write-Log "Taking AidaMid screenshot (half of test duration, FIO+FurMark under full load)..." 'Yellow'
+    Bring-AidaToFront
+    Save-AidaScreenshotInline -Prefix 'AIDA64_mid'
+} else {
+    Write-Log "AidaMid window missed (we are already past T/2). Skipping AidaMid." 'Yellow'
 }
 
 # --- AidaAuto (T-300s) - только если до него ещё есть запас
