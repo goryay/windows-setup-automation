@@ -208,25 +208,73 @@ function Invoke-CaptureAida {
     New-DesktopScreenshot -OutputFolder $screensDir -OutputName $Prefix | Out-Null
 }
 
+function Write-DiagLog {
+    param([string]$Msg)
+    # Записываем в диагностический лог рядом со скриншотами - чтобы родитель
+    # (aida_fio_furmark.ps1) и пользователь могли увидеть что именно случилось.
+    try {
+        $diagLog = Join-Path $screensDir ("screen_diag_{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
+        $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'HH:mm:ss'), $Mode, $Msg
+        Add-Content -LiteralPath $diagLog -Value $line -Encoding utf8
+    } catch {}
+    Write-Host $Msg
+}
+
 function Invoke-CaptureConsoleGroup {
     param(
         [Parameter(Mandatory)] [string]$Token,
         [Parameter(Mandatory)] [string]$Prefix,
         [switch]$CloseAfterCapture
     )
-    $found = @(Get-CmdWindowsByToken -Token $Token -FinalOnly)
-    if (-not $found) {
-        Write-Warning "No _FINAL cmd windows found for token '$Token'"
-        return
+
+    # === Диагностический дамп: ВСЕ cmd-окна в системе ===
+    # Помогает понять что произошло: окно закрылось / title не сменился / token не совпал
+    $allCmd = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.ProcessName -ieq 'cmd' -and $_.MainWindowHandle -ne 0
     }
+    Write-DiagLog "===== Console group capture for token '$Token' ====="
+    Write-DiagLog "All visible cmd.exe windows ($($allCmd.Count) total):"
+    foreach ($p in $allCmd) {
+        Write-DiagLog ("  PID={0,-6} hwnd={1,-8} title='{2}'" -f $p.Id, $p.MainWindowHandle, $p.MainWindowTitle)
+    }
+
+    # Попытка #1: ищем сразу окна с _FINAL в title
+    $found = @(Get-CmdWindowsByToken -Token $Token -FinalOnly)
+    Write-DiagLog "Pass 1: found $($found.Count) cmd window(s) matching token='$Token' AND title contains '_FINAL'."
+
+    # Если 0 — возможно title не успел смениться от _RUNNING к _FINAL. Подождём и повторим.
+    if ($found.Count -eq 0) {
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            Start-Sleep -Seconds 5
+            $found = @(Get-CmdWindowsByToken -Token $Token -FinalOnly)
+            Write-DiagLog "Pass 2 attempt $attempt (after +${attempt}0s wait): found $($found.Count) _FINAL window(s)."
+            if ($found.Count -gt 0) { break }
+        }
+    }
+
+    # Всё равно 0 - последняя попытка: берём окна без требования _FINAL,
+    # чтобы хотя бы что-то сфоткать (вдруг fio.exe сбил title)
+    if ($found.Count -eq 0) {
+        $found = @(Get-CmdWindowsByToken -Token $Token)
+        Write-DiagLog "Fallback: searching WITHOUT _FINAL filter. Found $($found.Count) cmd window(s) with token='$Token'."
+    }
+
+    if ($found.Count -eq 0) {
+        Write-DiagLog "GIVING UP: no cmd windows matching token '$Token' found at all. Exit 2."
+        Write-Warning "No cmd windows found for token '$Token' (even without _FINAL filter)"
+        exit 2
+    }
+
     $i = 1
     foreach ($proc in $found) {
         Start-Sleep -Seconds 2
+        Write-DiagLog "Capturing window #${i}: PID=$($proc.Id) title='$($proc.MainWindowTitle)'"
         New-WindowScreenshot -Process $proc -OutputFolder $screensDir -OutputName ("{0}_{1}" -f $Prefix, $i) -MaximizeBeforeCapture | Out-Null
         if ($CloseAfterCapture) { Close-WindowProcess -Process $proc }
         $i++
         Start-Sleep -Seconds 1
     }
+    Write-DiagLog "Done. Captured $($found.Count) window(s)."
 }
 
 # ===================== MAIN =====================

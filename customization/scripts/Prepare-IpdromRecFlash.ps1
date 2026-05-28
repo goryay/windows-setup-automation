@@ -378,21 +378,35 @@ $fwEntry     = Find-FirmwareEntryForPartition -Letter $winreLetter
 if ($fwEntry) {
     Write-Log "Firmware entry already exists: $fwEntry  (device partition=${winreLetter}:)" 'Green'
 } else {
-    Write-Log "No firmware entry found for partition=${winreLetter}:. Creating one via bcdedit..." 'Yellow'
+    Write-Log "No firmware entry found for partition=${winreLetter}:. Creating one via bcdedit /copy {bootmgr}..." 'Yellow'
 
-    $createOut = bcdedit /create /d "IPDROM Recovery FFU" /application bootmgr 2>&1
+    # КОРРЕКТНЫЙ способ создать firmware-entry типа bootmgr:
+    # /copy {bootmgr} - копирует существующий Windows Boot Manager entry,
+    # наследуя тип "bootmgr" (которого НЕТ среди допустимых /application X).
+    # На выходе получаем новый GUID, у которого затем переопределяем device и path.
+    $createOut = bcdedit /copy "{bootmgr}" /d "IPDROM Recovery FFU" 2>&1
     foreach ($l in $createOut) { Write-Log "  | $l" 'DarkGray' }
 
+    # Парсим новый GUID. Microsoft пишет "...copied to {GUID}" / "скопирована в {GUID}".
+    # Берём ПЕРВЫЙ GUID который не {bootmgr} и не {fwbootmgr}.
     $newGuid = $null
     foreach ($l in $createOut) {
-        if ($l -match '(\{[a-f0-9-]+\})') { $newGuid = $matches[1]; break }
+        $g = [regex]::Matches($l, '\{[a-f0-9-]+\}')
+        foreach ($m in $g) {
+            $candidate = $m.Value
+            if ($candidate -ine '{bootmgr}' -and $candidate -ine '{fwbootmgr}') {
+                $newGuid = $candidate
+                break
+            }
+        }
+        if ($newGuid) { break }
     }
 
     if (-not $newGuid) {
-        Write-Log "Could not parse new GUID from bcdedit /create output. Firmware entry NOT created." 'Red'
+        Write-Log "Could not parse new GUID from bcdedit /copy output. Firmware entry NOT created." 'Red'
         Write-Log "FFU capture will likely fail in Invoke-FfuCaptureReboot.ps1." 'Yellow'
     } else {
-        Write-Log "  Created entry: $newGuid" 'Gray'
+        Write-Log "  Copied entry: $newGuid" 'Gray'
 
         $r1 = bcdedit /set "$newGuid" device "partition=${winreLetter}:" 2>&1
         foreach ($l in $r1) { Write-Log "  | set device: $l" 'DarkGray' }
