@@ -219,6 +219,7 @@ public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
 [System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
 '@
         }
 
@@ -462,6 +463,27 @@ function Close-ProcessByName {
     }
 }
 
+# ===================== AIDA WARMUP + EARLY SCREENSHOT =====================
+# AIDA-у нужно ~120s чтобы войти в полноценный System Stability Test.
+# Делим этот warmup на две фазы:
+#   60s : AIDA одна работает, UI отвечает - снимаем AIDA_early скрин
+#   60s : дожидаемся пока AIDA точно стабилизировалась, потом возврат
+#         в основной поток (запустит FurMark/FIO).
+# Гарантирует что хотя бы ОДИН чистый скрин AIDA у нас будет, независимо от
+# того что произойдёт с UI под пиковой нагрузкой ближе к концу теста.
+function Wait-AidaWarmupWithEarlyScreenshot {
+    Write-Log "Waiting 60s for AIDA64 to fully start (phase 1/2)..."
+    Start-Sleep -Seconds 60
+    Write-Log "Taking AidaEarly screenshot (AIDA alone, FurMark/FIO not yet started)..." 'Yellow'
+    try {
+        Save-AidaScreenshotInline -Prefix 'AIDA64_early'
+    } catch {
+        Write-Log "AidaEarly screenshot failed: $_" 'Yellow'
+    }
+    Write-Log "Waiting another 60s before FurMark/FIO (phase 2/2)..."
+    Start-Sleep -Seconds 60
+}
+
 # ===================== SCREENSHOT HELPER =====================
 $invokeScreen = {
     param([string]$Mode)
@@ -511,8 +533,7 @@ elseif ($gpuCount -eq 1 -and -not $hasFio) {
     # ---- CASE 2: AIDA + FurMark GPU0 ----
     Write-Log "=== Case 2: AIDA64 + FurMark GPU0 ===" 'Cyan'
     $aidaProc = Start-Aida -IncludeGPU $false
-    Write-Log "Waiting 120s for AIDA64 to fully start..."
-    Start-Sleep -Seconds 120
+    Wait-AidaWarmupWithEarlyScreenshot
     $fm = Start-FurMark -GpuIndex 0
     if ($fm) { $furmarkStarted += $fm }
     $lastLaunchOffsetSec = Get-ElapsedSec
@@ -521,8 +542,7 @@ elseif ($gpuCount -ge 2 -and -not $hasFio) {
     # ---- CASE 3: AIDA + FurMark GPU0 + FurMark GPU1 ----
     Write-Log "=== Case 3: AIDA64 + FurMark GPU0 + FurMark GPU1 ===" 'Cyan'
     $aidaProc = Start-Aida -IncludeGPU $false
-    Write-Log "Waiting 120s for AIDA64 to fully start..."
-    Start-Sleep -Seconds 120
+    Wait-AidaWarmupWithEarlyScreenshot
     $fm = Start-FurMark -GpuIndex 0
     if ($fm) { $furmarkStarted += $fm }
     Write-Log "Waiting 15s before FurMark GPU1..."
@@ -535,8 +555,7 @@ elseif ($gpuCount -eq 0 -and $hasFio) {
     # ---- CASE 4: AIDA (GPU stress) + FIO ----
     Write-Log "=== Case 4: AIDA64 (GPU stress ON) + FIO $($fioDrives -join ',') ===" 'Cyan'
     $aidaProc = Start-Aida -IncludeGPU $true
-    Write-Log "Waiting 120s for AIDA64 to fully start..."
-    Start-Sleep -Seconds 120
+    Wait-AidaWarmupWithEarlyScreenshot
     foreach ($drive in $fioDrives) {
         $fio = Start-Fio -DriveLetter $drive
         if ($fio) { $fioStarted += $fio }
@@ -547,8 +566,7 @@ elseif ($gpuCount -eq 1 -and $hasFio) {
     # ---- CASE 5: AIDA + FurMark GPU0 + FIO ----
     Write-Log "=== Case 5: AIDA64 + FurMark GPU0 + FIO $($fioDrives -join ',') ===" 'Cyan'
     $aidaProc = Start-Aida -IncludeGPU $false
-    Write-Log "Waiting 120s for AIDA64 to fully start..."
-    Start-Sleep -Seconds 120
+    Wait-AidaWarmupWithEarlyScreenshot
     $fm = Start-FurMark -GpuIndex 0
     if ($fm) { $furmarkStarted += $fm }
     Write-Log "Waiting 30s before FIO..."
@@ -563,8 +581,7 @@ else {
     # ---- CASE 6: AIDA + FurMark GPU0 + FurMark GPU1 + FIO ----
     Write-Log "=== Case 6: AIDA64 + FurMark GPU0 + FurMark GPU1 + FIO $($fioDrives -join ',') ===" 'Cyan'
     $aidaProc = Start-Aida -IncludeGPU $false
-    Write-Log "Waiting 120s for AIDA64 to fully start..."
-    Start-Sleep -Seconds 120
+    Wait-AidaWarmupWithEarlyScreenshot
     $fm = Start-FurMark -GpuIndex 0
     if ($fm) { $furmarkStarted += $fm }
     Write-Log "Waiting 15s before FurMark GPU1..."
@@ -726,13 +743,17 @@ try {
     Write-Log "MinimizeAll failed: $_" 'Yellow'
 }
 # Shell.MinimizeAll() НЕ сворачивает консоль собственного процесса - её надо
-# свернуть отдельно через ShowWindow(SW_MINIMIZE=6), иначе DesktopFinal-скрин
-# покажет наш же запущенный PowerShell поверх рабочего стола.
+# свернуть отдельно. На Win11 консолью владеет conhost.exe, поэтому
+# (Get-Process -Id $PID).MainWindowHandle возвращает 0 или handle от conhost,
+# и ShowWindow на нём не работает. Канонический способ - kernel32!GetConsoleWindow.
 try {
-    $selfHwnd = (Get-Process -Id $PID).MainWindowHandle
+    $selfHwnd = [IPDROM.WinFG]::GetConsoleWindow()
     if ($selfHwnd -ne [IntPtr]::Zero) {
-        [IPDROM.WinFG]::ShowWindow($selfHwnd, 6) | Out-Null
+        [IPDROM.WinFG]::ShowWindow($selfHwnd, 6) | Out-Null  # SW_MINIMIZE
         Start-Sleep -Seconds 1
+        Write-Log "Self console minimized (hwnd=$selfHwnd)." 'DarkGray'
+    } else {
+        Write-Log "GetConsoleWindow returned NULL - cannot minimize self." 'Yellow'
     }
 } catch {
     Write-Log "Minimize self console failed: $_" 'Yellow'
