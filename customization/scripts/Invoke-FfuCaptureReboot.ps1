@@ -152,9 +152,14 @@ $bcdRaw = bcdedit /enum firmware 2>&1
 $bcdText = ($bcdRaw -join "`r`n")
 
 # bcdedit output is block-separated by blank lines. Parse each block.
-$blocks = $bcdText -split "(?ms)\r?\n\r?\n"
-$candidates = @()
-$flashModelTokens = @($flashDisk.FriendlyName -split '\s+' | Where-Object { $_.Length -gt 2 })
+# We match by `device partition=<letter>:` where <letter> is OUR WINRE drive letter -
+# this is a direct physical mapping, robust regardless of what BIOS put in description.
+# Prepare-IpdromRecFlash.ps1 guarantees that a firmware entry for this partition exists
+# (creates one via bcdedit /create if bcdboot didn't).
+$blocks       = $bcdText -split "(?ms)\r?\n\r?\n"
+$candidates   = @()
+$winreLetter  = $winreVol.DriveLetter.ToString().ToUpper()
+$ipdromLetter = $ipdromVol.DriveLetter.ToString().ToUpper()
 
 foreach ($block in $blocks) {
     # Locale-independent: first GUID in the block IS the identifier
@@ -163,31 +168,34 @@ foreach ($block in $blocks) {
     $id = $matches[1]
     if ($id -ieq '{bootmgr}' -or $id -ieq '{fwbootmgr}') { continue }
 
-    # "description" remains English in all locales
+    # "description" remains English in all locales (informational only - not used for matching)
     $desc = ''
     if ($block -match '(?im)^\s*description\s+(.+?)\s*$') { $desc = $matches[1].Trim() }
 
-    $isUsb = $false
-    if ($desc -match '(?i)\bUSB\b') { $isUsb = $true }
-    foreach ($t in $flashModelTokens) {
-        if ($desc -like "*$t*") { $isUsb = $true; break }
+    # Extract partition letter from "device partition=<letter>:"
+    $partLetter = $null
+    if ($block -match '(?im)^\s*device\s+partition=([A-Z]):') {
+        $partLetter = $matches[1].ToUpper()
     }
+    if (-not $partLetter) { continue }
 
-    if ($isUsb) {
-        # Score by partition number - prefer "Partition 1" (= ESP with bootloader)
-        $partNum = 99
-        if ($desc -match '(?i)Partition\s+(\d+)') { $partNum = [int]$matches[1] }
+    # Accept entries pointing at our WINRE partition (where bootmgr lives)
+    # OR at IpdromREC (some BIOSes register entries on the data partition too).
+    if ($partLetter -eq $winreLetter -or $partLetter -eq $ipdromLetter) {
+        # Prefer WINRE letter (= partition with actual bootloader)
+        $priority = if ($partLetter -eq $winreLetter) { 1 } else { 2 }
         $candidates += [pscustomobject]@{
             Id              = $id
             Description     = $desc
-            PartitionNumber = $partNum
+            PartitionLetter = $partLetter
+            Priority        = $priority
         }
-        Write-Log "  candidate: $id  '$desc'  (partition=$partNum)" 'Gray'
+        Write-Log "  candidate: $id  '$desc'  (partition=${partLetter}:, priority=$priority)" 'Gray'
     }
 }
 
-# Prefer lower partition number (Partition 1 = bootable ESP usually)
-$candidates = @($candidates | Sort-Object PartitionNumber)
+# Prefer WINRE partition (priority=1) over IpdromREC data partition (priority=2)
+$candidates = @($candidates | Sort-Object Priority)
 
 if ($candidates.Count -eq 0) {
     Write-Log "No UEFI boot entry matching the IpdromREC USB. Cannot set BootNext." 'Red'

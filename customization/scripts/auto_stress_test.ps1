@@ -554,16 +554,46 @@ function Ensure-DataDiskHasDriveLetter {
 
     $letters = @()
 
-    try {
-        $partitions = @(
-            Get-Partition -DiskNumber $Disk.Number -ErrorAction Stop |
-            Where-Object {
-                $_.Type -notmatch 'Reserved|Recovery|System' -and
-                $_.Size -gt 1GB
-            } |
-            Sort-Object Size -Descending
-        )
+    # Сначала проверяем все ли существующие партиции > 1GB.
+    # ErrorAction=SilentlyContinue вместо Stop - чтобы пустой результат не уходил
+    # в catch как "MSFT_Partition not found", а трактовался как "0 партиций".
+    $allPartitions = @(
+        Get-Partition -DiskNumber $Disk.Number -ErrorAction SilentlyContinue
+    )
+    $partitions = @(
+        $allPartitions |
+        Where-Object {
+            $_.Type -notmatch 'Reserved|Recovery|System' -and
+            $_.Size -gt 1GB
+        } |
+        Sort-Object Size -Descending
+    )
 
+    # Случай: диск инициализирован (GPT/MBR), но партиций нет вообще
+    # (например диск 0 - RAID 6TB Не распределена; диски 2/3 - чистые NVMe).
+    # Используем ту же логику что и для RAW: создаём партицию + форматируем NTFS.
+    if ($allPartitions.Count -eq 0) {
+        if (-not $AllowCreatePartition) {
+            Write-RaidLog "Disk $($Disk.Number) has no partitions but auto-create is not allowed. Skipped."
+            return @()
+        }
+        try {
+            $letter = Get-FreeDriveLetter
+            Write-ColorOutput "  Disk $($Disk.Number) initialized but empty. Creating NTFS partition, letter $letter`: ..." 'Yellow'
+            Write-RaidLog "Disk $($Disk.Number) has $($Disk.PartitionStyle) but 0 partitions - creating NTFS volume $letter`:"
+
+            $partition = New-Partition -DiskNumber $Disk.Number -UseMaximumSize -DriveLetter $letter -ErrorAction Stop
+            Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel 'IPDROM_RAID_TEST' -Confirm:$false -Force -ErrorAction Stop | Out-Null
+
+            Write-RaidLog "Disk $($Disk.Number) prepared as $letter`:"
+            return @($letter)
+        } catch {
+            Write-RaidLog "Failed to create partition on disk $($Disk.Number): $_"
+            return @()
+        }
+    }
+
+    try {
         foreach ($partition in $partitions) {
             if ($partition.DriveLetter) {
                 $letters += $partition.DriveLetter.ToString().ToUpper()

@@ -348,6 +348,72 @@ try {
 & dism /Unmount-Wim "/MountDir:$wimMount" /Discard 2>&1 | ForEach-Object { Write-Log "  | $_" 'DarkGray' }
 Remove-Item -LiteralPath $wimMount -Force -Recurse -ErrorAction SilentlyContinue
 
+# ===================== ENSURE FIRMWARE BOOT ENTRY EXISTS =====================
+# bcdboot ДОЛЖЕН был добавить запись в {fwbootmgr} (firmware NVRAM), указывающую
+# на наш USB. На removable-media это работает нестабильно: иногда bcdboot
+# тихо пропускает запись в EFI NVRAM. Проверяем явно, и если нет - создаём
+# руками через bcdedit. Invoke-FfuCaptureReboot.ps1 затем найдёт эту запись
+# и поставит её как BootNext.
+Write-Log "Verifying UEFI firmware boot entry for $winreRoot..." 'Yellow'
+
+function Find-FirmwareEntryForPartition {
+    param([string]$Letter)
+    $L = $Letter.TrimEnd(':\').ToUpper()
+    $raw = bcdedit /enum firmware 2>&1
+    $text = ($raw -join "`r`n")
+    foreach ($block in ($text -split "(?ms)\r?\n\r?\n")) {
+        if ($block -notmatch '(\{[a-f0-9-]+\})') { continue }
+        $id = $matches[1]
+        if ($id -ieq '{bootmgr}' -or $id -ieq '{fwbootmgr}') { continue }
+        if ($block -match '(?im)^\s*device\s+partition=([A-Z]):') {
+            if ($matches[1].ToUpper() -eq $L) { return $id }
+        }
+    }
+    return $null
+}
+
+$winreLetter = $winreRoot.TrimEnd(':\')
+$fwEntry     = Find-FirmwareEntryForPartition -Letter $winreLetter
+
+if ($fwEntry) {
+    Write-Log "Firmware entry already exists: $fwEntry  (device partition=${winreLetter}:)" 'Green'
+} else {
+    Write-Log "No firmware entry found for partition=${winreLetter}:. Creating one via bcdedit..." 'Yellow'
+
+    $createOut = bcdedit /create /d "IPDROM Recovery FFU" /application bootmgr 2>&1
+    foreach ($l in $createOut) { Write-Log "  | $l" 'DarkGray' }
+
+    $newGuid = $null
+    foreach ($l in $createOut) {
+        if ($l -match '(\{[a-f0-9-]+\})') { $newGuid = $matches[1]; break }
+    }
+
+    if (-not $newGuid) {
+        Write-Log "Could not parse new GUID from bcdedit /create output. Firmware entry NOT created." 'Red'
+        Write-Log "FFU capture will likely fail in Invoke-FfuCaptureReboot.ps1." 'Yellow'
+    } else {
+        Write-Log "  Created entry: $newGuid" 'Gray'
+
+        $r1 = bcdedit /set "$newGuid" device "partition=${winreLetter}:" 2>&1
+        foreach ($l in $r1) { Write-Log "  | set device: $l" 'DarkGray' }
+
+        $r2 = bcdedit /set "$newGuid" path \EFI\Microsoft\Boot\bootmgfw.efi 2>&1
+        foreach ($l in $r2) { Write-Log "  | set path: $l" 'DarkGray' }
+
+        $r3 = bcdedit /set "{fwbootmgr}" displayorder "$newGuid" /addlast 2>&1
+        foreach ($l in $r3) { Write-Log "  | addlast: $l" 'DarkGray' }
+
+        # Verify by re-enumerating firmware entries.
+        $verifyEntry = Find-FirmwareEntryForPartition -Letter $winreLetter
+        if ($verifyEntry) {
+            Write-Log "Firmware entry verified: $verifyEntry" 'Green'
+        } else {
+            Write-Log "Firmware entry creation may have failed - re-enumeration found nothing." 'Red'
+            Write-Log "FFU capture step will likely fail to set BootNext." 'Yellow'
+        }
+    }
+}
+
 # ===================== INITIALIZE IPDROMREC PARTITION =====================
 Write-Log "Initializing IpdromREC partition..." 'Yellow'
 New-Item -ItemType Directory -Force -Path (Join-Path $ipdromRoot 'Logs') | Out-Null
