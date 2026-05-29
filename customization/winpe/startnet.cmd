@@ -50,32 +50,41 @@ if exist "%IPDROM_TARGET%\.capture_pending" (
     goto :do_capture
 )
 
-if exist "%IPDROM_TARGET%\restore.ffu" (
-    echo.
-    echo ==============================================================
-    echo  RECOVERY MODE
-    echo ==============================================================
-    echo Found restore.ffu on %IPDROM_TARGET%
-    echo.
-    echo This will RESTORE the system disk from the recovery image.
-    echo ALL DATA on the system disk will be ERASED.
-    echo.
-    echo Press R within 30 seconds to RESTORE.
-    echo Any other key (or no key) - cancel and reboot.
-    echo ==============================================================
-    choice /c RC /n /t 30 /d C /m "Press [R]estore or [C]ancel (auto-cancel in 30s): "
-    if errorlevel 2 (
-        echo Cancelled by user/timeout. Rebooting in 5 seconds...
-        ping -n 6 127.0.0.1 > nul
-        wpeutil reboot
-        exit /b 0
-    )
-    echo User chose RESTORE. Proceeding...
-    goto :do_apply
-)
+if exist "%IPDROM_TARGET%\restore.ffu" goto :recovery_mode
 
 echo No .capture_pending marker and no restore.ffu found on %IPDROM_TARGET%.
 echo Nothing to do. Rebooting in 5 seconds...
+ping -n 6 127.0.0.1 > nul
+wpeutil reboot
+exit /b 0
+
+:: ==============================================================
+:: RECOVERY MODE (label-based, не multi-line if-блок).
+:: Раньше тут был "if exist (..." с многострочным блоком, и cmd-парсер
+:: ломался на echo-строках с непаредуемыми парентезами типа (or no key),
+:: что приводило к молчаливому ребуту.
+:: Также раньше использовался "choice" - которого может не быть в
+:: некоторых WinPE-сборках. Сейчас pause + set /p - они точно работают.
+:: ==============================================================
+:recovery_mode
+echo.
+echo ==============================================================
+echo  RECOVERY MODE
+echo ==============================================================
+echo Found restore.ffu on %IPDROM_TARGET%
+echo.
+echo This will RESTORE the system disk from the recovery image.
+echo ALL DATA on the system disk will be ERASED.
+echo.
+echo Press any key to see options.
+echo ==============================================================
+pause > nul
+
+set IPDROM_REPLY=
+set /p IPDROM_REPLY="Type R and press Enter to RESTORE, or anything else to cancel: "
+if /i "%IPDROM_REPLY%"=="R" goto :do_apply
+
+echo Cancelled. Rebooting in 5 seconds...
 ping -n 6 127.0.0.1 > nul
 wpeutil reboot
 exit /b 0
@@ -181,7 +190,7 @@ echo. >> "%IPDROM_LOG%"
 echo DISM exit code: %DISM_EXIT% >> "%IPDROM_LOG%"
 
 if %DISM_EXIT% NEQ 0 (
-    echo CAPTURE FAILED with exit code %DISM_EXIT%. Restoring old restore.ffu (if any). >> "%IPDROM_LOG%"
+    echo CAPTURE FAILED with exit code %DISM_EXIT%. Restoring old restore.ffu ^(if any^). >> "%IPDROM_LOG%"
     if exist "%FFU_OUT%" del /f /q "%FFU_OUT%"
     if exist "%IPDROM_TARGET%\restore.old.ffu" ren "%IPDROM_TARGET%\restore.old.ffu" restore.ffu
     echo FAILED %DATE% %TIME% exit=%DISM_EXIT% > "%IPDROM_TARGET%\.capture_failed"
