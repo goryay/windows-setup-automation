@@ -185,7 +185,18 @@ echo Target : %FFU_OUT% >> "%IPDROM_LOG%"
 echo Name   : %FFU_NAME% >> "%IPDROM_LOG%"
 echo. >> "%IPDROM_LOG%"
 
-dism /Capture-Ffu /ImageFile:"%FFU_OUT%" /CaptureDrive:\\.\PhysicalDrive%IPDROM_SYSDISK% /Name:"%FFU_NAME%" /Description:"%FFU_DESC%" >> "%IPDROM_LOG%" 2>&1
+echo.
+echo ==============================================================
+echo  Capturing system disk to FFU image...
+echo  Source: PhysicalDrive%IPDROM_SYSDISK%
+echo  Target: %FFU_OUT%
+echo  This takes 5-30 min. Progress bar below.
+echo ==============================================================
+echo.
+
+:: DISM выводит прогресс-бар на ЭКРАН (без перенаправления в лог),
+:: чтобы было видно процесс. Результат (exit code) пишем в лог отдельно ниже.
+dism /Capture-Ffu /ImageFile:"%FFU_OUT%" /CaptureDrive:\\.\PhysicalDrive%IPDROM_SYSDISK% /Name:"%FFU_NAME%" /Description:"%FFU_DESC%"
 set DISM_EXIT=%ERRORLEVEL%
 
 echo. >> "%IPDROM_LOG%"
