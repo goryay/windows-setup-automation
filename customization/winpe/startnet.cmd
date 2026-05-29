@@ -253,12 +253,12 @@ echo.
 echo Available physical disks:
 echo. >> "%IPDROM_LOG%"
 echo Available physical disks: >> "%IPDROM_LOG%"
-wmic diskdrive get Index,Model,Size,InterfaceType,MediaType /format:list | findstr /v "^$" >> "%IPDROM_LOG%" 2>&1
+wmic diskdrive get Index,Model,Size,InterfaceType,MediaType /format:list >> "%IPDROM_LOG%" 2>&1
 echo DEBUG E: wmic-to-log done. Press any key.
 pause > nul
 
-wmic diskdrive get Index,Model,Size,InterfaceType,MediaType
-echo DEBUG F: wmic-to-screen done. Press any key.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Disk | Sort-Object Number | Format-Table Number, FriendlyName, @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}}, BusType, PartitionStyle -AutoSize"
+echo DEBUG F: disk list shown. Press any key.
 pause > nul
 
 echo.
