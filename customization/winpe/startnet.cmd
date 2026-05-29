@@ -75,17 +75,19 @@ echo Found restore.ffu on %IPDROM_TARGET%
 echo.
 echo This will RESTORE the system disk from the recovery image.
 echo ALL DATA on the system disk will be ERASED.
-echo.
-echo Press any key to see options.
 echo ==============================================================
-pause > nul
+echo.
 
+:: Интерактив через PowerShell Read-Host - надёжнее чем cmd set /p в WinPE.
+:: PS точно работает в этом WinPE (используется для Get-Partition ниже).
 set IPDROM_REPLY=
-set /p IPDROM_REPLY="Type R and press Enter to RESTORE, or anything else to cancel: "
+for /f "usebackq delims=" %%i in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "(Read-Host 'Type R and press Enter to RESTORE (anything else cancels)').Trim()"`) do set IPDROM_REPLY=%%i
+
+echo DEBUG: captured reply = [%IPDROM_REPLY%]
 if /i "%IPDROM_REPLY%"=="R" goto :do_apply
 
-echo Cancelled. Rebooting in 5 seconds...
-ping -n 6 127.0.0.1 > nul
+echo Cancelled. Press any key to reboot.
+pause > nul
 wpeutil reboot
 exit /b 0
 
@@ -249,16 +251,12 @@ echo Find the SYSTEM DISK - usually the internal NVMe/SATA.
 echo DO NOT pick the IpdromREC USB - that would erase the recovery image itself.
 echo.
 
-:: ВАЖНО: после вывода wmic в буфере stdin может остаться символ перевода
-:: строки, который set /p проглотит как пустой ввод. Сначала pause очищает
-:: буфер и даёт пользователю прочитать список, потом запрашиваем Index.
-echo Press any key when ready to enter the disk Index...
-pause > nul
-
 :ask_index
+:: Интерактив через PowerShell Read-Host - надёжнее cmd set /p в WinPE.
 set IPDROM_APPLYIDX=
-set /p IPDROM_APPLYIDX="Enter disk Index to APPLY recovery to (then Enter), or X to cancel: "
+for /f "usebackq delims=" %%i in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "(Read-Host 'Enter disk Index to APPLY recovery to, or X to cancel').Trim()"`) do set IPDROM_APPLYIDX=%%i
 
+echo DEBUG: index = [%IPDROM_APPLYIDX%]
 if /i "%IPDROM_APPLYIDX%"=="X" goto :apply_cancel
 if not defined IPDROM_APPLYIDX goto :apply_cancel
 
@@ -282,7 +280,7 @@ echo.
 echo This will COMPLETELY ERASE Disk %IPDROM_APPLYIDX%. ALL data lost.
 echo.
 set IPDROM_CONFIRM=
-set /p IPDROM_CONFIRM="Type Y and Enter to proceed, anything else to cancel: "
+for /f "usebackq delims=" %%i in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "(Read-Host 'Type Y to proceed, anything else cancels').Trim()"`) do set IPDROM_CONFIRM=%%i
 if /i not "%IPDROM_CONFIRM%"=="Y" goto :apply_cancel
 
 :: --- Run DISM /Apply-Ffu ---
