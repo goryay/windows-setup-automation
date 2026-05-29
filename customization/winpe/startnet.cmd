@@ -245,30 +245,30 @@ wmic diskdrive get Index,Model,Size,InterfaceType,MediaType /format:list | finds
 wmic diskdrive get Index,Model,Size,InterfaceType,MediaType
 
 echo.
-echo Find the SYSTEM DISK (usually Index=0 or Index=1, the internal NVMe/SATA).
+echo Find the SYSTEM DISK - usually the internal NVMe/SATA.
 echo DO NOT pick the IpdromREC USB - that would erase the recovery image itself.
 echo.
 
-set IPDROM_APPLYIDX=
-set /p IPDROM_APPLYIDX="Enter disk Index to APPLY recovery to (or just Enter to cancel): "
+:: ВАЖНО: после вывода wmic в буфере stdin может остаться символ перевода
+:: строки, который set /p проглотит как пустой ввод. Сначала pause очищает
+:: буфер и даёт пользователю прочитать список, потом запрашиваем Index.
+echo Press any key when ready to enter the disk Index...
+pause > nul
 
-if not defined IPDROM_APPLYIDX (
-    echo Cancelled by user. >> "%IPDROM_LOG%"
-    echo Cancelled. Rebooting...
-    ping -n 6 127.0.0.1 > nul
-    wpeutil reboot
-    exit /b 0
-)
+:ask_index
+set IPDROM_APPLYIDX=
+set /p IPDROM_APPLYIDX="Enter disk Index to APPLY recovery to (then Enter), or X to cancel: "
+
+if /i "%IPDROM_APPLYIDX%"=="X" goto :apply_cancel
+if not defined IPDROM_APPLYIDX goto :apply_cancel
 
 :: --- Safety check: don't apply to IpdromREC USB itself ---
 for /f "tokens=*" %%i in ('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "(Get-Partition -DriveLetter '%IPDROM_TARGET:~0,1%' -ErrorAction SilentlyContinue).DiskNumber" 2^>nul') do set IPDROM_TGTDISK=%%i
 if defined IPDROM_TGTDISK if "%IPDROM_APPLYIDX%"=="%IPDROM_TGTDISK%" (
-    echo ERROR: you picked Disk %IPDROM_APPLYIDX% which is the IpdromREC flash itself! >> "%IPDROM_LOG%"
-    echo ERROR: you picked Disk %IPDROM_APPLYIDX% which is the IpdromREC flash itself!
-    echo ABORT. Press any key to reboot.
-    pause > nul
-    wpeutil reboot
-    exit /b 4
+    echo.
+    echo ERROR: Disk %IPDROM_APPLYIDX% is the IpdromREC flash itself. Pick another.
+    echo.
+    goto :ask_index
 )
 
 :: --- Confirmation ---
@@ -279,17 +279,11 @@ echo ==============================================================
 echo About to apply: %IPDROM_TARGET%\restore.ffu
 echo Target disk:    PhysicalDrive%IPDROM_APPLYIDX%
 echo.
-echo This will COMPLETELY ERASE Disk %IPDROM_APPLYIDX%.
-echo ALL data on it will be LOST.
+echo This will COMPLETELY ERASE Disk %IPDROM_APPLYIDX%. ALL data lost.
 echo.
-choice /c YN /n /m "Type Y to proceed, N to cancel: "
-if errorlevel 2 (
-    echo Cancelled by user at confirmation. >> "%IPDROM_LOG%"
-    echo Cancelled. Rebooting...
-    ping -n 6 127.0.0.1 > nul
-    wpeutil reboot
-    exit /b 0
-)
+set IPDROM_CONFIRM=
+set /p IPDROM_CONFIRM="Type Y and Enter to proceed, anything else to cancel: "
+if /i not "%IPDROM_CONFIRM%"=="Y" goto :apply_cancel
 
 :: --- Run DISM /Apply-Ffu ---
 echo. >> "%IPDROM_LOG%"
@@ -303,20 +297,13 @@ echo Applying image... this will take 5-30 minutes depending on disk speed.
 echo Progress is shown below.
 echo.
 
-dism /Apply-Ffu /ImageFile:"%IPDROM_TARGET%\restore.ffu" /ApplyDrive:\\.\PhysicalDrive%IPDROM_APPLYIDX% >> "%IPDROM_LOG%" 2>&1
+dism /Apply-Ffu /ImageFile:"%IPDROM_TARGET%\restore.ffu" /ApplyDrive:\\.\PhysicalDrive%IPDROM_APPLYIDX%
 set DISM_EXIT=%ERRORLEVEL%
 
 echo. >> "%IPDROM_LOG%"
 echo DISM exit code: %DISM_EXIT% >> "%IPDROM_LOG%"
 
-if %DISM_EXIT% NEQ 0 (
-    echo APPLY FAILED with exit code %DISM_EXIT%. >> "%IPDROM_LOG%"
-    echo APPLY FAILED. See log: %IPDROM_LOG%
-    echo Press any key to reboot.
-    pause > nul
-    wpeutil reboot
-    exit /b %DISM_EXIT%
-)
+if not "%DISM_EXIT%"=="0" goto :apply_failed
 
 echo === Apply completed successfully === >> "%IPDROM_LOG%"
 echo.
@@ -326,7 +313,27 @@ echo ==============================================================
 echo Remove the IpdromREC USB and reboot the machine.
 echo It will boot into the restored Windows.
 echo.
-echo Auto-reboot in 30 seconds (or press any key now).
-choice /c R /n /t 30 /d R > nul
+echo Press any key to reboot.
+pause > nul
 wpeutil reboot
 exit /b 0
+
+:apply_cancel
+echo Cancelled by user. >> "%IPDROM_LOG%"
+echo.
+echo Apply cancelled. Press any key to reboot.
+pause > nul
+wpeutil reboot
+exit /b 0
+
+:apply_failed
+echo APPLY FAILED with exit code %DISM_EXIT%. >> "%IPDROM_LOG%"
+echo.
+echo ==============================================================
+echo  APPLY FAILED (exit %DISM_EXIT%)
+echo ==============================================================
+echo See log: %IPDROM_LOG%
+echo Press any key to reboot.
+pause > nul
+wpeutil reboot
+exit /b %DISM_EXIT%
