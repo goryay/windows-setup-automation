@@ -1,0 +1,35 @@
+sn=SLTEST01-001
+model=Server IPDROM Test PC BUILD
+
+#hwinfo
+OS_family=Windows
+OS_type=Windows 11
+OS_ver=24H2
+OS_license_type=Server
+cpu_num=Single
+cpu_models=Intel Core
+mb_vendor=ASUSTeK
+mb_model=PRIME Z790-P
+ram_num=2
+ram_size=16
+gpu_discrete=TRUE
+gpu_discrete_model=NVIDIA RTX A400
+gpu_discrete_num=2
+
+#raid
+raid1_model=AVAGO MegaRAID SAS9361-8i
+raid1_bbu=TRUE
+raid2_model=None
+raid2_bbu=FALSE
+
+#disks
+# group_1 = СИСТЕМНЫЙ массив (создан вручную в RAID BIOS).
+# Парсер увидит disk_system=TRUE и ПРОПУСТИТ его (загрузочный не трогаем).
+group_1_host=AVAGO MegaRAID SAS9361-8i
+group_1_Type=RAID-1
+group_1_disk_type=HDD
+group_1_disk_form_factor=SATA 3,5"
+group_1_disk_size=6Tb
+group_1_disk_quantity=2
+group_1_disk_system=TRUE
+group_1_disk_ratio=None
