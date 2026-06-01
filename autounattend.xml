@@ -532,22 +532,39 @@ Write-Host "Detected platform: $product"
 # Prepare folder name (replace spaces with underscores)
 $folderName = $product -replace '\s+', '_'
 $driverPath = Join-Path $driveRoot "drivers\platforms\$folderName"
+$commonPath = Join-Path $driveRoot "drivers\common\drivers"
 
-if (Test-Path $driverPath) {
-    Write-Host "Found driver folder: $driverPath"
-    Get-ChildItem $driverPath -Recurse -Filter *.inf | ForEach-Object {
-        Write-Host "Installing driver: $($_.FullName)"
+# 1. ALWAYS install COMMON drivers first (universal base: Intel chipset / ME /
+#    Serial IO, Moxa, etc.). pnputil matches each INF by HardwareID, so drivers
+#    that don't fit the current machine are simply skipped - safe to ship all.
+if (Test-Path $commonPath) {
+    Write-Host "Installing COMMON drivers from: $commonPath"
+    Get-ChildItem $commonPath -Recurse -Filter *.inf | ForEach-Object {
+        Write-Host "Installing common driver: $($_.FullName)"
         &amp; pnputil /add-driver $_.FullName /install
     }
 } else {
-    Write-Warning "No driver folder for platform $product. Trying common drivers..."
-    $commonPath = Join-Path $driveRoot "drivers\common\drivers"
-    if (Test-Path $commonPath) {
-        Get-ChildItem $commonPath -Recurse -Filter *.inf | ForEach-Object {
-            &amp; pnputil /add-driver $_.FullName /install
-        }
-    }
+    Write-Warning "Common drivers folder not found: $commonPath"
 }
+
+# 2. THEN install PLATFORM-specific drivers on top (board-specific additions /
+#    overrides). If no folder for this exact board - common drivers already cover it.
+if (Test-Path $driverPath) {
+    Write-Host "Installing PLATFORM drivers from: $driverPath"
+    Get-ChildItem $driverPath -Recurse -Filter *.inf | ForEach-Object {
+        Write-Host "Installing platform driver: $($_.FullName)"
+        &amp; pnputil /add-driver $_.FullName /install
+    }
+} else {
+    Write-Warning "No platform-specific folder for '$product' ($driverPath). Using common drivers only."
+}
+
+# 3. Rescan devices so drivers just added to the store get BOUND to PCI/ACPI
+#    devices that weren't fully enumerated during the specialize phase
+#    (e.g. Intel MEI / 7A68). Without this they sit in the store unbound and
+#    show as "Other devices" with a yellow mark, even though the INF is present.
+Write-Host "Rescanning hardware to bind freshly-added drivers..."
+&amp; pnputil /scan-devices
 		</File>
 		<File path="C:\Windows\Setup\Scripts\unattend-02.ps1">
 # Find and run customization script from USB
