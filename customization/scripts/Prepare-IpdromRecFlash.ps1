@@ -297,15 +297,32 @@ if ($parts.Count -lt 2) {
     exit 7
 }
 
-$winrePart  = $parts | Where-Object { $_.PartitionNumber -eq 1 -or ($_.AccessPaths | Where-Object { Test-Path "$_EFI\Boot" }) } | Select-Object -First 1
-$ipdromPart = $parts | Where-Object { $_.PartitionNumber -ne $winrePart.PartitionNumber } | Select-Object -First 1
-$winreVol   = Get-Volume -Partition $winrePart  -ErrorAction SilentlyContinue
-$ipdromVol  = Get-Volume -Partition $ipdromPart -ErrorAction SilentlyContinue
+# Определяем разделы ПО МЕТКЕ (надёжно - diskpart их проставил), а не по
+# номеру/эвристике. Раньше тут была кривая логика ("$_EFI\Boot"), из-за которой
+# WINRE и IpdromREC путались местами (boot.wim лёг на большой раздел, а
+# IpdromREC получался 1.5 ГБ - restore.ffu не влезал).
+$winreVol  = Get-Volume -ErrorAction SilentlyContinue | Where-Object {
+    $_.FileSystemLabel -eq 'WINRE' -and
+    (Get-Partition -Volume $_ -ErrorAction SilentlyContinue).DiskNumber -eq $disk.Number
+} | Select-Object -First 1
+$ipdromVol = Get-Volume -ErrorAction SilentlyContinue | Where-Object {
+    $_.FileSystemLabel -eq 'IpdromREC' -and
+    (Get-Partition -Volume $_ -ErrorAction SilentlyContinue).DiskNumber -eq $disk.Number
+} | Select-Object -First 1
 
+if (-not $winreVol -or -not $ipdromVol) {
+    Write-Log "Could not find WINRE/IpdromREC volumes by label after diskpart. Aborting." 'Red'
+    exit 8
+}
 if (-not $winreVol.DriveLetter -or -not $ipdromVol.DriveLetter) {
     Write-Log "Partitions have no drive letters after diskpart. Aborting." 'Red'
     exit 8
 }
+
+# Sanity: WINRE должен быть маленький (FAT32 ~1.5 ГБ), IpdromREC - большой (NTFS).
+Write-Log ("Label-based detection: WINRE={0}: ({1} MB {2}), IpdromREC={3}: ({4} GB {5})" -f `
+    $winreVol.DriveLetter, [math]::Round($winreVol.Size/1MB), $winreVol.FileSystem, `
+    $ipdromVol.DriveLetter, [math]::Round($ipdromVol.Size/1GB,1), $ipdromVol.FileSystem) 'Gray'
 
 $winreRoot  = "$($winreVol.DriveLetter):"
 $ipdromRoot = "$($ipdromVol.DriveLetter):"
@@ -340,13 +357,21 @@ try {
     Write-Log "Bootloader installed on $winreRoot." 'Green'
 
     # ===================== COPY boot.sdi (ramdisk descriptor) =====================
-    # bcdboot НЕ кладёт boot.sdi в \boot\ на USB - его надо взять руками из
-    # смонтированного boot.wim (после Unmount к нему доступа уже не будет).
-    # Без этого файла bootmgr не сможет разрезолвить ramdisk=[boot]\sources\boot.wim,{ramdiskoptions}.
-    Write-Log "Copying boot.sdi from mounted WIM..." 'Yellow'
+    # Без этого файла bootmgr не разрезолвит ramdisk=[boot]\sources\boot.wim
+    # и выдаст 0xC0000098/0xC0000225. ВАЖНО: в кастомном boot.wim файла boot.sdi
+    # обычно НЕТ (искать в смонтированном WIM бесполезно - это была причина бага).
+    # Берём boot.sdi с ЖИВОЙ системы (C:\Windows\...) - там он всегда есть.
+    Write-Log "Copying boot.sdi (from live OS, not from WIM)..." 'Yellow'
     $bootSdiSrc = $null
-    foreach ($rel in @('Windows\Boot\DVD\EFI\boot.sdi', 'Windows\Boot\DVD\PCAT\boot.sdi', 'Windows\System32\boot.sdi')) {
-        $p = Join-Path $wimMount $rel
+    $sdiCandidates = @(
+        (Join-Path $env:SystemRoot 'Boot\DVD\EFI\boot.sdi'),
+        (Join-Path $env:SystemRoot 'Boot\DVD\PCAT\boot.sdi'),
+        (Join-Path $env:SystemRoot 'System32\boot.sdi'),
+        (Join-Path $env:SystemRoot 'System32\Recovery\boot.sdi'),
+        # запасной вариант - вдруг всё же есть в WIM:
+        (Join-Path $wimMount 'Windows\Boot\DVD\EFI\boot.sdi')
+    )
+    foreach ($p in $sdiCandidates) {
         if (Test-Path $p) { $bootSdiSrc = $p; break }
     }
     if ($bootSdiSrc) {
@@ -356,8 +381,8 @@ try {
         $sdiSize = (Get-Item $bootSdiDst).Length
         Write-Log "  boot.sdi copied: $bootSdiDst ($sdiSize bytes from $bootSdiSrc)" 'Green'
     } else {
-        Write-Log "  boot.sdi NOT FOUND in mounted WIM - WinPE will fail to boot." 'Red'
-        Write-Log "  Searched paths: Windows\Boot\DVD\EFI\boot.sdi, Windows\Boot\DVD\PCAT\boot.sdi, Windows\System32\boot.sdi" 'Red'
+        Write-Log "  boot.sdi NOT FOUND anywhere - WinPE will fail to boot (0xC0000098)." 'Red'
+        Write-Log "  Searched live OS paths + WIM. Check C:\Windows\Boot\DVD\EFI\boot.sdi exists." 'Red'
     }
 
 } catch {
