@@ -268,12 +268,16 @@ if ($mode -eq 'REFRESH') {
 # ===================== FRESH PATH =====================
 Write-Log "FRESH: wiping and partitioning Disk $($disk.Number)..." 'Cyan'
 
-# Diskpart script: clean + GPT + WINRE FAT32 + IpdromREC NTFS
+# Diskpart script: clean + GPT + WINRE ESP(FAT32) + IpdromREC NTFS
+# ВАЖНО: WINRE создаётся как ESP (create partition efi), а НЕ primary.
+# UEFI на removable надёжно грузится только с EFI System Partition. Если делать
+# primary FAT32, BIOS (особенно ASUS) НЕ видит раздел как загрузочный -> в Boot
+# Menu нет записи Partition 1 -> загрузка падает. ESP-тип это чинит.
 $dpScript = @"
 select disk $($disk.Number)
 clean
 convert gpt
-create partition primary size=$WinreSizeMB
+create partition efi size=$WinreSizeMB
 format fs=fat32 label="WINRE" quick
 assign
 create partition primary
