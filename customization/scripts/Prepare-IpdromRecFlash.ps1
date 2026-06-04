@@ -412,85 +412,17 @@ if (-not (Test-Path $winreBcd)) {
     foreach ($l in $dump) { Write-Log "  | $l" 'DarkGray' }
 }
 
-# ===================== ENSURE FIRMWARE BOOT ENTRY EXISTS =====================
-# bcdboot ДОЛЖЕН был добавить запись в {fwbootmgr} (firmware NVRAM), указывающую
-# на наш USB. На removable-media это работает нестабильно: иногда bcdboot
-# тихо пропускает запись в EFI NVRAM. Проверяем явно, и если нет - создаём
-# руками через bcdedit. Invoke-FfuCaptureReboot.ps1 затем найдёт эту запись
-# и поставит её как BootNext.
-Write-Log "Verifying UEFI firmware boot entry for $winreRoot..." 'Yellow'
-
-function Find-FirmwareEntryForPartition {
-    param([string]$Letter)
-    $L = $Letter.TrimEnd(':\').ToUpper()
-    $raw = bcdedit /enum firmware 2>&1
-    $text = ($raw -join "`r`n")
-    foreach ($block in ($text -split "(?ms)\r?\n\r?\n")) {
-        if ($block -notmatch '(\{[a-f0-9-]+\})') { continue }
-        $id = $matches[1]
-        if ($id -ieq '{bootmgr}' -or $id -ieq '{fwbootmgr}') { continue }
-        if ($block -match '(?im)^\s*device\s+partition=([A-Z]):') {
-            if ($matches[1].ToUpper() -eq $L) { return $id }
-        }
-    }
-    return $null
-}
-
-$winreLetter = $winreRoot.TrimEnd(':\')
-$fwEntry     = Find-FirmwareEntryForPartition -Letter $winreLetter
-
-if ($fwEntry) {
-    Write-Log "Firmware entry already exists: $fwEntry  (device partition=${winreLetter}:)" 'Green'
-} else {
-    Write-Log "No firmware entry found for partition=${winreLetter}:. Creating one via bcdedit /copy {bootmgr}..." 'Yellow'
-
-    # КОРРЕКТНЫЙ способ создать firmware-entry типа bootmgr:
-    # /copy {bootmgr} - копирует существующий Windows Boot Manager entry,
-    # наследуя тип "bootmgr" (которого НЕТ среди допустимых /application X).
-    # На выходе получаем новый GUID, у которого затем переопределяем device и path.
-    $createOut = bcdedit /copy "{bootmgr}" /d "IPDROM Recovery FFU" 2>&1
-    foreach ($l in $createOut) { Write-Log "  | $l" 'DarkGray' }
-
-    # Парсим новый GUID. Microsoft пишет "...copied to {GUID}" / "скопирована в {GUID}".
-    # Берём ПЕРВЫЙ GUID который не {bootmgr} и не {fwbootmgr}.
-    $newGuid = $null
-    foreach ($l in $createOut) {
-        $g = [regex]::Matches($l, '\{[a-f0-9-]+\}')
-        foreach ($m in $g) {
-            $candidate = $m.Value
-            if ($candidate -ine '{bootmgr}' -and $candidate -ine '{fwbootmgr}') {
-                $newGuid = $candidate
-                break
-            }
-        }
-        if ($newGuid) { break }
-    }
-
-    if (-not $newGuid) {
-        Write-Log "Could not parse new GUID from bcdedit /copy output. Firmware entry NOT created." 'Red'
-        Write-Log "FFU capture will likely fail in Invoke-FfuCaptureReboot.ps1." 'Yellow'
-    } else {
-        Write-Log "  Copied entry: $newGuid" 'Gray'
-
-        $r1 = bcdedit /set "$newGuid" device "partition=${winreLetter}:" 2>&1
-        foreach ($l in $r1) { Write-Log "  | set device: $l" 'DarkGray' }
-
-        $r2 = bcdedit /set "$newGuid" path \EFI\Microsoft\Boot\bootmgfw.efi 2>&1
-        foreach ($l in $r2) { Write-Log "  | set path: $l" 'DarkGray' }
-
-        $r3 = bcdedit /set "{fwbootmgr}" displayorder "$newGuid" /addlast 2>&1
-        foreach ($l in $r3) { Write-Log "  | addlast: $l" 'DarkGray' }
-
-        # Verify by re-enumerating firmware entries.
-        $verifyEntry = Find-FirmwareEntryForPartition -Letter $winreLetter
-        if ($verifyEntry) {
-            Write-Log "Firmware entry verified: $verifyEntry" 'Green'
-        } else {
-            Write-Log "Firmware entry creation may have failed - re-enumeration found nothing." 'Red'
-            Write-Log "FFU capture step will likely fail to set BootNext." 'Yellow'
-        }
-    }
-}
+# ===================== FIRMWARE BOOT ENTRY =====================
+# НЕ создаём firmware-запись вручную через bcdedit /copy.
+# Раньше тут был такой блок - он создавал запись "IPDROM Recovery FFU" с
+# device=partition=WINRE, который на REMOVABLE USB невалиден ("несуществующее
+# устройство"). Invoke-FfuCaptureReboot находил ЭТУ кривую запись вместо
+# нативной и BootNext падал -> авто-capture не запускался.
+#
+# Правильно: WINRE теперь ESP-раздел (create partition efi выше), поэтому BIOS
+# САМ создаёт нативную UEFI boot-запись для флешки при следующем enum'е.
+# Invoke-FfuCaptureReboot найдёт нативную запись и поставит её BootNext.
+Write-Log "Firmware entry: relying on native UEFI entry (WINRE is ESP). Not creating manual entry." 'Gray'
 
 # ===================== INITIALIZE IPDROMREC PARTITION =====================
 Write-Log "Initializing IpdromREC partition..." 'Yellow'
