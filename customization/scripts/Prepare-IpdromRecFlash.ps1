@@ -268,12 +268,15 @@ if ($mode -eq 'REFRESH') {
 # ===================== FRESH PATH =====================
 Write-Log "FRESH: wiping and partitioning Disk $($disk.Number)..." 'Cyan'
 
-# Diskpart script: clean + GPT + WINRE FAT32 + IpdromREC NTFS
+# Diskpart script: clean + GPT + WINRE ESP(FAT32) + IpdromREC NTFS
+# ВАЖНО: WINRE = ESP (create partition efi), НЕ primary! UEFI на removable
+# грузится надёжно только с EFI System Partition. primary FAT32 -> ASUS не
+# видит раздел загрузочным -> нет записи в Boot Menu -> 0xC0000098.
 $dpScript = @"
 select disk $($disk.Number)
 clean
 convert gpt
-create partition primary size=$WinreSizeMB
+create partition efi size=$WinreSizeMB
 format fs=fat32 label="WINRE" quick
 assign
 create partition primary
@@ -291,17 +294,22 @@ if ($rc -ne 0) {
 # Refresh volume info
 Start-Sleep -Seconds 3
 $disk = Get-Disk -Number $disk.Number
-$parts = Get-Partition -DiskNumber $disk.Number | Sort-Object PartitionNumber
-if ($parts.Count -lt 2) {
-    Write-Log "Expected 2 partitions, got $($parts.Count). Aborting." 'Red'
-    exit 7
+
+# Определяем разделы ПО МЕТКЕ (надёжно), а не по номеру/эвристике - иначе
+# WINRE и IpdromREC путаются местами (размеры/буквы перепутываются).
+$winreVol  = Get-Volume -ErrorAction SilentlyContinue | Where-Object {
+    $_.FileSystemLabel -eq 'WINRE' -and
+    (Get-Partition -Volume $_ -ErrorAction SilentlyContinue).DiskNumber -eq $disk.Number
+} | Select-Object -First 1
+$ipdromVol = Get-Volume -ErrorAction SilentlyContinue | Where-Object {
+    $_.FileSystemLabel -eq 'IpdromREC' -and
+    (Get-Partition -Volume $_ -ErrorAction SilentlyContinue).DiskNumber -eq $disk.Number
+} | Select-Object -First 1
+
+if (-not $winreVol -or -not $ipdromVol) {
+    Write-Log "Could not find WINRE/IpdromREC volumes by label after diskpart. Aborting." 'Red'
+    exit 8
 }
-
-$winrePart  = $parts | Where-Object { $_.PartitionNumber -eq 1 -or ($_.AccessPaths | Where-Object { Test-Path "$_EFI\Boot" }) } | Select-Object -First 1
-$ipdromPart = $parts | Where-Object { $_.PartitionNumber -ne $winrePart.PartitionNumber } | Select-Object -First 1
-$winreVol   = Get-Volume -Partition $winrePart  -ErrorAction SilentlyContinue
-$ipdromVol  = Get-Volume -Partition $ipdromPart -ErrorAction SilentlyContinue
-
 if (-not $winreVol.DriveLetter -or -not $ipdromVol.DriveLetter) {
     Write-Log "Partitions have no drive letters after diskpart. Aborting." 'Red'
     exit 8
@@ -309,9 +317,9 @@ if (-not $winreVol.DriveLetter -or -not $ipdromVol.DriveLetter) {
 
 $winreRoot  = "$($winreVol.DriveLetter):"
 $ipdromRoot = "$($ipdromVol.DriveLetter):"
-Write-Log "Partitions ready:" 'Green'
-Write-Log "  WINRE:     $winreRoot ($([math]::Round($winreVol.Size/1MB)) MB FAT32)"
-Write-Log "  IpdromREC: $ipdromRoot ($([math]::Round($ipdromVol.Size/1GB,1)) GB NTFS)"
+Write-Log "Partitions ready (label-based):" 'Green'
+Write-Log "  WINRE:     $winreRoot ($([math]::Round($winreVol.Size/1MB)) MB $($winreVol.FileSystem))"
+Write-Log "  IpdromREC: $ipdromRoot ($([math]::Round($ipdromVol.Size/1GB,1)) GB $($ipdromVol.FileSystem))"
 
 # ===================== COPY PATCHED BOOT.WIM =====================
 $sourcesDir   = Join-Path $winreRoot 'sources'
@@ -340,13 +348,19 @@ try {
     Write-Log "Bootloader installed on $winreRoot." 'Green'
 
     # ===================== COPY boot.sdi (ramdisk descriptor) =====================
-    # bcdboot НЕ кладёт boot.sdi в \boot\ на USB - его надо взять руками из
-    # смонтированного boot.wim (после Unmount к нему доступа уже не будет).
-    # Без этого файла bootmgr не сможет разрезолвить ramdisk=[boot]\sources\boot.wim,{ramdiskoptions}.
-    Write-Log "Copying boot.sdi from mounted WIM..." 'Yellow'
+    # Без boot.sdi bootmgr не разрезолвит ramdisk=[boot]\sources\boot.wim ->
+    # 0xC0000098/0xC0000225. В кастомном boot.wim файла boot.sdi обычно НЕТ
+    # (искать в WIM бесполезно). Берём с ЖИВОЙ системы (C:\Windows...) - там есть.
+    Write-Log "Copying boot.sdi (from live OS, not from WIM)..." 'Yellow'
     $bootSdiSrc = $null
-    foreach ($rel in @('Windows\Boot\DVD\EFI\boot.sdi', 'Windows\Boot\DVD\PCAT\boot.sdi', 'Windows\System32\boot.sdi')) {
-        $p = Join-Path $wimMount $rel
+    $sdiCandidates = @(
+        (Join-Path $env:SystemRoot 'Boot\DVD\EFI\boot.sdi'),
+        (Join-Path $env:SystemRoot 'Boot\DVD\PCAT\boot.sdi'),
+        (Join-Path $env:SystemRoot 'System32\boot.sdi'),
+        (Join-Path $env:SystemRoot 'System32\Recovery\boot.sdi'),
+        (Join-Path $wimMount 'Windows\Boot\DVD\EFI\boot.sdi')
+    )
+    foreach ($p in $sdiCandidates) {
         if (Test-Path $p) { $bootSdiSrc = $p; break }
     }
     if ($bootSdiSrc) {
@@ -356,8 +370,8 @@ try {
         $sdiSize = (Get-Item $bootSdiDst).Length
         Write-Log "  boot.sdi copied: $bootSdiDst ($sdiSize bytes from $bootSdiSrc)" 'Green'
     } else {
-        Write-Log "  boot.sdi NOT FOUND in mounted WIM - WinPE will fail to boot." 'Red'
-        Write-Log "  Searched paths: Windows\Boot\DVD\EFI\boot.sdi, Windows\Boot\DVD\PCAT\boot.sdi, Windows\System32\boot.sdi" 'Red'
+        Write-Log "  boot.sdi NOT FOUND anywhere - WinPE will fail to boot (0xC0000098)." 'Red'
+        Write-Log "  Check C:\Windows\Boot\DVD\EFI\boot.sdi exists." 'Red'
     }
 
 } catch {
