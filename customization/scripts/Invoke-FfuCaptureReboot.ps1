@@ -31,6 +31,7 @@ param(
     [string]$FlashLabel = 'IpdromREC',
     [string]$WinreLabel = 'WINRE',
     [switch]$NoReboot,
+    [switch]$Force,
     [string]$LogPath
 )
 
@@ -199,10 +200,27 @@ $candidates = @($candidates | Sort-Object Priority)
 
 if ($candidates.Count -eq 0) {
     Write-Log "No UEFI entry matching IpdromREC by partition letter." 'Yellow'
-    # FALLBACK: generic "UEFI:Removable Device". BIOS грузит первое removable
-    # с \EFI\BOOT\BOOTX64.EFI. В ПРОДЕ (вставлена только IpdromREC, Ventoy вынут)
-    # это загрузит нашу флешку -> авто-capture работает. На стенде с Ventoy
-    # может выбрать Ventoy - но стенд не показатель, в проде Ventoy нет.
+
+    # SAFETY: generic "UEFI:Removable Device" грузит ПЕРВОЕ попавшееся USB.
+    # В проде (одна флешка - IpdromREC) это OK. На стенде с Ventoy/чужой флешкой
+    # BIOS может выбрать НЕ нашу и BootNext улетит мимо -> auto-capture не запустится,
+    # винда вернётся, лаунчер увидит StressTest_Completed.flag и тихо выйдет.
+    # Поэтому если есть другие removable USB - отказываемся (или -Force).
+    $otherUsbDisks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object {
+        $_.BusType -eq 'USB' -and $_.Number -ne $flashDisk.Number -and -not $_.IsBoot -and -not $_.IsSystem
+    })
+    if ($otherUsbDisks.Count -gt 0 -and -not $Force) {
+        Write-Log "Other USB sticks detected in system - generic 'UEFI:Removable Device' fallback is UNSAFE:" 'Red'
+        foreach ($u in $otherUsbDisks) {
+            Write-Log ("  - Disk {0}: '{1}' ({2} GB)" -f $u.Number, $u.FriendlyName, [math]::Round($u.Size/1GB,1)) 'Red'
+        }
+        Write-Log "BIOS may boot one of these instead of IpdromREC." 'Red'
+        Write-Log "Unplug other USB sticks (Ventoy, etc) and rerun, OR pass -Force to ignore." 'Yellow'
+        Write-Log "Markers KEPT - boot IpdromREC flash manually via F11 if needed." 'Yellow'
+        exit 11
+    }
+
+    # FALLBACK: одна removable в системе -> generic-entry однозначно её и загрузит.
     $genericId = $null
     foreach ($block in $blocks) {
         if ($block -notmatch '(\{[a-f0-9-]+\})') { continue }
@@ -211,14 +229,17 @@ if ($candidates.Count -eq 0) {
         if ($block -match '(?im)^\s*description\s+UEFI:\s*Removable\s+Device') { $genericId = $gid; break }
     }
     if ($genericId) {
-        Write-Log "Fallback to generic 'UEFI:Removable Device' entry: $genericId" 'Yellow'
-        Write-Log "(In production - only IpdromREC inserted - this boots our flash.)" 'Gray'
+        if ($otherUsbDisks.Count -gt 0) {
+            Write-Log "Fallback to generic 'UEFI:Removable Device' DESPITE other USB present (-Force)." 'Yellow'
+        } else {
+            Write-Log "Fallback to generic 'UEFI:Removable Device' entry: $genericId" 'Yellow'
+            Write-Log "(IpdromREC is the only removable USB - BIOS will boot it.)" 'Gray'
+        }
         $chosen = [pscustomobject]@{ Id = $genericId; Description = 'UEFI:Removable Device (generic fallback)' }
     } else {
         Write-Log "No matching entry and no generic Removable Device entry found." 'Red'
         Write-Log "Cannot set BootNext automatically on this BIOS." 'Red'
         Write-Log "Markers KEPT - boot the IpdromREC flash manually via F11 to run capture." 'Yellow'
-        # НЕ удаляем маркеры: оператор загрузит флешку через F11 и capture сработает.
         exit 9
     }
 } else {

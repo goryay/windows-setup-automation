@@ -268,17 +268,20 @@ if ($mode -eq 'REFRESH') {
 # ===================== FRESH PATH =====================
 Write-Log "FRESH: wiping and partitioning Disk $($disk.Number)..." 'Cyan'
 
-# Diskpart script: clean + GPT + WINRE ESP(FAT32) + IpdromREC NTFS
-# ВАЖНО: WINRE должен быть ESP. Но "create partition efi" НЕ работает на
-# removable USB ("операция не поддерживается на сменных носителях"). Поэтому:
-# create partition primary + set id=c12a7328... (меняем тип на ESP - это
-# работает на removable). Без ESP ASUS не видит раздел загрузочным -> 0xC0000098.
+# Diskpart script: clean + GPT + WINRE (FAT32, basic data) + IpdromREC (NTFS).
+# Раздел НЕ помечается как ESP: на removable USB Windows запрещает и
+# "create partition efi", и "set id=c12a7328..." с ошибкой
+# "Эта операция не поддерживается на сменных носителях".
+# Это OK: BIOS грузит \EFI\Boot\bootx64.efi с любого removable-раздела
+# через generic "UEFI:Removable Device" boot-entry (которая у ASUS/etc
+# создаётся автоматически при наличии removable USB с bootx64.efi).
+# В Invoke-FfuCaptureReboot.ps1 fallback на этот generic-entry и работает в проде,
+# когда в системе только наша IpdromREC флешка.
 $dpScript = @"
 select disk $($disk.Number)
 clean
 convert gpt
 create partition primary size=$WinreSizeMB
-set id=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
 format fs=fat32 label="WINRE" quick
 assign
 create partition primary
@@ -433,12 +436,14 @@ if (-not (Test-Path $winreBcd)) {
 # Раньше тут был такой блок - он создавал запись "IPDROM Recovery FFU" с
 # device=partition=WINRE, который на REMOVABLE USB невалиден ("несуществующее
 # устройство"). Invoke-FfuCaptureReboot находил ЭТУ кривую запись вместо
-# нативной и BootNext падал -> авто-capture не запускался.
+# generic и BootNext падал -> авто-capture не запускался.
 #
-# Правильно: WINRE теперь ESP-раздел (create partition efi выше), поэтому BIOS
-# САМ создаёт нативную UEFI boot-запись для флешки при следующем enum'е.
-# Invoke-FfuCaptureReboot найдёт нативную запись и поставит её BootNext.
-Write-Log "Firmware entry: relying on native UEFI entry (WINRE is ESP). Not creating manual entry." 'Gray'
+# На removable USB пометить раздел как ESP нельзя (set id=c12a7328... и
+# create partition efi оба запрещены Windows на сменных носителях).
+# Поэтому полагаемся на generic "UEFI:Removable Device" boot-entry,
+# которую BIOS создаёт автоматически для любого removable с \EFI\Boot\bootx64.efi.
+# В production-среде (вставлена только IpdromREC) она однозначно грузит нашу флешку.
+Write-Log "Firmware entry: relying on generic 'UEFI:Removable Device' (removable USB cannot be marked ESP)." 'Gray'
 
 # ===================== INITIALIZE IPDROMREC PARTITION =====================
 Write-Log "Initializing IpdromREC partition..." 'Yellow'

@@ -240,24 +240,16 @@ exit /b 0
 :do_apply
 echo.
 echo === Apply-Ffu mode starting ===
-echo DEBUG A: entered do_apply. Press any key.
-pause > nul
 
 :: --- Prepare log ---
 if not exist "%IPDROM_TARGET%\Logs" mkdir "%IPDROM_TARGET%\Logs"
-echo DEBUG B: Logs dir ok. Press any key.
-pause > nul
 
 for /f "tokens=2 delims==" %%i in ('wmic os get LocalDateTime /value ^| find "="') do set DT=%%i
 set IPDROM_TIMESTAMP=%DT:~0,8%_%DT:~8,6%
 set IPDROM_LOG=%IPDROM_TARGET%\Logs\apply_%IPDROM_TIMESTAMP%.log
-echo DEBUG C: timestamp=%IPDROM_TIMESTAMP%, log=%IPDROM_LOG%. Press any key.
-pause > nul
 
 echo === IPDROM apply-ffu started at %DATE% %TIME% === > "%IPDROM_LOG%"
 echo Target volume: %IPDROM_TARGET% >> "%IPDROM_LOG%"
-echo DEBUG D: log header written. Press any key.
-pause > nul
 
 :: --- Show available disks for user to pick ---
 echo.
@@ -265,12 +257,8 @@ echo Available physical disks:
 echo. >> "%IPDROM_LOG%"
 echo Available physical disks: >> "%IPDROM_LOG%"
 wmic diskdrive get Index,Model,Size,InterfaceType,MediaType /format:list >> "%IPDROM_LOG%" 2>&1
-echo DEBUG E: wmic-to-log done. Press any key.
-pause > nul
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Disk | Sort-Object Number | Format-Table Number, FriendlyName, @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}}, BusType, PartitionStyle -AutoSize"
-echo DEBUG F: disk list shown. Press any key.
-pause > nul
 
 echo.
 echo Find the SYSTEM DISK - usually the internal NVMe/SATA.
