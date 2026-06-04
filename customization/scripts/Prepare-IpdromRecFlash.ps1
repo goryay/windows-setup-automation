@@ -269,15 +269,17 @@ if ($mode -eq 'REFRESH') {
 Write-Log "FRESH: wiping and partitioning Disk $($disk.Number)..." 'Cyan'
 
 # Diskpart script: clean + GPT + WINRE ESP(FAT32) + IpdromREC NTFS
-# ВАЖНО: WINRE = ESP (create partition efi), НЕ primary! UEFI на removable
-# грузится надёжно только с EFI System Partition. primary FAT32 -> ASUS не
-# видит раздел загрузочным -> нет записи в Boot Menu -> 0xC0000098.
+# ВАЖНО: WINRE должен быть ESP. Но "create partition efi" НЕ работает на
+# removable USB ("операция не поддерживается на сменных носителях"). Поэтому:
+# create partition primary + set id=c12a7328... (меняем тип на ESP - это
+# работает на removable). Без ESP ASUS не видит раздел загрузочным -> 0xC0000098.
 $dpScript = @"
 select disk $($disk.Number)
 clean
 convert gpt
-create partition efi size=$WinreSizeMB
+create partition primary size=$WinreSizeMB
 format fs=fat32 label="WINRE" quick
+set id=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
 assign
 create partition primary
 format fs=ntfs label="IpdromREC" quick
