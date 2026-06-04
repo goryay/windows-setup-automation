@@ -198,22 +198,35 @@ foreach ($block in $blocks) {
 $candidates = @($candidates | Sort-Object Priority)
 
 if ($candidates.Count -eq 0) {
-    Write-Log "No UEFI boot entry matching the IpdromREC USB. Cannot set BootNext." 'Red'
-    Write-Log "Full bcdedit output saved in log for debugging." 'Gray'
-    Write-Log "------ bcdedit /enum firmware ------" 'DarkGray'
-    foreach ($l in ($bcdText -split "`r?`n")) { Write-Log "  | $l" 'DarkGray' }
-    Write-Log "------------------------------------" 'DarkGray'
-    Remove-Item -LiteralPath $markerPending -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $stressFlag -Force -ErrorAction SilentlyContinue
-    Write-Log "Removed markers (no capture will happen)." 'Yellow'
-    exit 9
+    Write-Log "No UEFI entry matching IpdromREC by partition letter." 'Yellow'
+    # FALLBACK: generic "UEFI:Removable Device". BIOS грузит первое removable
+    # с \EFI\BOOT\BOOTX64.EFI. В ПРОДЕ (вставлена только IpdromREC, Ventoy вынут)
+    # это загрузит нашу флешку -> авто-capture работает. На стенде с Ventoy
+    # может выбрать Ventoy - но стенд не показатель, в проде Ventoy нет.
+    $genericId = $null
+    foreach ($block in $blocks) {
+        if ($block -notmatch '(\{[a-f0-9-]+\})') { continue }
+        $gid = $matches[1]
+        if ($gid -ieq '{bootmgr}' -or $gid -ieq '{fwbootmgr}') { continue }
+        if ($block -match '(?im)^\s*description\s+UEFI:\s*Removable\s+Device') { $genericId = $gid; break }
+    }
+    if ($genericId) {
+        Write-Log "Fallback to generic 'UEFI:Removable Device' entry: $genericId" 'Yellow'
+        Write-Log "(In production - only IpdromREC inserted - this boots our flash.)" 'Gray'
+        $chosen = [pscustomobject]@{ Id = $genericId; Description = 'UEFI:Removable Device (generic fallback)' }
+    } else {
+        Write-Log "No matching entry and no generic Removable Device entry found." 'Red'
+        Write-Log "Cannot set BootNext automatically on this BIOS." 'Red'
+        Write-Log "Markers KEPT - boot the IpdromREC flash manually via F11 to run capture." 'Yellow'
+        # НЕ удаляем маркеры: оператор загрузит флешку через F11 и capture сработает.
+        exit 9
+    }
+} else {
+    if ($candidates.Count -gt 1) {
+        Write-Log "Multiple USB entries found. Picking first one - review log if wrong." 'Yellow'
+    }
+    $chosen = $candidates[0]
 }
-
-if ($candidates.Count -gt 1) {
-    Write-Log "Multiple USB entries found. Picking first one - review log if wrong." 'Yellow'
-}
-
-$chosen = $candidates[0]
 Write-Log "Selected UEFI entry: $($chosen.Id)  '$($chosen.Description)'" 'Cyan'
 
 # ===================== SET BOOTNEXT =====================
@@ -222,9 +235,9 @@ $bcdSetOut = bcdedit /set "{fwbootmgr}" bootsequence $chosen.Id 2>&1
 foreach ($l in ($bcdSetOut -split "`r?`n")) { if ($l.Trim()) { Write-Log "  | $l" 'DarkGray' } }
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Log "bcdedit failed (exit $LASTEXITCODE). Aborting." 'Red'
-    Remove-Item -LiteralPath $markerPending -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $stressFlag -Force -ErrorAction SilentlyContinue
+    Write-Log "bcdedit BootNext failed (exit $LASTEXITCODE)." 'Red'
+    Write-Log "Markers KEPT - boot the IpdromREC flash manually via F11 to run capture." 'Yellow'
+    # НЕ удаляем маркеры: ручной F11-capture должен сработать.
     exit 10
 }
 
