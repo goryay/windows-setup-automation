@@ -278,8 +278,8 @@ select disk $($disk.Number)
 clean
 convert gpt
 create partition primary size=$WinreSizeMB
-format fs=fat32 label="WINRE" quick
 set id=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+format fs=fat32 label="WINRE" quick
 assign
 create partition primary
 format fs=ntfs label="IpdromREC" quick
