@@ -166,24 +166,30 @@ if defined IPDROM_TGTDISK (
     )
 )
 
-:: --- Cleanup local WinPE staging on system disk BEFORE capture ---
-:: Prepare-IpdromRecFlash стейджит C:\WinPE\ + правит локальный BCD ради bootsequence.
-:: ВАЖНО: убираем это ПЕРЕД DISM /Capture-Ffu, чтобы в FFU попал ЧИСТЫЙ системный диск
-:: (без \WinPE\ и без скрытого osloader entry, который сломает restore на чужой машине).
+rem === CLEANUP LOCAL WINPE STAGING ON SYSTEM DISK BEFORE CAPTURE ===
+rem Prepare-IpdromRecFlash stages C:\WinPE + local BCD entry for bootsequence.
+rem Wipe staging + BCD entries BEFORE capture so FFU has clean system disk.
+rem Use goto/label structure to avoid cmd-parser quirks with nested if blocks.
+echo. >> "%IPDROM_LOG%"
+echo Reached cleanup phase. >> "%IPDROM_LOG%"
+echo Reached cleanup phase.
 set IPDROM_STAGE_DIR=%IPDROM_SYSDRV%\WinPE
 set IPDROM_CLEANUP=%IPDROM_STAGE_DIR%\Cleanup-CaptureStaging.ps1
-if exist "%IPDROM_CLEANUP%" (
-    echo. >> "%IPDROM_LOG%"
-    echo === Running Cleanup-CaptureStaging === >> "%IPDROM_LOG%"
-    echo Running Cleanup-CaptureStaging to remove local WinPE staging artifacts...
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%IPDROM_CLEANUP%" -SysDrive "%IPDROM_SYSDRV%" -LogPath "%IPDROM_LOG%"
-    if errorlevel 1 (
-        echo Cleanup-CaptureStaging exit=%ERRORLEVEL% - continuing anyway. >> "%IPDROM_LOG%"
-        echo Cleanup-CaptureStaging exit=%ERRORLEVEL% - continuing anyway.
-    )
-) else (
-    echo No local staging found (booted via USB directly?). Skipping cleanup. >> "%IPDROM_LOG%"
-)
+echo IPDROM_STAGE_DIR=%IPDROM_STAGE_DIR% >> "%IPDROM_LOG%"
+echo IPDROM_CLEANUP=%IPDROM_CLEANUP% >> "%IPDROM_LOG%"
+if not exist "%IPDROM_CLEANUP%" goto :no_local_stage
+echo Found cleanup script - running it... >> "%IPDROM_LOG%"
+echo Running Cleanup-CaptureStaging...
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%IPDROM_CLEANUP%" -SysDrive "%IPDROM_SYSDRV%" -LogPath "%IPDROM_LOG%"
+set CLEANUP_EXIT=%ERRORLEVEL%
+echo Cleanup-CaptureStaging exit code: %CLEANUP_EXIT% >> "%IPDROM_LOG%"
+echo Cleanup-CaptureStaging exit code: %CLEANUP_EXIT%
+goto :cleanup_done
+:no_local_stage
+echo No local staging script found at %IPDROM_CLEANUP% - skipping. >> "%IPDROM_LOG%"
+:cleanup_done
+echo Cleanup phase finished. >> "%IPDROM_LOG%"
+echo Cleanup phase finished, proceeding to DISM.
 
 :: --- Backup old restore.ffu (if exists) before overwrite ---
 if exist "%IPDROM_TARGET%\restore.ffu" (

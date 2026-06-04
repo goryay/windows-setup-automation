@@ -115,6 +115,18 @@ function Invoke-LocalWinPEStage {
 
     $sysDrv  = $env:SystemDrive   # "C:"
     $stageDir = Join-Path $sysDrv 'WinPE'
+
+    # --- IDEMPOTENCY: delete previous hidden entry if exists ---
+    # If Prepare-IpdromRecFlash is run multiple times, avoid orphaned BCD entries.
+    $prevGuidFile = Join-Path $stageDir 'capture_entry_guid.txt'
+    if (Test-Path $prevGuidFile) {
+        $prevGuid = (Get-Content -LiteralPath $prevGuidFile -Raw).Trim()
+        if ($prevGuid) {
+            Write-Log "  Deleting previous hidden osloader entry: $prevGuid" 'Gray'
+            & bcdedit /delete $prevGuid /f 2>&1 | Out-Null
+        }
+    }
+
     New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
 
     # --- Копируем boot.wim ---
@@ -134,20 +146,27 @@ function Invoke-LocalWinPEStage {
     Copy-Item -LiteralPath $sdiSrc -Destination $stageSdi -Force
     Write-Log "  Staged boot.sdi -> $stageSdi (from $sdiSrc)" 'Gray'
 
-    # --- Сохраняем текущее состояние {ramdiskoptions} (если есть) ---
-    # Локальный {ramdiskoptions} может уже использоваться WinRE - не ломаем его насовсем.
-    $rdoEnum  = bcdedit /enum '{ramdiskoptions}' 2>&1
-    $rdoState = @{ existed = $false; sdidevice = $null; sdipath = $null }
-    if ($LASTEXITCODE -eq 0) {
-        foreach ($l in $rdoEnum) {
-            if ($l -match '(?i)^\s*ramdisksdidevice\s+(.+)$') { $rdoState.sdidevice = $matches[1].Trim() }
-            if ($l -match '(?i)^\s*ramdisksdipath\s+(.+)$')   { $rdoState.sdipath   = $matches[1].Trim() }
-        }
-        if ($rdoState.sdidevice -or $rdoState.sdipath) { $rdoState.existed = $true }
-    }
+    # --- Сохраняем ОРИГИНАЛЬНОЕ состояние {ramdiskoptions} ---
+    # IDEMPOTENCY: если ramdiskoptions_orig.json уже существует от прошлого запуска,
+    # значит мы УЖЕ модифицировали {ramdiskoptions} - не переписываем (иначе сохраним
+    # свои значения как "оригинальные" и cleanup восстановит их неправильно).
     $rdoJson = Join-Path $stageDir 'ramdiskoptions_orig.json'
-    $rdoState | ConvertTo-Json | Set-Content -LiteralPath $rdoJson -Encoding utf8 -Force
-    Write-Log "  Saved {ramdiskoptions} state (existed=$($rdoState.existed)) -> $rdoJson" 'Gray'
+    if (Test-Path $rdoJson) {
+        $rdoState = Get-Content -LiteralPath $rdoJson -Raw | ConvertFrom-Json
+        Write-Log "  Reusing saved {ramdiskoptions} original state from $rdoJson (existed=$($rdoState.existed))" 'Gray'
+    } else {
+        $rdoEnum  = bcdedit /enum '{ramdiskoptions}' 2>&1
+        $rdoState = [pscustomobject]@{ existed = $false; sdidevice = $null; sdipath = $null }
+        if ($LASTEXITCODE -eq 0) {
+            foreach ($l in $rdoEnum) {
+                if ($l -match '(?i)^\s*ramdisksdidevice\s+(.+)$') { $rdoState.sdidevice = $matches[1].Trim() }
+                if ($l -match '(?i)^\s*ramdisksdipath\s+(.+)$')   { $rdoState.sdipath   = $matches[1].Trim() }
+            }
+            if ($rdoState.sdidevice -or $rdoState.sdipath) { $rdoState.existed = $true }
+        }
+        $rdoState | ConvertTo-Json | Set-Content -LiteralPath $rdoJson -Encoding utf8 -Force
+        Write-Log "  Saved {ramdiskoptions} original state (existed=$($rdoState.existed)) -> $rdoJson" 'Gray'
+    }
 
     # --- Настраиваем {ramdiskoptions} на наш boot.sdi ---
     if (-not $rdoState.existed) {
