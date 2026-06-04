@@ -268,16 +268,12 @@ if ($mode -eq 'REFRESH') {
 # ===================== FRESH PATH =====================
 Write-Log "FRESH: wiping and partitioning Disk $($disk.Number)..." 'Cyan'
 
-# Diskpart script: clean + GPT + WINRE ESP(FAT32) + IpdromREC NTFS
-# ВАЖНО: WINRE создаётся как ESP (create partition efi), а НЕ primary.
-# UEFI на removable надёжно грузится только с EFI System Partition. Если делать
-# primary FAT32, BIOS (особенно ASUS) НЕ видит раздел как загрузочный -> в Boot
-# Menu нет записи Partition 1 -> загрузка падает. ESP-тип это чинит.
+# Diskpart script: clean + GPT + WINRE FAT32 + IpdromREC NTFS
 $dpScript = @"
 select disk $($disk.Number)
 clean
 convert gpt
-create partition efi size=$WinreSizeMB
+create partition primary size=$WinreSizeMB
 format fs=fat32 label="WINRE" quick
 assign
 create partition primary
@@ -301,32 +297,15 @@ if ($parts.Count -lt 2) {
     exit 7
 }
 
-# Определяем разделы ПО МЕТКЕ (надёжно - diskpart их проставил), а не по
-# номеру/эвристике. Раньше тут была кривая логика ("$_EFI\Boot"), из-за которой
-# WINRE и IpdromREC путались местами (boot.wim лёг на большой раздел, а
-# IpdromREC получался 1.5 ГБ - restore.ffu не влезал).
-$winreVol  = Get-Volume -ErrorAction SilentlyContinue | Where-Object {
-    $_.FileSystemLabel -eq 'WINRE' -and
-    (Get-Partition -Volume $_ -ErrorAction SilentlyContinue).DiskNumber -eq $disk.Number
-} | Select-Object -First 1
-$ipdromVol = Get-Volume -ErrorAction SilentlyContinue | Where-Object {
-    $_.FileSystemLabel -eq 'IpdromREC' -and
-    (Get-Partition -Volume $_ -ErrorAction SilentlyContinue).DiskNumber -eq $disk.Number
-} | Select-Object -First 1
+$winrePart  = $parts | Where-Object { $_.PartitionNumber -eq 1 -or ($_.AccessPaths | Where-Object { Test-Path "$_EFI\Boot" }) } | Select-Object -First 1
+$ipdromPart = $parts | Where-Object { $_.PartitionNumber -ne $winrePart.PartitionNumber } | Select-Object -First 1
+$winreVol   = Get-Volume -Partition $winrePart  -ErrorAction SilentlyContinue
+$ipdromVol  = Get-Volume -Partition $ipdromPart -ErrorAction SilentlyContinue
 
-if (-not $winreVol -or -not $ipdromVol) {
-    Write-Log "Could not find WINRE/IpdromREC volumes by label after diskpart. Aborting." 'Red'
-    exit 8
-}
 if (-not $winreVol.DriveLetter -or -not $ipdromVol.DriveLetter) {
     Write-Log "Partitions have no drive letters after diskpart. Aborting." 'Red'
     exit 8
 }
-
-# Sanity: WINRE должен быть маленький (FAT32 ~1.5 ГБ), IpdromREC - большой (NTFS).
-Write-Log ("Label-based detection: WINRE={0}: ({1} MB {2}), IpdromREC={3}: ({4} GB {5})" -f `
-    $winreVol.DriveLetter, [math]::Round($winreVol.Size/1MB), $winreVol.FileSystem, `
-    $ipdromVol.DriveLetter, [math]::Round($ipdromVol.Size/1GB,1), $ipdromVol.FileSystem) 'Gray'
 
 $winreRoot  = "$($winreVol.DriveLetter):"
 $ipdromRoot = "$($ipdromVol.DriveLetter):"
@@ -361,21 +340,13 @@ try {
     Write-Log "Bootloader installed on $winreRoot." 'Green'
 
     # ===================== COPY boot.sdi (ramdisk descriptor) =====================
-    # Без этого файла bootmgr не разрезолвит ramdisk=[boot]\sources\boot.wim
-    # и выдаст 0xC0000098/0xC0000225. ВАЖНО: в кастомном boot.wim файла boot.sdi
-    # обычно НЕТ (искать в смонтированном WIM бесполезно - это была причина бага).
-    # Берём boot.sdi с ЖИВОЙ системы (C:\Windows\...) - там он всегда есть.
-    Write-Log "Copying boot.sdi (from live OS, not from WIM)..." 'Yellow'
+    # bcdboot НЕ кладёт boot.sdi в \boot\ на USB - его надо взять руками из
+    # смонтированного boot.wim (после Unmount к нему доступа уже не будет).
+    # Без этого файла bootmgr не сможет разрезолвить ramdisk=[boot]\sources\boot.wim,{ramdiskoptions}.
+    Write-Log "Copying boot.sdi from mounted WIM..." 'Yellow'
     $bootSdiSrc = $null
-    $sdiCandidates = @(
-        (Join-Path $env:SystemRoot 'Boot\DVD\EFI\boot.sdi'),
-        (Join-Path $env:SystemRoot 'Boot\DVD\PCAT\boot.sdi'),
-        (Join-Path $env:SystemRoot 'System32\boot.sdi'),
-        (Join-Path $env:SystemRoot 'System32\Recovery\boot.sdi'),
-        # запасной вариант - вдруг всё же есть в WIM:
-        (Join-Path $wimMount 'Windows\Boot\DVD\EFI\boot.sdi')
-    )
-    foreach ($p in $sdiCandidates) {
+    foreach ($rel in @('Windows\Boot\DVD\EFI\boot.sdi', 'Windows\Boot\DVD\PCAT\boot.sdi', 'Windows\System32\boot.sdi')) {
+        $p = Join-Path $wimMount $rel
         if (Test-Path $p) { $bootSdiSrc = $p; break }
     }
     if ($bootSdiSrc) {
@@ -385,8 +356,8 @@ try {
         $sdiSize = (Get-Item $bootSdiDst).Length
         Write-Log "  boot.sdi copied: $bootSdiDst ($sdiSize bytes from $bootSdiSrc)" 'Green'
     } else {
-        Write-Log "  boot.sdi NOT FOUND anywhere - WinPE will fail to boot (0xC0000098)." 'Red'
-        Write-Log "  Searched live OS paths + WIM. Check C:\Windows\Boot\DVD\EFI\boot.sdi exists." 'Red'
+        Write-Log "  boot.sdi NOT FOUND in mounted WIM - WinPE will fail to boot." 'Red'
+        Write-Log "  Searched paths: Windows\Boot\DVD\EFI\boot.sdi, Windows\Boot\DVD\PCAT\boot.sdi, Windows\System32\boot.sdi" 'Red'
     }
 
 } catch {
@@ -441,85 +412,17 @@ if (-not (Test-Path $winreBcd)) {
     foreach ($l in $dump) { Write-Log "  | $l" 'DarkGray' }
 }
 
-# ===================== ENSURE FIRMWARE BOOT ENTRY EXISTS =====================
-# bcdboot ДОЛЖЕН был добавить запись в {fwbootmgr} (firmware NVRAM), указывающую
-# на наш USB. На removable-media это работает нестабильно: иногда bcdboot
-# тихо пропускает запись в EFI NVRAM. Проверяем явно, и если нет - создаём
-# руками через bcdedit. Invoke-FfuCaptureReboot.ps1 затем найдёт эту запись
-# и поставит её как BootNext.
-Write-Log "Verifying UEFI firmware boot entry for $winreRoot..." 'Yellow'
-
-function Find-FirmwareEntryForPartition {
-    param([string]$Letter)
-    $L = $Letter.TrimEnd(':\').ToUpper()
-    $raw = bcdedit /enum firmware 2>&1
-    $text = ($raw -join "`r`n")
-    foreach ($block in ($text -split "(?ms)\r?\n\r?\n")) {
-        if ($block -notmatch '(\{[a-f0-9-]+\})') { continue }
-        $id = $matches[1]
-        if ($id -ieq '{bootmgr}' -or $id -ieq '{fwbootmgr}') { continue }
-        if ($block -match '(?im)^\s*device\s+partition=([A-Z]):') {
-            if ($matches[1].ToUpper() -eq $L) { return $id }
-        }
-    }
-    return $null
-}
-
-$winreLetter = $winreRoot.TrimEnd(':\')
-$fwEntry     = Find-FirmwareEntryForPartition -Letter $winreLetter
-
-if ($fwEntry) {
-    Write-Log "Firmware entry already exists: $fwEntry  (device partition=${winreLetter}:)" 'Green'
-} else {
-    Write-Log "No firmware entry found for partition=${winreLetter}:. Creating one via bcdedit /copy {bootmgr}..." 'Yellow'
-
-    # КОРРЕКТНЫЙ способ создать firmware-entry типа bootmgr:
-    # /copy {bootmgr} - копирует существующий Windows Boot Manager entry,
-    # наследуя тип "bootmgr" (которого НЕТ среди допустимых /application X).
-    # На выходе получаем новый GUID, у которого затем переопределяем device и path.
-    $createOut = bcdedit /copy "{bootmgr}" /d "IPDROM Recovery FFU" 2>&1
-    foreach ($l in $createOut) { Write-Log "  | $l" 'DarkGray' }
-
-    # Парсим новый GUID. Microsoft пишет "...copied to {GUID}" / "скопирована в {GUID}".
-    # Берём ПЕРВЫЙ GUID который не {bootmgr} и не {fwbootmgr}.
-    $newGuid = $null
-    foreach ($l in $createOut) {
-        $g = [regex]::Matches($l, '\{[a-f0-9-]+\}')
-        foreach ($m in $g) {
-            $candidate = $m.Value
-            if ($candidate -ine '{bootmgr}' -and $candidate -ine '{fwbootmgr}') {
-                $newGuid = $candidate
-                break
-            }
-        }
-        if ($newGuid) { break }
-    }
-
-    if (-not $newGuid) {
-        Write-Log "Could not parse new GUID from bcdedit /copy output. Firmware entry NOT created." 'Red'
-        Write-Log "FFU capture will likely fail in Invoke-FfuCaptureReboot.ps1." 'Yellow'
-    } else {
-        Write-Log "  Copied entry: $newGuid" 'Gray'
-
-        $r1 = bcdedit /set "$newGuid" device "partition=${winreLetter}:" 2>&1
-        foreach ($l in $r1) { Write-Log "  | set device: $l" 'DarkGray' }
-
-        $r2 = bcdedit /set "$newGuid" path \EFI\Microsoft\Boot\bootmgfw.efi 2>&1
-        foreach ($l in $r2) { Write-Log "  | set path: $l" 'DarkGray' }
-
-        $r3 = bcdedit /set "{fwbootmgr}" displayorder "$newGuid" /addlast 2>&1
-        foreach ($l in $r3) { Write-Log "  | addlast: $l" 'DarkGray' }
-
-        # Verify by re-enumerating firmware entries.
-        $verifyEntry = Find-FirmwareEntryForPartition -Letter $winreLetter
-        if ($verifyEntry) {
-            Write-Log "Firmware entry verified: $verifyEntry" 'Green'
-        } else {
-            Write-Log "Firmware entry creation may have failed - re-enumeration found nothing." 'Red'
-            Write-Log "FFU capture step will likely fail to set BootNext." 'Yellow'
-        }
-    }
-}
+# ===================== FIRMWARE BOOT ENTRY =====================
+# НЕ создаём firmware-запись вручную через bcdedit /copy.
+# Раньше тут был такой блок - он создавал запись "IPDROM Recovery FFU" с
+# device=partition=WINRE, который на REMOVABLE USB невалиден ("несуществующее
+# устройство"). Invoke-FfuCaptureReboot находил ЭТУ кривую запись вместо
+# нативной и BootNext падал -> авто-capture не запускался.
+#
+# Правильно: WINRE теперь ESP-раздел (create partition efi выше), поэтому BIOS
+# САМ создаёт нативную UEFI boot-запись для флешки при следующем enum'е.
+# Invoke-FfuCaptureReboot найдёт нативную запись и поставит её BootNext.
+Write-Log "Firmware entry: relying on native UEFI entry (WINRE is ESP). Not creating manual entry." 'Gray'
 
 # ===================== INITIALIZE IPDROMREC PARTITION =====================
 Write-Log "Initializing IpdromREC partition..." 'Yellow'
