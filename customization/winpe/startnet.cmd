@@ -166,6 +166,25 @@ if defined IPDROM_TGTDISK (
     )
 )
 
+:: --- Cleanup local WinPE staging on system disk BEFORE capture ---
+:: Prepare-IpdromRecFlash стейджит C:\WinPE\ + правит локальный BCD ради bootsequence.
+:: ВАЖНО: убираем это ПЕРЕД DISM /Capture-Ffu, чтобы в FFU попал ЧИСТЫЙ системный диск
+:: (без \WinPE\ и без скрытого osloader entry, который сломает restore на чужой машине).
+set IPDROM_STAGE_DIR=%IPDROM_SYSDRV%\WinPE
+set IPDROM_CLEANUP=%IPDROM_STAGE_DIR%\Cleanup-CaptureStaging.ps1
+if exist "%IPDROM_CLEANUP%" (
+    echo. >> "%IPDROM_LOG%"
+    echo === Running Cleanup-CaptureStaging === >> "%IPDROM_LOG%"
+    echo Running Cleanup-CaptureStaging to remove local WinPE staging artifacts...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%IPDROM_CLEANUP%" -SysDrive "%IPDROM_SYSDRV%" -LogPath "%IPDROM_LOG%"
+    if errorlevel 1 (
+        echo Cleanup-CaptureStaging exit=%ERRORLEVEL% - continuing anyway. >> "%IPDROM_LOG%"
+        echo Cleanup-CaptureStaging exit=%ERRORLEVEL% - continuing anyway.
+    )
+) else (
+    echo No local staging found (booted via USB directly?). Skipping cleanup. >> "%IPDROM_LOG%"
+)
+
 :: --- Backup old restore.ffu (if exists) before overwrite ---
 if exist "%IPDROM_TARGET%\restore.ffu" (
     echo Backing up existing restore.ffu to restore.old.ffu... >> "%IPDROM_LOG%"

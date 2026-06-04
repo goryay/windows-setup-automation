@@ -1,18 +1,23 @@
 <#
 .SYNOPSIS
-    Triggers FFU capture by rebooting into the IpdromREC WinPE flash.
+    Triggers FFU capture by rebooting into LOCALLY-STAGED WinPE.
 
     Workflow:
       1. Validate IpdromREC partition is ready (boot.wim + EFI bootloader present)
       2. Write .capture_pending marker on IpdromREC
       3. Write stress-test-completed flag so launcher doesn't re-run after return
-      4. Find UEFI firmware boot entry pointing at the IpdromREC USB
-      5. Set one-time BootNext via bcdedit
+      4. Read GUID of local WinPE BCD entry from C:\WinPE\capture_entry_guid.txt
+         (created by Prepare-IpdromRecFlash.ps1)
+      5. Set one-time {bootmgr} bootsequence to that GUID
       6. Restart-Computer
 
-    After capture, WinPE startnet removes .capture_pending and reboots. Default
-    boot order returns the system to Windows. Launcher sees the completed flag
-    and exits cleanly.
+    On reboot: Windows bootmgr loads (no USB picking), sees bootsequence,
+    ramdisk-boots WinPE from C:\WinPE\boot.wim. WinPE captures FFU to IpdromREC
+    USB, cleans up C:\WinPE\ and BCD entry, reboots. Default boot order
+    returns to regular Windows. Launcher sees Completed flag and exits.
+
+    This approach works even when Ventoy/other USBs are plugged in - because
+    boot decision is made by Windows bootmgr on system disk, not by BIOS.
 
 .PARAMETER FlashLabel
     Volume label of the recovery flash data partition. Default 'IpdromREC'.
@@ -31,7 +36,6 @@ param(
     [string]$FlashLabel = 'IpdromREC',
     [string]$WinreLabel = 'WINRE',
     [switch]$NoReboot,
-    [switch]$Force,
     [string]$LogPath
 )
 
@@ -146,123 +150,43 @@ if (-not (Test-Path $stressFlag)) {
     Write-Log "Stress flag already present - launcher will exit on next boot." 'Gray'
 }
 
-# ===================== FIND UEFI BOOT ENTRY FOR THIS USB =====================
-Write-Log "Enumerating UEFI firmware boot entries..." 'Yellow'
-
-$bcdRaw = bcdedit /enum firmware 2>&1
-$bcdText = ($bcdRaw -join "`r`n")
-
-# bcdedit output is block-separated by blank lines. Parse each block.
-# We match by `device partition=<letter>:` where <letter> is OUR WINRE drive letter -
-# this is a direct physical mapping, robust regardless of what BIOS put in description.
-# Prepare-IpdromRecFlash.ps1 guarantees that a firmware entry for this partition exists
-# (creates one via bcdedit /create if bcdboot didn't).
-$blocks       = $bcdText -split "(?ms)\r?\n\r?\n"
-$candidates   = @()
-$winreLetter  = $winreVol.DriveLetter.ToString().ToUpper()
-$ipdromLetter = $ipdromVol.DriveLetter.ToString().ToUpper()
-
-foreach ($block in $blocks) {
-    # Locale-independent: first GUID in the block IS the identifier
-    # (bcdedit always puts identifier as the first field, regardless of language)
-    if ($block -notmatch '(\{[a-f0-9-]+\})') { continue }
-    $id = $matches[1]
-    if ($id -ieq '{bootmgr}' -or $id -ieq '{fwbootmgr}') { continue }
-
-    # "description" remains English in all locales (informational only - not used for matching)
-    $desc = ''
-    if ($block -match '(?im)^\s*description\s+(.+?)\s*$') { $desc = $matches[1].Trim() }
-
-    # Extract partition letter from "device partition=<letter>:"
-    $partLetter = $null
-    if ($block -match '(?im)^\s*device\s+partition=([A-Z]):') {
-        $partLetter = $matches[1].ToUpper()
-    }
-    if (-not $partLetter) { continue }
-
-    # Accept entries pointing at our WINRE partition (where bootmgr lives)
-    # OR at IpdromREC (some BIOSes register entries on the data partition too).
-    if ($partLetter -eq $winreLetter -or $partLetter -eq $ipdromLetter) {
-        # Prefer WINRE letter (= partition with actual bootloader)
-        $priority = if ($partLetter -eq $winreLetter) { 1 } else { 2 }
-        $candidates += [pscustomobject]@{
-            Id              = $id
-            Description     = $desc
-            PartitionLetter = $partLetter
-            Priority        = $priority
-        }
-        Write-Log "  candidate: $id  '$desc'  (partition=${partLetter}:, priority=$priority)" 'Gray'
-    }
+# ===================== LOCATE LOCAL CAPTURE BCD ENTRY =====================
+# Prepare-IpdromRecFlash стейджит C:\WinPE\boot.wim + создаёт СКРЫТЫЙ osloader entry
+# в локальной BCD. Мы тут ставим {bootmgr} bootsequence на этот GUID -
+# одноразовый next-boot. Windows bootmgr грузится с системного диска (как обычно),
+# видит bootsequence, ramdisk-bootит наш WinPE c C:\WinPE\boot.wim.
+# Никаких USB-выборов BIOS - Ventoy/прочие removable не влияют вообще.
+$capGuidPath = Join-Path $env:SystemDrive 'WinPE\capture_entry_guid.txt'
+if (-not (Test-Path $capGuidPath)) {
+    Write-Log "Local WinPE not staged: $capGuidPath not found." 'Red'
+    Write-Log "Run Prepare-IpdromRecFlash.ps1 first - it stages the local capture entry." 'Yellow'
+    exit 9
 }
+$capGuid = (Get-Content -LiteralPath $capGuidPath -Raw).Trim()
+Write-Log "Local capture BCD entry GUID: $capGuid" 'Gray'
 
-# Prefer WINRE partition (priority=1) over IpdromREC data partition (priority=2)
-$candidates = @($candidates | Sort-Object Priority)
-
-if ($candidates.Count -eq 0) {
-    Write-Log "No UEFI entry matching IpdromREC by partition letter." 'Yellow'
-
-    # SAFETY: generic "UEFI:Removable Device" грузит ПЕРВОЕ попавшееся USB.
-    # В проде (одна флешка - IpdromREC) это OK. На стенде с Ventoy/чужой флешкой
-    # BIOS может выбрать НЕ нашу и BootNext улетит мимо -> auto-capture не запустится,
-    # винда вернётся, лаунчер увидит StressTest_Completed.flag и тихо выйдет.
-    # Поэтому если есть другие removable USB - отказываемся (или -Force).
-    $otherUsbDisks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object {
-        $_.BusType -eq 'USB' -and $_.Number -ne $flashDisk.Number -and -not $_.IsBoot -and -not $_.IsSystem
-    })
-    if ($otherUsbDisks.Count -gt 0 -and -not $Force) {
-        Write-Log "Other USB sticks detected in system - generic 'UEFI:Removable Device' fallback is UNSAFE:" 'Red'
-        foreach ($u in $otherUsbDisks) {
-            Write-Log ("  - Disk {0}: '{1}' ({2} GB)" -f $u.Number, $u.FriendlyName, [math]::Round($u.Size/1GB,1)) 'Red'
-        }
-        Write-Log "BIOS may boot one of these instead of IpdromREC." 'Red'
-        Write-Log "Unplug other USB sticks (Ventoy, etc) and rerun, OR pass -Force to ignore." 'Yellow'
-        Write-Log "Markers KEPT - boot IpdromREC flash manually via F11 if needed." 'Yellow'
-        exit 11
-    }
-
-    # FALLBACK: одна removable в системе -> generic-entry однозначно её и загрузит.
-    $genericId = $null
-    foreach ($block in $blocks) {
-        if ($block -notmatch '(\{[a-f0-9-]+\})') { continue }
-        $gid = $matches[1]
-        if ($gid -ieq '{bootmgr}' -or $gid -ieq '{fwbootmgr}') { continue }
-        if ($block -match '(?im)^\s*description\s+UEFI:\s*Removable\s+Device') { $genericId = $gid; break }
-    }
-    if ($genericId) {
-        if ($otherUsbDisks.Count -gt 0) {
-            Write-Log "Fallback to generic 'UEFI:Removable Device' DESPITE other USB present (-Force)." 'Yellow'
-        } else {
-            Write-Log "Fallback to generic 'UEFI:Removable Device' entry: $genericId" 'Yellow'
-            Write-Log "(IpdromREC is the only removable USB - BIOS will boot it.)" 'Gray'
-        }
-        $chosen = [pscustomobject]@{ Id = $genericId; Description = 'UEFI:Removable Device (generic fallback)' }
-    } else {
-        Write-Log "No matching entry and no generic Removable Device entry found." 'Red'
-        Write-Log "Cannot set BootNext automatically on this BIOS." 'Red'
-        Write-Log "Markers KEPT - boot the IpdromREC flash manually via F11 to run capture." 'Yellow'
-        exit 9
-    }
-} else {
-    if ($candidates.Count -gt 1) {
-        Write-Log "Multiple USB entries found. Picking first one - review log if wrong." 'Yellow'
-    }
-    $chosen = $candidates[0]
-}
-Write-Log "Selected UEFI entry: $($chosen.Id)  '$($chosen.Description)'" 'Cyan'
-
-# ===================== SET BOOTNEXT =====================
-Write-Log "Setting one-time BootNext..." 'Yellow'
-$bcdSetOut = bcdedit /set "{fwbootmgr}" bootsequence $chosen.Id 2>&1
-foreach ($l in ($bcdSetOut -split "`r?`n")) { if ($l.Trim()) { Write-Log "  | $l" 'DarkGray' } }
-
+# Verify entry still exists in BCD
+$verify = bcdedit /enum $capGuid 2>&1
 if ($LASTEXITCODE -ne 0) {
-    Write-Log "bcdedit BootNext failed (exit $LASTEXITCODE)." 'Red'
-    Write-Log "Markers KEPT - boot the IpdromREC flash manually via F11 to run capture." 'Yellow'
-    # НЕ удаляем маркеры: ручной F11-capture должен сработать.
+    Write-Log "BCD entry $capGuid no longer exists - re-run Prepare-IpdromRecFlash.ps1." 'Red'
+    foreach ($l in $verify) { Write-Log "  | $l" 'DarkGray' }
     exit 10
 }
 
-Write-Log "BootNext armed. On next reboot, system will boot into IpdromREC WinPE." 'Green'
+# ===================== SET BOOTSEQUENCE =====================
+# {bootmgr} bootsequence - one-time next-boot. Consumed by bootmgr, NOT persisted.
+# After WinPE capture reboots back -> next boot uses {default} (regular Windows).
+Write-Log "Setting one-time {bootmgr} bootsequence to local WinPE entry..." 'Yellow'
+$bcdSetOut = bcdedit /set '{bootmgr}' bootsequence $capGuid 2>&1
+foreach ($l in ($bcdSetOut -split "`r?`n")) { if ($l.Trim()) { Write-Log "  | $l" 'DarkGray' } }
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Log "bcdedit bootsequence failed (exit $LASTEXITCODE)." 'Red'
+    Write-Log "Markers KEPT - boot the IpdromREC flash manually via F11 to run capture." 'Yellow'
+    exit 11
+}
+
+Write-Log "bootsequence armed. Next reboot -> local WinPE -> capture FFU to IpdromREC." 'Green'
 
 # ===================== REBOOT =====================
 if ($NoReboot) {

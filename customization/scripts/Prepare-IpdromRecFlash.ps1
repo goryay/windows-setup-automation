@@ -105,6 +105,158 @@ function Get-DiskNumberByVolume {
     } catch { return $null }
 }
 
+function Invoke-LocalWinPEStage {
+    # Стейдж локального WinPE для capture-trigger без зависимости от USB-выбора BIOS.
+    # Копирует boot.wim+boot.sdi на C:\WinPE\, создаёт СКРЫТЫЙ osloader-entry
+    # в локальной BCD (НЕ в displayorder -> не показывается в boot-меню).
+    # Invoke-FfuCaptureReboot потом ставит {bootmgr} bootsequence на этот GUID.
+    # Cleanup делается WinPE startnet.cmd ДО DISM, поэтому в FFU мусор не попадает.
+    param([string]$PatchedWim)
+
+    $sysDrv  = $env:SystemDrive   # "C:"
+    $stageDir = Join-Path $sysDrv 'WinPE'
+    New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+    # --- Копируем boot.wim ---
+    $stageWim = Join-Path $stageDir 'boot.wim'
+    Copy-Item -LiteralPath $PatchedWim -Destination $stageWim -Force
+    $wimMB = [math]::Round((Get-Item $stageWim).Length / 1MB, 1)
+    Write-Log "  Staged boot.wim -> $stageWim ($wimMB MB)" 'Gray'
+
+    # --- Копируем boot.sdi (из живой OS) ---
+    $sdiSrc = @(
+        (Join-Path $env:SystemRoot 'Boot\DVD\EFI\boot.sdi'),
+        (Join-Path $env:SystemRoot 'Boot\DVD\PCAT\boot.sdi'),
+        (Join-Path $env:SystemRoot 'System32\boot.sdi')
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $sdiSrc) { throw "boot.sdi not found in any standard location" }
+    $stageSdi = Join-Path $stageDir 'boot.sdi'
+    Copy-Item -LiteralPath $sdiSrc -Destination $stageSdi -Force
+    Write-Log "  Staged boot.sdi -> $stageSdi (from $sdiSrc)" 'Gray'
+
+    # --- Сохраняем текущее состояние {ramdiskoptions} (если есть) ---
+    # Локальный {ramdiskoptions} может уже использоваться WinRE - не ломаем его насовсем.
+    $rdoEnum  = bcdedit /enum '{ramdiskoptions}' 2>&1
+    $rdoState = @{ existed = $false; sdidevice = $null; sdipath = $null }
+    if ($LASTEXITCODE -eq 0) {
+        foreach ($l in $rdoEnum) {
+            if ($l -match '(?i)^\s*ramdisksdidevice\s+(.+)$') { $rdoState.sdidevice = $matches[1].Trim() }
+            if ($l -match '(?i)^\s*ramdisksdipath\s+(.+)$')   { $rdoState.sdipath   = $matches[1].Trim() }
+        }
+        if ($rdoState.sdidevice -or $rdoState.sdipath) { $rdoState.existed = $true }
+    }
+    $rdoJson = Join-Path $stageDir 'ramdiskoptions_orig.json'
+    $rdoState | ConvertTo-Json | Set-Content -LiteralPath $rdoJson -Encoding utf8 -Force
+    Write-Log "  Saved {ramdiskoptions} state (existed=$($rdoState.existed)) -> $rdoJson" 'Gray'
+
+    # --- Настраиваем {ramdiskoptions} на наш boot.sdi ---
+    if (-not $rdoState.existed) {
+        & bcdedit /create '{ramdiskoptions}' /d "Ramdisk Options" 2>&1 | Out-Null
+    }
+    & bcdedit /set '{ramdiskoptions}' ramdisksdidevice "partition=$sysDrv" 2>&1 | Out-Null
+    & bcdedit /set '{ramdiskoptions}' ramdisksdipath '\WinPE\boot.sdi' 2>&1 | Out-Null
+
+    # --- Создаём СКРЫТЫЙ osloader entry ---
+    $createOut = bcdedit /create /d "IPDROM Capture WinPE" /application osloader 2>&1
+    $capGuid = $null
+    foreach ($l in $createOut) {
+        if ($l -match '(\{[a-f0-9-]+\})') { $capGuid = $matches[1]; break }
+    }
+    if (-not $capGuid) {
+        throw "Failed to create osloader entry. bcdedit output: $($createOut -join '; ')"
+    }
+
+    & bcdedit /set $capGuid device     "ramdisk=[$sysDrv]\WinPE\boot.wim,{ramdiskoptions}" 2>&1 | Out-Null
+    & bcdedit /set $capGuid osdevice   "ramdisk=[$sysDrv]\WinPE\boot.wim,{ramdiskoptions}" 2>&1 | Out-Null
+    & bcdedit /set $capGuid path       '\windows\system32\winload.efi' 2>&1 | Out-Null
+    & bcdedit /set $capGuid systemroot '\windows' 2>&1 | Out-Null
+    & bcdedit /set $capGuid winpe      yes 2>&1 | Out-Null
+    & bcdedit /set $capGuid detecthal  yes 2>&1 | Out-Null
+
+    # ВАЖНО: не добавляем в {bootmgr} /displayorder - чтобы entry был НЕВИДИМ
+    # в boot-menu обычного юзера. Вызывается ТОЛЬКО через bootsequence one-shot.
+
+    $capGuidFile = Join-Path $stageDir 'capture_entry_guid.txt'
+    Set-Content -LiteralPath $capGuidFile -Value $capGuid -Encoding ASCII -Force
+    Write-Log "  Created hidden osloader entry: $capGuid" 'Green'
+    Write-Log "  GUID saved -> $capGuidFile" 'Gray'
+
+    # --- Пишем Cleanup-CaptureStaging.ps1 (для WinPE startnet.cmd) ---
+    $cleanupPath = Join-Path $stageDir 'Cleanup-CaptureStaging.ps1'
+    $cleanupBody = @'
+# Cleanup-CaptureStaging.ps1 - runs IN WinPE before DISM /Capture-Ffu.
+# Restores system BCD to clean state so captured FFU has no staging artifacts.
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$SysDrive,  # e.g. "C:" - WinPE-mounted system Windows drive
+    [string]$LogPath
+)
+$ErrorActionPreference = 'Continue'
+function L($m) {
+    Write-Host $m
+    if ($LogPath) { try { "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'),$m | Out-File $LogPath -Append -Encoding utf8 } catch {} }
+}
+
+$stageDir   = Join-Path $SysDrive 'WinPE'
+$origJson   = Join-Path $stageDir 'ramdiskoptions_orig.json'
+$guidFile   = Join-Path $stageDir 'capture_entry_guid.txt'
+
+L "Cleanup-CaptureStaging started. SysDrive=$SysDrive"
+
+# Read state BEFORE deleting staging files
+$capGuid = $null
+if (Test-Path $guidFile) { $capGuid = (Get-Content -LiteralPath $guidFile -Raw).Trim() }
+$rdoOrig = $null
+if (Test-Path $origJson) { $rdoOrig = Get-Content -LiteralPath $origJson -Raw | ConvertFrom-Json }
+
+# Find system ESP and mount it (WinPE doesn't auto-assign letter to ESP)
+$sysLetter  = $SysDrive.TrimEnd(':')
+$sysDiskNum = (Get-Partition -DriveLetter $sysLetter -ErrorAction SilentlyContinue).DiskNumber
+if ($null -eq $sysDiskNum) { L "ERROR: cannot resolve disk number for $SysDrive"; exit 1 }
+$esp = Get-Disk -Number $sysDiskNum | Get-Partition | Where-Object { $_.Type -eq 'System' } | Select-Object -First 1
+if (-not $esp) { L "ERROR: no ESP partition on disk $sysDiskNum"; exit 2 }
+
+if (-not $esp.DriveLetter) {
+    # Find a free letter
+    $used = (Get-Volume).DriveLetter | Where-Object { $_ }
+    $free = 'YZWVUTS'.ToCharArray() | Where-Object { $used -notcontains $_ } | Select-Object -First 1
+    if (-not $free) { L "ERROR: no free drive letter for ESP"; exit 3 }
+    Add-PartitionAccessPath -DiskNumber $sysDiskNum -PartitionNumber $esp.PartitionNumber -AccessPath "${free}:" -ErrorAction SilentlyContinue
+    $esp = Get-Partition -DiskNumber $sysDiskNum -PartitionNumber $esp.PartitionNumber
+}
+$espLetter = $esp.DriveLetter
+$sysBcd    = "${espLetter}:\EFI\Microsoft\Boot\BCD"
+if (-not (Test-Path $sysBcd)) { L "ERROR: system BCD not found at $sysBcd"; exit 4 }
+L "System BCD: $sysBcd"
+
+# Delete our hidden osloader entry
+if ($capGuid) {
+    & bcdedit /store $sysBcd /delete $capGuid /f 2>&1 | ForEach-Object { L "  | delete ${capGuid}: $_" }
+}
+
+# Restore {ramdiskoptions} to original state
+if ($rdoOrig) {
+    if ($rdoOrig.existed) {
+        if ($rdoOrig.sdidevice) { & bcdedit /store $sysBcd /set '{ramdiskoptions}' ramdisksdidevice $rdoOrig.sdidevice 2>&1 | ForEach-Object { L "  | restore sdidevice: $_" } }
+        if ($rdoOrig.sdipath)   { & bcdedit /store $sysBcd /set '{ramdiskoptions}' ramdisksdipath   $rdoOrig.sdipath   2>&1 | ForEach-Object { L "  | restore sdipath: $_"   } }
+    } else {
+        # We created {ramdiskoptions} - delete it
+        & bcdedit /store $sysBcd /delete '{ramdiskoptions}' /f 2>&1 | ForEach-Object { L "  | delete ramdiskoptions: $_" }
+    }
+}
+
+# Wipe staging dir from system disk so it isn't in the captured FFU
+Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+L "Removed staging dir: $stageDir"
+L "Cleanup-CaptureStaging completed."
+exit 0
+'@
+    Set-Content -LiteralPath $cleanupPath -Value $cleanupBody -Encoding utf8 -Force
+    Write-Log "  Wrote $cleanupPath" 'Gray'
+
+    Write-Log "Local WinPE staged: bootsequence-ready, will be picked at next reboot." 'Green'
+}
+
 # ===================== FIND CANDIDATE FLASH =====================
 Write-Log "Scanning for candidate USB flash drives..." 'Yellow'
 
@@ -257,6 +409,9 @@ if ($mode -eq 'REFRESH') {
         $p = Join-Path $ipdromRoot $mk
         if (Test-Path $p) { Remove-Item -LiteralPath $p -Force; Write-Log "  Removed stale marker: $mk" 'Gray' }
     }
+
+    Write-Log "Re-staging local WinPE for capture trigger..." 'Yellow'
+    Invoke-LocalWinPEStage -PatchedWim $PatchedWim
 
     Write-Log "=== REFRESH completed successfully ===" 'Green'
     Write-Log "Flash ready at Disk $($disk.Number):" 'Green'
@@ -500,9 +655,13 @@ DO NOT pick the USB flash itself as ApplyDrive - that would wipe the image.
 "@
 Set-Content -LiteralPath (Join-Path $ipdromRoot 'README.txt') -Value $readme -Encoding utf8
 
+# ===================== STAGE LOCAL WINPE FOR CAPTURE TRIGGER =====================
+Write-Log "Staging local WinPE for capture trigger..." 'Yellow'
+Invoke-LocalWinPEStage -PatchedWim $PatchedWim
+
 Write-Log "=== FRESH preparation completed successfully ===" 'Green'
 Write-Log "Flash ready at Disk $($disk.Number):" 'Green'
 Write-Log "  WINRE:     $winreRoot" 'Green'
 Write-Log "  IpdromREC: $ipdromRoot" 'Green'
-Write-Log "Next step: capture trigger from Windows (Phase 4 - to be wired in [6.5/7])." 'Cyan'
+Write-Log "Local WinPE staged at C:\WinPE\ - bootsequence-ready." 'Cyan'
 exit 0
