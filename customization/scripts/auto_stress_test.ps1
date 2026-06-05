@@ -903,44 +903,46 @@ Write-ColorOutput '[2/7] Detecting configuration...' 'Yellow'
 $allControllers = Get-CimInstance Win32_VideoController
 Write-ColorOutput "  Found video controllers: $($allControllers.Name -join ', ')" 'Gray'
 
-$pnpNvidia = @(Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Where-Object {
-    $_.FriendlyName -like '*NVIDIA*'
-})
+# Vendor-ID detection is language-independent. The previous Name-based filter
+# missed localized "Microsoft Basic Display Adapter" (RU: "Базовый видеоадаптер
+# (Майкрософт)"), so the basic VGA driver was counted as discrete -> FurMark
+# was launched and instantly failed with "OpenGL 2.1 required".
+# PCI vendor IDs: NVIDIA=10DE, AMD=1002, Intel=8086. Microsoft Basic has no VEN_.
+$displayPnp = @(Get-PnpDevice -Class Display -ErrorAction SilentlyContinue)
+$nvidiaPnp  = @($displayPnp | Where-Object { $_.InstanceId -match 'VEN_10DE' })
+$amdPnp     = @($displayPnp | Where-Object { $_.InstanceId -match 'VEN_1002' })
+$intelPnp   = @($displayPnp | Where-Object { $_.InstanceId -match 'VEN_8086' })
 
-$expectedNvidiaCount = $pnpNvidia.Count
+Write-ColorOutput "  PnP display vendors: NVIDIA=$($nvidiaPnp.Count), AMD=$($amdPnp.Count), Intel=$($intelPnp.Count)" 'Gray'
 
-if ($expectedNvidiaCount -lt 1) {
-    $expectedNvidiaCount = @($allControllers | Where-Object {
-        $_.Name -like '*NVIDIA*'
-    }).Count
+# Only wait for nvidia-smi if NVIDIA is actually on the PCI bus. Previously
+# $expectedNvidiaCount was forced to 1 even with no NVIDIA hardware, wasting
+# 5 minutes on every iGPU-only machine.
+$gpuLines = @()
+if ($nvidiaPnp.Count -gt 0) {
+    $gpuLines = @(Wait-NvidiaGpusReady -ExpectedCount $nvidiaPnp.Count -TimeoutSeconds 300)
+} else {
+    Write-ColorOutput '  No NVIDIA on PCI bus - skipping nvidia-smi wait.' 'Gray'
 }
-
-if ($expectedNvidiaCount -lt 1) {
-    $expectedNvidiaCount = 1
-}
-
-$gpuLines = @(Wait-NvidiaGpusReady -ExpectedCount $expectedNvidiaCount -TimeoutSeconds 300)
 
 $discreteGpuCount = 0
-
 if ($gpuLines.Count -gt 0) {
     $discreteGpuCount = $gpuLines.Count
     Write-ColorOutput "  NVIDIA GPUs via nvidia-smi: $($gpuLines -join '; ')" 'Gray'
+} elseif ($nvidiaPnp.Count -gt 0) {
+    $discreteGpuCount = $nvidiaPnp.Count
+    Write-ColorOutput "  nvidia-smi silent but PnP reports $($nvidiaPnp.Count) NVIDIA device(s) - counting as discrete." 'Yellow'
 }
 
-if ($discreteGpuCount -eq 0) {
-    $discreteControllers = @($allControllers | Where-Object {
-        $_.Name -notlike '*Microsoft Basic Display Adapter*' -and
-        $_.Name -notlike '*Microsoft Hyper-V Video*' -and
-        $_.Name -notlike '*Remote Desktop Display*' -and
-        $_.Name -notlike '*Intel(R) HD Graphics*' -and
-        $_.Name -notlike '*Intel(R) UHD Graphics*' -and
-        $_.Name -notlike '*Intel(R) Iris*' -and
-        $_.Name -notlike '*AMD Radeon(TM) Graphics*' -and
-        $_.Name -notlike '*AMD Radeon Graphics*'
-    })
-
-    $discreteGpuCount = $discreteControllers.Count
+# AMD: discrete only if FriendlyName matches a known discrete family. Driver
+# INF names are usually English even on localized Windows, so this is safe.
+# Plain "AMD Radeon Graphics" / "AMD Radeon(TM) Graphics" is the iGPU and is excluded.
+$amdDiscrete = @($amdPnp | Where-Object {
+    $_.FriendlyName -match '(?i)Radeon\s+(RX|PRO|R9|R7|VII|Vega|HD\s*[5-9]\d{3})|FirePro|Instinct|W[57]\d{3}'
+})
+if ($amdDiscrete.Count -gt 0) {
+    Write-ColorOutput "  AMD discrete GPUs: $($amdDiscrete.Count) ($($amdDiscrete.FriendlyName -join '; '))" 'Gray'
+    $discreteGpuCount += $amdDiscrete.Count
 }
 
 Write-ColorOutput "  Discrete GPUs: $discreteGpuCount" 'Gray'
