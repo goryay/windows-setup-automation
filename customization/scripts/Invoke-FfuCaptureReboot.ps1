@@ -1,18 +1,23 @@
 <#
 .SYNOPSIS
-    Triggers FFU capture by rebooting into the IpdromREC WinPE flash.
+    Triggers FFU capture by rebooting into LOCALLY-STAGED WinPE.
 
     Workflow:
       1. Validate IpdromREC partition is ready (boot.wim + EFI bootloader present)
       2. Write .capture_pending marker on IpdromREC
       3. Write stress-test-completed flag so launcher doesn't re-run after return
-      4. Find UEFI firmware boot entry pointing at the IpdromREC USB
-      5. Set one-time BootNext via bcdedit
+      4. Read GUID of local WinPE BCD entry from C:\WinPE\capture_entry_guid.txt
+         (created by Prepare-IpdromRecFlash.ps1)
+      5. Set one-time {bootmgr} bootsequence to that GUID
       6. Restart-Computer
 
-    After capture, WinPE startnet removes .capture_pending and reboots. Default
-    boot order returns the system to Windows. Launcher sees the completed flag
-    and exits cleanly.
+    On reboot: Windows bootmgr loads (no USB picking), sees bootsequence,
+    ramdisk-boots WinPE from C:\WinPE\boot.wim. WinPE captures FFU to IpdromREC
+    USB, cleans up C:\WinPE\ and BCD entry, reboots. Default boot order
+    returns to regular Windows. Launcher sees Completed flag and exits.
+
+    This approach works even when Ventoy/other USBs are plugged in - because
+    boot decision is made by Windows bootmgr on system disk, not by BIOS.
 
 .PARAMETER FlashLabel
     Volume label of the recovery flash data partition. Default 'IpdromREC'.
@@ -145,90 +150,43 @@ if (-not (Test-Path $stressFlag)) {
     Write-Log "Stress flag already present - launcher will exit on next boot." 'Gray'
 }
 
-# ===================== FIND UEFI BOOT ENTRY FOR THIS USB =====================
-Write-Log "Enumerating UEFI firmware boot entries..." 'Yellow'
-
-$bcdRaw = bcdedit /enum firmware 2>&1
-$bcdText = ($bcdRaw -join "`r`n")
-
-# bcdedit output is block-separated by blank lines. Parse each block.
-# We match by `device partition=<letter>:` where <letter> is OUR WINRE drive letter -
-# this is a direct physical mapping, robust regardless of what BIOS put in description.
-# Prepare-IpdromRecFlash.ps1 guarantees that a firmware entry for this partition exists
-# (creates one via bcdedit /create if bcdboot didn't).
-$blocks       = $bcdText -split "(?ms)\r?\n\r?\n"
-$candidates   = @()
-$winreLetter  = $winreVol.DriveLetter.ToString().ToUpper()
-$ipdromLetter = $ipdromVol.DriveLetter.ToString().ToUpper()
-
-foreach ($block in $blocks) {
-    # Locale-independent: first GUID in the block IS the identifier
-    # (bcdedit always puts identifier as the first field, regardless of language)
-    if ($block -notmatch '(\{[a-f0-9-]+\})') { continue }
-    $id = $matches[1]
-    if ($id -ieq '{bootmgr}' -or $id -ieq '{fwbootmgr}') { continue }
-
-    # "description" remains English in all locales (informational only - not used for matching)
-    $desc = ''
-    if ($block -match '(?im)^\s*description\s+(.+?)\s*$') { $desc = $matches[1].Trim() }
-
-    # Extract partition letter from "device partition=<letter>:"
-    $partLetter = $null
-    if ($block -match '(?im)^\s*device\s+partition=([A-Z]):') {
-        $partLetter = $matches[1].ToUpper()
-    }
-    if (-not $partLetter) { continue }
-
-    # Accept entries pointing at our WINRE partition (where bootmgr lives)
-    # OR at IpdromREC (some BIOSes register entries on the data partition too).
-    if ($partLetter -eq $winreLetter -or $partLetter -eq $ipdromLetter) {
-        # Prefer WINRE letter (= partition with actual bootloader)
-        $priority = if ($partLetter -eq $winreLetter) { 1 } else { 2 }
-        $candidates += [pscustomobject]@{
-            Id              = $id
-            Description     = $desc
-            PartitionLetter = $partLetter
-            Priority        = $priority
-        }
-        Write-Log "  candidate: $id  '$desc'  (partition=${partLetter}:, priority=$priority)" 'Gray'
-    }
-}
-
-# Prefer WINRE partition (priority=1) over IpdromREC data partition (priority=2)
-$candidates = @($candidates | Sort-Object Priority)
-
-if ($candidates.Count -eq 0) {
-    Write-Log "No UEFI boot entry matching the IpdromREC USB. Cannot set BootNext." 'Red'
-    Write-Log "Full bcdedit output saved in log for debugging." 'Gray'
-    Write-Log "------ bcdedit /enum firmware ------" 'DarkGray'
-    foreach ($l in ($bcdText -split "`r?`n")) { Write-Log "  | $l" 'DarkGray' }
-    Write-Log "------------------------------------" 'DarkGray'
-    Remove-Item -LiteralPath $markerPending -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $stressFlag -Force -ErrorAction SilentlyContinue
-    Write-Log "Removed markers (no capture will happen)." 'Yellow'
+# ===================== LOCATE LOCAL CAPTURE BCD ENTRY =====================
+# Prepare-IpdromRecFlash стейджит C:\WinPE\boot.wim + создаёт СКРЫТЫЙ osloader entry
+# в локальной BCD. Мы тут ставим {bootmgr} bootsequence на этот GUID -
+# одноразовый next-boot. Windows bootmgr грузится с системного диска (как обычно),
+# видит bootsequence, ramdisk-bootит наш WinPE c C:\WinPE\boot.wim.
+# Никаких USB-выборов BIOS - Ventoy/прочие removable не влияют вообще.
+$capGuidPath = Join-Path $env:SystemDrive 'WinPE\capture_entry_guid.txt'
+if (-not (Test-Path $capGuidPath)) {
+    Write-Log "Local WinPE not staged: $capGuidPath not found." 'Red'
+    Write-Log "Run Prepare-IpdromRecFlash.ps1 first - it stages the local capture entry." 'Yellow'
     exit 9
 }
+$capGuid = (Get-Content -LiteralPath $capGuidPath -Raw).Trim()
+Write-Log "Local capture BCD entry GUID: $capGuid" 'Gray'
 
-if ($candidates.Count -gt 1) {
-    Write-Log "Multiple USB entries found. Picking first one - review log if wrong." 'Yellow'
-}
-
-$chosen = $candidates[0]
-Write-Log "Selected UEFI entry: $($chosen.Id)  '$($chosen.Description)'" 'Cyan'
-
-# ===================== SET BOOTNEXT =====================
-Write-Log "Setting one-time BootNext..." 'Yellow'
-$bcdSetOut = bcdedit /set "{fwbootmgr}" bootsequence $chosen.Id 2>&1
-foreach ($l in ($bcdSetOut -split "`r?`n")) { if ($l.Trim()) { Write-Log "  | $l" 'DarkGray' } }
-
+# Verify entry still exists in BCD
+$verify = bcdedit /enum $capGuid 2>&1
 if ($LASTEXITCODE -ne 0) {
-    Write-Log "bcdedit failed (exit $LASTEXITCODE). Aborting." 'Red'
-    Remove-Item -LiteralPath $markerPending -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $stressFlag -Force -ErrorAction SilentlyContinue
+    Write-Log "BCD entry $capGuid no longer exists - re-run Prepare-IpdromRecFlash.ps1." 'Red'
+    foreach ($l in $verify) { Write-Log "  | $l" 'DarkGray' }
     exit 10
 }
 
-Write-Log "BootNext armed. On next reboot, system will boot into IpdromREC WinPE." 'Green'
+# ===================== SET BOOTSEQUENCE =====================
+# {bootmgr} bootsequence - one-time next-boot. Consumed by bootmgr, NOT persisted.
+# After WinPE capture reboots back -> next boot uses {default} (regular Windows).
+Write-Log "Setting one-time {bootmgr} bootsequence to local WinPE entry..." 'Yellow'
+$bcdSetOut = bcdedit /set '{bootmgr}' bootsequence $capGuid 2>&1
+foreach ($l in ($bcdSetOut -split "`r?`n")) { if ($l.Trim()) { Write-Log "  | $l" 'DarkGray' } }
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Log "bcdedit bootsequence failed (exit $LASTEXITCODE)." 'Red'
+    Write-Log "Markers KEPT - boot the IpdromREC flash manually via F11 to run capture." 'Yellow'
+    exit 11
+}
+
+Write-Log "bootsequence armed. Next reboot -> local WinPE -> capture FFU to IpdromREC." 'Green'
 
 # ===================== REBOOT =====================
 if ($NoReboot) {
