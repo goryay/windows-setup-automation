@@ -1,0 +1,31 @@
+{
+  "general": {
+    "baseUrl": "http://10.0.6.41:3000/axxonsoft/intellectx/exe/main",
+    "workRoot": "C:\\Temp\\intellect_auto",
+    "keepCache": false
+  },
+  "installType": "Server",
+  "sql": {
+    "instance": "(local)",
+    "authType": "Windows",
+    "username": "",
+    "password": "",
+    "dbIntellectName": "intellect",
+    "dbTitlesName": "titles",
+    "ensure": true
+  },
+  "guardant": {
+    "remove": true
+  },
+  "options": {
+    "installDir": "C:\\Program Files\\Intellect",
+    "cmdProps": "CREATE_QUICKLAUNCH_SHORTCUT=\\\"1\\\" INSTALL_AS_SERVICE=\\\"1\\\""
+  },
+  "addons": [
+    "acfa",
+    "web_report"
+  ],
+  "acfa": {
+    "modules": ["base", "axacfa_ru", "aritech_ru"]
+  }
+}

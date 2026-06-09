@@ -1,0 +1,11 @@
+{
+  "general": {
+    "baseUrl": "http://10.0.6.41:3000/axxonsoft/intellectx/msi/main",
+    "workRoot": "C:\\Temp\\intellectx_auto",
+    "keepCache": false
+  },
+  "installType": "raftserver",
+  "removeGuardant": false,
+  "cmdProps": "",
+  "addons": []
+}

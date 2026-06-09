@@ -1,0 +1,16 @@
+{
+  "general": {
+    "baseUrl": "http://10.0.6.41:3000/axxonsoft/intellectx/exe/main",
+    "workRoot": "C:\\Temp\\intellect_auto",
+    "keepCache": false
+  },
+  "installType": "Client",
+  "guardant": {
+    "remove": true
+  },
+  "options": {
+    "installDir": "C:\\Program Files\\Intellect",
+    "cmdProps": "CREATE_QUICKLAUNCH_SHORTCUT=\\\"1\\\""
+  },
+  "addons": []
+}
