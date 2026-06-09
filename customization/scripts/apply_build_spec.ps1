@@ -12,8 +12,15 @@
 .PARAMETER UsbRoot
     Корень USB-флешки (где лежит папка config). Обязательный.
 
+.PARAMETER ConfigPath
+    Явный путь к файлу конфигурации. Если задан - используется как есть.
+
+.PARAMETER ConfigDir
+    Папка где искать SL*.txt. По умолчанию <UsbRoot>\config.
+
 .PARAMETER ConfigRelPath
-    Путь к конфигу относительно UsbRoot. По умолчанию config\build_spec.txt.
+    Legacy: относительный путь к build_spec.txt относительно UsbRoot.
+    Если задан явно, имеет приоритет над auto-discovery.
 
 .PARAMETER NoRename
     Распарсить и залогировать, но НЕ применять Rename-Computer (dry-run).
@@ -26,9 +33,13 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$UsbRoot,
-    [string]$ConfigRelPath = 'config\build_spec.txt',
+    [string]$ConfigPath,
+    [string]$ConfigDir,
+    [string]$ConfigRelPath,
     [switch]$NoRename
 )
+
+if (-not $ConfigDir) { $ConfigDir = Join-Path $UsbRoot 'config' }
 
 $ErrorActionPreference = 'Stop'
 
@@ -80,16 +91,63 @@ function Test-ComputerName {
     return $true
 }
 
-# ===================== ОСНОВНАЯ ЛОГИКА =====================
-$configPath = Join-Path $UsbRoot $ConfigRelPath
+# ===================== ПОИСК ФАЙЛА КОНФИГА =====================
+# Приоритет:
+#   1. -ConfigPath <abs path>      (явный override для тестов)
+#   2. -ConfigRelPath <rel path>   (legacy override относительно UsbRoot)
+#   3. Auto-discovery в $ConfigDir:
+#        a) SL<digits>-<digits>.txt (новый формат, имя совпадает с серийником;
+#           допускаем " 1" суффикс от Windows-дубликатов)
+#        b) build_spec.txt (legacy fallback)
+function Resolve-ConfigPath {
+    param([string]$Explicit, [string]$RelPath, [string]$Dir, [string]$RootDir)
 
-if (-not (Test-Path -LiteralPath $configPath)) {
-    Write-Log "Config not found at $configPath - nothing to apply (using defaults)." 'Yellow'
+    if ($Explicit) {
+        if (Test-Path -LiteralPath $Explicit) { return $Explicit }
+        Write-Log "Explicit -ConfigPath not found: $Explicit" 'Red'
+        return $null
+    }
+    if ($RelPath) {
+        $p = Join-Path $RootDir $RelPath
+        if (Test-Path -LiteralPath $p) { return $p }
+        Write-Log "Explicit -ConfigRelPath not found: $p" 'Red'
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $Dir)) {
+        Write-Log "Config dir does not exist: $Dir" 'Yellow'
+        return $null
+    }
+
+    $slCandidates = @(Get-ChildItem -Path $Dir -Filter 'SL*.txt' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^SL\d+-\d+(\s+\d+)?\.txt$' } |
+        Sort-Object LastWriteTime -Descending)
+    if ($slCandidates.Count -ge 1) {
+        if ($slCandidates.Count -gt 1) {
+            Write-Log "Found $($slCandidates.Count) SL*-*.txt files in $Dir - taking newest:" 'Yellow'
+            foreach ($c in $slCandidates) {
+                Write-Log ("  - {0}  ({1})" -f $c.Name, $c.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) 'Gray'
+            }
+        }
+        return $slCandidates[0].FullName
+    }
+
+    $legacy = Join-Path $Dir 'build_spec.txt'
+    if (Test-Path -LiteralPath $legacy) {
+        Write-Log "No SL*-*.txt found in $Dir, using legacy build_spec.txt." 'Gray'
+        return $legacy
+    }
+    return $null
+}
+
+$configPath = Resolve-ConfigPath -Explicit $ConfigPath -RelPath $ConfigRelPath -Dir $ConfigDir -RootDir $UsbRoot
+if (-not $configPath) {
+    Write-Log "No config file found - nothing to apply (using defaults)." 'Yellow'
+    Write-Log "Tried: explicit=$ConfigPath, rel=$ConfigRelPath, dir=$ConfigDir (SL*-*.txt or build_spec.txt)" 'Gray'
     Write-Log "=== apply_build_spec finished (no config) ===" 'Gray'
     exit 0
 }
 
-Write-Log "Config found: $configPath" 'Green'
+Write-Log "Config: $configPath" 'Green'
 
 try {
     $spec = Read-BuildSpec -Path $configPath
