@@ -364,15 +364,26 @@ foreach ($step in $execSteps) {
     }
 
     try {
-        # Не используем '& $scriptPath', чтобы избежать особенностей dot-sourcing.
-        # PowerShell.exe в отдельном процессе - чище, и exit code ловится через $LASTEXITCODE.
+        # Выбор PS engine: install_intellect.ps1 требует PS7 (pwsh.exe),
+        # install_intellectx.ps1 - терпит и 5.1. Используем pwsh.exe если он
+        # установлен, иначе fallback на powershell.exe с предупреждением.
+        $psExe = $null
+        $pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+        if ($pwshCmd) {
+            $psExe = $pwshCmd.Source
+        } else {
+            $psExe = (Get-Command powershell.exe).Source
+            Write-Log "pwsh.exe (PS7) not found - falling back to powershell.exe (PS5)." 'Yellow'
+            Write-Log "Some install scripts (install_intellect.ps1) require PS7 and will fail." 'Yellow'
+        }
+
         $pwshArgs = @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass',
             '-File', $scriptPath,
             '-ConfigFile', $cfgPath
         )
-        Write-Log "Invoking: powershell.exe $($pwshArgs -join ' ')" 'DarkGray'
-        & powershell.exe @pwshArgs
+        Write-Log "Invoking: $psExe $($pwshArgs -join ' ')" 'DarkGray'
+        & $psExe @pwshArgs
         $rc = $LASTEXITCODE
         if ($rc -ne 0) {
             Write-Log "Step exited with code $rc (non-zero)." 'Red'
