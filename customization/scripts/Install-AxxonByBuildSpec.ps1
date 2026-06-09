@@ -287,7 +287,10 @@ function Resolve-InstallPlan {
 
 # ===================== BUILD PLAN =====================
 Write-Log "Building install plan..." 'Yellow'
-$plan = Resolve-InstallPlan -Software $axxonsoft -InstallVar $axxonInst
+# @(...) ОБЯЗАТЕЛЕН: PowerShell разворачивает функцию-возвращающую-массив-из-одного-элемента
+# обратно в этот элемент. Если plan содержит 1 hashtable, без @() $plan станет hashtable,
+# и $plan.Count вернёт число ключей (4), а $plan[$i] вернёт null - получим N SKIP без причин.
+$plan = @(Resolve-InstallPlan -Software $axxonsoft -InstallVar $axxonInst)
 
 if ($plan.Count -eq 0) {
     Write-Log "No Axxon software requested (axxonsoft not set). Skipping." 'Gray'
@@ -329,7 +332,7 @@ if ($DryRun) {
     exit 0
 }
 
-$execSteps = $plan | Where-Object { $_.Action -eq 'RUN' }
+$execSteps = @($plan | Where-Object { $_.Action -eq 'RUN' })
 if ($execSteps.Count -eq 0) {
     Write-Log "Nothing to execute (all steps skipped or no plan)." 'Gray'
     Write-Log "=== Install-AxxonByBuildSpec finished (nothing to do) ===" 'Cyan'
