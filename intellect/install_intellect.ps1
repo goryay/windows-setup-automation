@@ -908,6 +908,20 @@ function Install-Intellect-Base-Unified {
 
             if (-not $sqlFound) {
                 Write-Info "Server: SQL не найден — ставлю SQL Express (DEFAULT MSSQLSERVER) из Redist..."
+                # WORKAROUND: HTTP-listing /hash/<dir>/ возвращает только файлы, без подкаталогов.
+                # Mirror-ShareDir рекурсивно не находит "Redist/SQL Server Express" (родительский
+                # листинг для "Redist/" приходит пустым). Принудительно тянем эту подпапку.
+                # Когда listing-сервис починят (начнёт включать подкаталоги в JSON), этот вызов
+                # станет no-op (mirror просто перепроверит уже скачанные файлы).
+                try {
+                    $sqlRel    = "$baseRel/Redist/SQL Server Express"
+                    $sqlLocal  = Join-Path $baseLocal "Redist\SQL Server Express"
+                    Write-Info ("Force-mirror SQL Express folder: /hash/{0}" -f $sqlRel)
+                    Mirror-ShareDir -RelPath $sqlRel -LocalRoot $sqlLocal -ProgressId 22
+                } catch {
+                    Write-Warn ("Force-mirror of SQL Server Express failed: {0}" -f $_.Exception.Message)
+                    Write-Warn "Ensure-SqlDefaultInstance will likely fail. Check HTTP listing service."
+                }
                 try { Ensure-SqlDefaultInstance -BaseDstFolder $baseLocal }
                 catch { throw "Server: не удалось установить SQL Express. Причина: $($_.Exception.Message)" }
                 $SqlInstance = '(local)'
