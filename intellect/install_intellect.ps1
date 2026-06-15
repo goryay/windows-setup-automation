@@ -482,6 +482,31 @@ IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = N'NT AUTHORITY\N
 EXEC sp_addsrvrolemember N'NT AUTHORITY\NETWORK SERVICE', N'sysadmin';
 "@
 
+    # Способ 1 (ОСНОВНОЙ): .NET SqlClient через ADO.NET.
+    # System.Data.SqlClient встроен в Windows + .NET Framework, не требует SQL CLU
+    # или модулей PowerShell. Это устраняет зависимость от внешних инструментов.
+    # В PS7 при необходимости подгружаем сборку явно.
+    try {
+        try { Add-Type -AssemblyName 'System.Data' -ErrorAction SilentlyContinue } catch {}
+        $connStr = "Server=$Server;Integrated Security=true;Connect Timeout=10"
+        $conn = New-Object System.Data.SqlClient.SqlConnection $connStr
+        $conn.Open()
+        try {
+            $cmd = $conn.CreateCommand()
+            $cmd.CommandText = $q
+            $cmd.CommandTimeout = 30
+            [void]$cmd.ExecuteNonQuery()
+            Write-Info "SQL права выданы (.NET SqlClient): BUILTIN\Администраторы + NT AUTHORITY\NETWORK SERVICE"
+            return
+        } finally {
+            $conn.Close()
+            $conn.Dispose()
+        }
+    } catch {
+        Write-Warn ("SqlClient попытка не удалась: {0}. Пробую sqlcmd/Invoke-Sqlcmd..." -f $_.Exception.Message)
+    }
+
+    # Способ 2 (fallback): sqlcmd.exe если установлены SQL Server Command Line Utilities
     $sqlcmd = Get-Command sqlcmd.exe -ErrorAction SilentlyContinue
     if ($sqlcmd) {
         $tmpSql = [System.IO.Path]::GetTempFileName() + ".sql"
@@ -499,6 +524,7 @@ EXEC sp_addsrvrolemember N'NT AUTHORITY\NETWORK SERVICE', N'sysadmin';
         }
     }
 
+    # Способ 3 (fallback): Invoke-Sqlcmd из модуля SqlServer/SQLPS
     try { Import-Module SQLPS -DisableNameChecking -ErrorAction SilentlyContinue | Out-Null } catch {}
     try { if (Get-Module -ListAvailable -Name SqlServer) { Import-Module SqlServer -ErrorAction SilentlyContinue | Out-Null } } catch {}
 
@@ -508,7 +534,7 @@ EXEC sp_addsrvrolemember N'NT AUTHORITY\NETWORK SERVICE', N'sysadmin';
         return
     }
 
-    throw "Не найден ни sqlcmd.exe, ни Invoke-Sqlcmd. Установи SQL Server Command Line Utilities."
+    throw "Не удалось выдать SQL права ни одним из способов (.NET SqlClient, sqlcmd, Invoke-Sqlcmd)."
 }
 
 function Find-InstalledPath([string]$PreferredInstallDir) {
