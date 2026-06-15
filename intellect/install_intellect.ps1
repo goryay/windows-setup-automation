@@ -876,7 +876,12 @@ function Install-Intellect-Base-Unified {
         Mirror-ShareDir -RelPath $baseRel -LocalRoot $baseLocal -ProgressId 20
         Write-Ok "base скачан"
 
-        # Некоторые /hash возвращают только файлы верхнего уровня — докачиваем подпапки явно
+        # Некоторые /hash возвращают только файлы верхнего уровня — докачиваем подпапки явно.
+        # WORKAROUND: HTTP-listing-сервис на сервере не отдаёт подкаталоги в JSON
+        # (например /hash/<base>/Redist/ возвращает {}), поэтому Mirror-ShareDir рекурсивно
+        # не находит нужные prerequisites. Перечисляем все известные подпапки явно.
+        # ПРИМЕЧАНИЕ: список нужно поддерживать в актуальном состоянии при изменениях
+        # структуры на сервере. Когда listing-сервис починят - блок станет no-op.
         $extraDirs = @(
             "languages/Setup",
             "languages/Setup/ru",
@@ -884,7 +889,26 @@ function Install-Intellect-Base-Unified {
             "Drivers",
             "Key",
             "Redist",
-            "ipint.driverpack"
+            "ipint.driverpack",
+            # Каждая подпапка Redist отдельно - без этого setup.exe не находит VC++/.NET/SQL/...
+            "Redist/Acrobat Reader",
+            "Redist/CamMonitor",
+            "Redist/Dotnet4.6",
+            "Redist/Elasticsearch",
+            "Redist/Fonts",
+            "Redist/Java",
+            "Redist/MSXML 40 SP2",
+            "Redist/ReportViewer",
+            "Redist/SQL Server Express",
+            "Redist/VC2005_SP1",
+            "Redist/VC2010_x64_Runtime",
+            "Redist/VC2010_x86_Runtime",
+            "Redist/VC2013",
+            "Redist/VC2013/x64",
+            "Redist/VC2013/x86",
+            "Redist/VC2017",
+            "Redist/VC2017/x64",
+            "Redist/VC2017/x86"
         )
         foreach ($d in $extraDirs) {
             try {
@@ -908,20 +932,6 @@ function Install-Intellect-Base-Unified {
 
             if (-not $sqlFound) {
                 Write-Info "Server: SQL не найден — ставлю SQL Express (DEFAULT MSSQLSERVER) из Redist..."
-                # WORKAROUND: HTTP-listing /hash/<dir>/ возвращает только файлы, без подкаталогов.
-                # Mirror-ShareDir рекурсивно не находит "Redist/SQL Server Express" (родительский
-                # листинг для "Redist/" приходит пустым). Принудительно тянем эту подпапку.
-                # Когда listing-сервис починят (начнёт включать подкаталоги в JSON), этот вызов
-                # станет no-op (mirror просто перепроверит уже скачанные файлы).
-                try {
-                    $sqlRel    = "$baseRel/Redist/SQL Server Express"
-                    $sqlLocal  = Join-Path $baseLocal "Redist\SQL Server Express"
-                    Write-Info ("Force-mirror SQL Express folder: /hash/{0}" -f $sqlRel)
-                    Mirror-ShareDir -RelPath $sqlRel -LocalRoot $sqlLocal -ProgressId 22
-                } catch {
-                    Write-Warn ("Force-mirror of SQL Server Express failed: {0}" -f $_.Exception.Message)
-                    Write-Warn "Ensure-SqlDefaultInstance will likely fail. Check HTTP listing service."
-                }
                 try { Ensure-SqlDefaultInstance -BaseDstFolder $baseLocal }
                 catch { throw "Server: не удалось установить SQL Express. Причина: $($_.Exception.Message)" }
                 $SqlInstance = '(local)'
