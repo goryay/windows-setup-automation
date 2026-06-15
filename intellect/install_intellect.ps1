@@ -472,14 +472,30 @@ function Ensure-SqlDefaultInstance {
 function Ensure-IntellectSqlRights {
     param([Parameter(Mandatory=$true)][string]$Server)
 
+    # BUILTIN\Administrators на русской Windows локализовано как BUILTIN\Администраторы.
+    # IF NOT EXISTS с английским именем не находит локализованный логин и пробует
+    # CREATE LOGIN [BUILTIN\Administrators] FROM WINDOWS - падает с "user not found".
+    # Поэтому каждый блок оборачиваем в TRY/CATCH: если логин уже есть в нужной
+    # локализации, или CREATE LOGIN не может разрешить имя - пропускаем.
+    # NT AUTHORITY\NETWORK SERVICE - well-known SID, английское имя работает везде.
     $q = @"
-IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = N'BUILTIN\Administrators')
-  CREATE LOGIN [BUILTIN\Administrators] FROM WINDOWS;
-EXEC sp_addsrvrolemember N'BUILTIN\Administrators', N'sysadmin';
+BEGIN TRY
+    IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE sid = SUSER_SID(N'BUILTIN\Administrators'))
+        CREATE LOGIN [BUILTIN\Administrators] FROM WINDOWS;
+END TRY BEGIN CATCH END CATCH
 
-IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = N'NT AUTHORITY\NETWORK SERVICE')
-  CREATE LOGIN [NT AUTHORITY\NETWORK SERVICE] FROM WINDOWS;
-EXEC sp_addsrvrolemember N'NT AUTHORITY\NETWORK SERVICE', N'sysadmin';
+BEGIN TRY
+    EXEC sp_addsrvrolemember N'BUILTIN\Administrators', N'sysadmin';
+END TRY BEGIN CATCH END CATCH
+
+BEGIN TRY
+    IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = N'NT AUTHORITY\NETWORK SERVICE')
+        CREATE LOGIN [NT AUTHORITY\NETWORK SERVICE] FROM WINDOWS;
+END TRY BEGIN CATCH END CATCH
+
+BEGIN TRY
+    EXEC sp_addsrvrolemember N'NT AUTHORITY\NETWORK SERVICE', N'sysadmin';
+END TRY BEGIN CATCH END CATCH
 "@
 
     # Способ 1 (ОСНОВНОЙ): .NET SqlClient через ADO.NET.
