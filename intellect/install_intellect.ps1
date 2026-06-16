@@ -446,6 +446,29 @@ function Ensure-WebReportPrereqs {
     Write-Warn ("SQL Browser не доступен: {0}. CA SilentSelectServerInstances может упасть." -f $_.Exception.Message)
   }
 
+  # .NET Framework 3.5 - SFXCA Custom Actions Web Report'a собраны под .NET 2.0/3.5.
+  # На Win10/11 NetFx3 по умолчанию ВЫКЛЮЧЕН. Если не включить - при запуске CA
+  # вылетает диалог "установить .NET 3.5", в /qn режиме он не нажимается, CA
+  # не отрабатывает -> MSI exit 1603. Включаем через DISM.
+  try {
+    $netfx3 = Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction Stop
+    if ($netfx3.State -ne 'Enabled') {
+      Write-Info "Включаю .NET Framework 3.5 (NetFx3) - может потребоваться интернет/WU..."
+      $r = Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -LimitAccess -ErrorAction Stop
+      if ($r.RestartNeeded) {
+        Write-Warn ".NET Framework 3.5 включён, требуется перезагрузка. Web Report CA может всё равно работать сразу - попробуем."
+      } else {
+        Write-Ok ".NET Framework 3.5 включён."
+      }
+    } else {
+      Write-Info ".NET Framework 3.5 уже установлен."
+    }
+  } catch {
+    Write-Warn (".NET Framework 3.5 включить не удалось: {0}" -f $_.Exception.Message)
+    Write-Warn "Web Report CA SilentSelectServerInstances может попросить .NET 3.5 диалогом - MSI упадёт 1603."
+    Write-Warn "Установи руками: Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All"
+  }
+
   try {
     $iisreset = Join-Path $env:SystemRoot "System32\iisreset.exe"
     if (Test-Path $iisreset) { Start-Process -FilePath $iisreset -ArgumentList "/noforce" -Wait | Out-Null }
