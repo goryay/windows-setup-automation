@@ -818,7 +818,25 @@ function Install-AddonFolder {
 
       $mstRel = Get-RuTransformRel -DstFolder $DstFolder
 
-      $r = Install-Msi-Quiet -MsiPath $msi -TransformsRel $mstRel
+      # Web Report MSI требует в quiet-режиме явных свойств, иначе CA "ConnectionString
+      # не инициализировано" -> exit 1603. Дефолты MSI: LICENSE_ACCEPTED=0 (отказ),
+      # IS_SQL_NOT_LOCAL=1 (ожидает удалённый SQL). Для нашего сценария (локальный
+      # MSSQLSERVER, Windows-auth) надо переопределить.
+      $sql = $script:SqlSettings
+      $sqlInst = if ($sql -and $sql.Instance) { $sql.Instance } else { '(local)' }
+      $sqlAuth = if ($sql -and $sql.AuthType) { $sql.AuthType } else { 'Windows' }
+      # Локальность определяем по имени инстанса: (local), localhost, "." и пустой - локальный.
+      $isLocal = $true
+      if ($sqlInst -notmatch '^(\(local\)|localhost|\.|)$' -and $sqlInst -notlike "$env:COMPUTERNAME*") {
+        # Если инстанс выглядит как имя/IP другой машины - значит удалённый.
+        if ($sqlInst -match '\\') { $isLocal = $true }  # (local)\INSTANCE - всё ещё локально
+        else { $isLocal = $false }
+      }
+      $isSqlNotLocal = if ($isLocal) { '0' } else { '1' }
+      $wrProps = ('LICENSE_ACCEPTED="1" SQL_INSTANCE="{0}" SQL_AUTHTYPE="{1}" IS_SQL_NOT_LOCAL="{2}"' -f $sqlInst, $sqlAuth, $isSqlNotLocal)
+      Write-Info ("WEB_REPORT: MSI extra props: {0}" -f $wrProps)
+
+      $r = Install-Msi-Quiet -MsiPath $msi -TransformsRel $mstRel -ExtraProps $wrProps
       if ($r.Ok) {
         Ok "WEB_REPORT: установлен тихо через MSI."
         return
@@ -831,7 +849,9 @@ function Install-AddonFolder {
       $stamp = Get-Date
       $log = Join-Path $Logs ("setup_" + (Get-Date -Format "yyyyMMdd_HHmmss") + "_web_report.log")
 
-      $p = Start-Process -FilePath $exe -WorkingDirectory $DstFolder -ArgumentList "/quiet /norestart" -PassThru
+      # setup.exe -> msiexec изнутри, то же тихое + те же свойства. Иначе fallback бесполезен.
+      $setupArgs = ('/quiet /norestart /CMD="{0}"' -f ($wrProps -replace '"','\"'))
+      $p = Start-Process -FilePath $exe -WorkingDirectory $DstFolder -ArgumentList $setupArgs -PassThru
       $finished = $true
       try {
         $finished = $p.WaitForExit(30 * 60 * 1000)
