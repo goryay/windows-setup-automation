@@ -13,14 +13,20 @@
                      известен формат вывода storcli show с целевого сервера.
 
 .PARAMETER UsbRoot
-    Корень USB-флешки (где config\build_spec.txt). Обязательный.
+    Корень USB-флешки (где config\). Обязательный.
+
+.PARAMETER ConfigPath
+    Явный путь к файлу конфигурации. Если задан - используется как есть.
+
+.PARAMETER ConfigDir
+    Папка где искать SL*.txt. По умолчанию <UsbRoot>\config.
 
 .PARAMETER ConfigRelPath
-    Путь к конфигу относительно UsbRoot. По умолчанию config\build_spec.txt.
+    Legacy: относительный путь к build_spec.txt. Если задан - имеет приоритет
+    над auto-discovery.
 
 .PARAMETER Execute
     Реально создавать массивы через storcli. БЕЗ него - только dry-run план.
-    (Пока НЕ реализовано - заглушка, чтобы случайно не тронуть железо.)
 
 .NOTES
     Формат группы в build_spec (пример реальной машины):
@@ -34,9 +40,13 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$UsbRoot,
-    [string]$ConfigRelPath = 'config\build_spec.txt',
+    [string]$ConfigPath,
+    [string]$ConfigDir,
+    [string]$ConfigRelPath,
     [switch]$Execute
 )
+
+if (-not $ConfigDir) { $ConfigDir = Join-Path $UsbRoot 'config' }
 
 $ErrorActionPreference = 'Stop'
 
@@ -118,12 +128,59 @@ function Get-RaidGroups {
     return $groups
 }
 
+# ===================== ПОИСК ФАЙЛА КОНФИГА =====================
+# Тот же приоритет что в apply_build_spec.ps1 и Install-AxxonByBuildSpec.ps1:
+#   1. -ConfigPath (явный)
+#   2. -ConfigRelPath (legacy)
+#   3. Auto-discovery в $ConfigDir: SL*-*.txt -> build_spec.txt
+function Resolve-ConfigPath {
+    param([string]$Explicit, [string]$RelPath, [string]$Dir, [string]$RootDir)
+
+    if ($Explicit) {
+        if (Test-Path -LiteralPath $Explicit) { return $Explicit }
+        Write-Log "Explicit -ConfigPath not found: $Explicit" 'Red'
+        return $null
+    }
+    if ($RelPath) {
+        $p = Join-Path $RootDir $RelPath
+        if (Test-Path -LiteralPath $p) { return $p }
+        Write-Log "Explicit -ConfigRelPath not found: $p" 'Red'
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $Dir)) {
+        Write-Log "Config dir does not exist: $Dir" 'Yellow'
+        return $null
+    }
+
+    $slCandidates = @(Get-ChildItem -Path $Dir -Filter 'SL*.txt' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^SL\w+-\w+(\s+\d+)?\.txt$' } |
+        Sort-Object LastWriteTime -Descending)
+    if ($slCandidates.Count -ge 1) {
+        if ($slCandidates.Count -gt 1) {
+            Write-Log "Found $($slCandidates.Count) SL*-*.txt files in $Dir - taking newest:" 'Yellow'
+            foreach ($c in $slCandidates) {
+                Write-Log ("  - {0}  ({1})" -f $c.Name, $c.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) 'Gray'
+            }
+        }
+        return $slCandidates[0].FullName
+    }
+
+    $legacy = Join-Path $Dir 'build_spec.txt'
+    if (Test-Path -LiteralPath $legacy) {
+        Write-Log "No SL*-*.txt found in $Dir, using legacy build_spec.txt." 'Gray'
+        return $legacy
+    }
+    return $null
+}
+
 # ===================== ОСНОВНАЯ ЛОГИКА =====================
-$configPath = Join-Path $UsbRoot $ConfigRelPath
-if (-not (Test-Path -LiteralPath $configPath)) {
-    Write-Log "Config not found at $configPath - nothing to do." 'Yellow'
+$configPath = Resolve-ConfigPath -Explicit $ConfigPath -RelPath $ConfigRelPath -Dir $ConfigDir -RootDir $UsbRoot
+if (-not $configPath) {
+    Write-Log "No config file found - nothing to do." 'Yellow'
+    Write-Log "Tried: explicit=$ConfigPath, rel=$ConfigRelPath, dir=$ConfigDir (SL*-*.txt or build_spec.txt)" 'Gray'
     exit 0
 }
+Write-Log "Config: $configPath" 'Green'
 
 $spec   = Read-BuildSpec -Path $configPath
 $groups = Get-RaidGroups -Spec $spec

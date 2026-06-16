@@ -66,6 +66,8 @@ param(
     [string]$ConfigRelPath,
     [string]$IntellectRoot,
     [string]$IntellectXRoot,
+    [string]$LicenseMapPath,
+    [string]$InstallMapPath,
     [switch]$DryRun,
     [string]$LogPath
 )
@@ -76,6 +78,8 @@ $ErrorActionPreference = 'Stop'
 if (-not $IntellectRoot)  { $IntellectRoot  = Join-Path $UsbRoot 'intellect'  }
 if (-not $IntellectXRoot) { $IntellectXRoot = Join-Path $UsbRoot 'intellectx' }
 if (-not $ConfigDir)      { $ConfigDir      = Join-Path $UsbRoot 'config'    }
+if (-not $LicenseMapPath) { $LicenseMapPath = Join-Path $UsbRoot 'customization\axxon_module_map.json' }
+if (-not $InstallMapPath) { $InstallMapPath = Join-Path $UsbRoot 'customization\axxon_addon_install_map.json' }
 if (-not $LogPath) {
     $logDir = Join-Path $env:ProgramData 'IPDROM\Logs'
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -190,13 +194,212 @@ try {
 Write-Log "Parsed $($spec.Count) key(s) from config." 'Gray'
 
 # Извлекаем нужные ключи. Все необязательны - если их нет, просто выходим.
-$axxonsoft   = if ($spec.ContainsKey('axxonsoft'))         { $spec['axxonsoft'].ToLower().Trim() }       else { $null }
-$axxonInst   = if ($spec.ContainsKey('axxonsoft_install')) { $spec['axxonsoft_install'].ToLower().Trim() } else { $null }
-$axxonLS     = if ($spec.ContainsKey('axxon_LS'))          { $spec['axxon_LS'].ToUpper().Trim() }         else { $null }
+$axxonsoft     = if ($spec.ContainsKey('axxonsoft'))         { $spec['axxonsoft'].ToLower().Trim() }       else { $null }
+$axxonInst     = if ($spec.ContainsKey('axxonsoft_install')) { $spec['axxonsoft_install'].ToLower().Trim() } else { $null }
+$axxonLS       = if ($spec.ContainsKey('axxon_LS'))          { $spec['axxon_LS'].ToUpper().Trim() }         else { $null }
+$axxonAddons   = if ($spec.ContainsKey('axxonsoft_addons'))  { $spec['axxonsoft_addons'] }                  else { $null }
 
 Write-Log "axxonsoft         = $axxonsoft"
 Write-Log "axxonsoft_install = $axxonInst"
 Write-Log "axxon_LS          = $axxonLS"
+Write-Log "axxonsoft_addons  = $(if ($axxonAddons) { '(' + ($axxonAddons -split ';').Where({$_.Trim()}).Count + ' items)' } else { '(empty)' })"
+
+# ===================== ADDONS PARSER =====================
+# Парсит axxonsoft_addons из SL: формат "/Name1::Cat1;/Name2::Cat2;...".
+# Левая часть :: ищется в axxon_module_map.json -> Module Win,
+# затем Module Win в axxon_addon_install_map.json -> [addon-codes].
+# Возвращает unique список addon-кодов для install_intellect[x].ps1.
+# Значения с префиксом _TODO_ - неверифицированные mapping'и, пропускаются с warning'ом.
+function Resolve-AddonsFromBuildSpec {
+    param(
+        [string]$Spec,                # значение axxonsoft_addons из SL
+        [string]$Family,              # 'intellect' | 'intellectx' | 'axxon_next'
+        [string]$LicenseMapPath,      # путь к axxon_module_map.json
+        [string]$InstallMapPath       # путь к axxon_addon_install_map.json
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Spec)) {
+        Write-Log "  No axxonsoft_addons in SL - skipping addon mapping." 'Gray'
+        return @()
+    }
+
+    if (-not (Test-Path -LiteralPath $LicenseMapPath)) {
+        Write-Log "  License map not found: $LicenseMapPath - cannot resolve addons." 'Yellow'
+        return @()
+    }
+    if (-not (Test-Path -LiteralPath $InstallMapPath)) {
+        Write-Log "  Install map not found: $InstallMapPath - cannot resolve addons." 'Yellow'
+        return @()
+    }
+
+    try {
+        $licenseJson = Get-Content -LiteralPath $LicenseMapPath -Raw | ConvertFrom-Json
+        $installJson = Get-Content -LiteralPath $InstallMapPath -Raw | ConvertFrom-Json
+    } catch {
+        Write-Log "  Failed to parse mapping JSON: $_" 'Red'
+        return @()
+    }
+
+    $familyMap = $installJson.$Family
+    if (-not $familyMap) {
+        Write-Log "  Install map has no '$Family' section - skipping." 'Yellow'
+        return @()
+    }
+
+    $items = $Spec -split ';' | Where-Object { $_.Trim() -ne '' }
+    Write-Log "  Parsed $($items.Count) addon items from SL axxonsoft_addons." 'Gray'
+
+    $codes = New-Object 'System.Collections.Generic.HashSet[string]'
+    $hasGuardant = $false
+    foreach ($item in $items) {
+        $clean = $item.Trim().TrimStart('/').TrimEnd(';').Trim()
+        if (-not $clean) { continue }
+        $licName = if ($clean -match '^(.+?)::') { $matches[1].Trim() } else { $clean }
+
+        # Lookup Module Win
+        $moduleWin = $null
+        if ($licenseJson.entries.PSObject.Properties.Match($licName).Count -gt 0) {
+            $moduleWin = $licenseJson.entries.$licName
+        }
+        if (-not $moduleWin) {
+            Write-Log "    ?  '$licName' - не найден в license map (Excel)" 'Yellow'
+            continue
+        }
+
+        # Special: Guardant key - управляет флагом guardant.remove в JSON конфиге.
+        # Не идёт в addons[] (отдельный механизм install_intellect.ps1).
+        if ($moduleWin -eq 'Ключ Guardant') {
+            $hasGuardant = $true
+            Write-Log "    G  '$licName' -> Guardant ключ требуется (install_intellect не будет снимать)" 'Green'
+            continue
+        }
+
+        # Lookup addon codes for this Module Win
+        $addonCodes = $null
+        if ($familyMap.PSObject.Properties.Match($moduleWin).Count -gt 0) {
+            $addonCodes = $familyMap.$moduleWin
+        }
+        if ($null -eq $addonCodes) {
+            Write-Log "    !  '$licName' -> Module Win '$moduleWin' - нет mapping в install_map для $Family. Допиши вручную." 'Yellow'
+            continue
+        }
+        if ($addonCodes.Count -eq 0) {
+            Write-Log "    .  '$licName' -> '$moduleWin' -> [] (ничего не ставится, настраивается в UI)" 'DarkGray'
+            continue
+        }
+
+        foreach ($code in @($addonCodes)) {
+            if ($code -match '^_TODO_') {
+                Write-Log "    ~  '$licName' -> '$moduleWin' -> '$code' - НЕ ВЕРИФИЦИРОВАН на сервере, пропускаю" 'Yellow'
+                continue
+            }
+            if ($code) {
+                [void]$codes.Add($code)
+                Write-Log "    +  '$licName' -> '$moduleWin' -> '$code'" 'Green'
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Addons      = @($codes)
+        HasGuardant = $hasGuardant
+    }
+}
+
+# Готовит и сохраняет временный JSON-конфиг расширенный addon'ами для install_intellect[x].ps1.
+# Берёт базовый конфиг (server.json/serverclient.json/etc), добавляет в его addons[] коды
+# полученные из SL axxonsoft_addons. Возвращает путь к временному JSON для -ConfigFile.
+function Build-ExtendedAxxonConfig {
+    param(
+        [string]$BaseConfigPath,
+        [string[]]$ExtraAddons,
+        [bool]$HasGuardant,
+        [string]$Family   # 'intellect' | 'intellectx' | 'axxon_next'
+    )
+
+    if (-not (Test-Path -LiteralPath $BaseConfigPath)) {
+        Write-Log "  Base config not found: $BaseConfigPath" 'Red'
+        return $BaseConfigPath
+    }
+
+    try {
+        $base = Get-Content -LiteralPath $BaseConfigPath -Raw | ConvertFrom-Json
+    } catch {
+        Write-Log "  Failed to parse base config: $_" 'Red'
+        return $BaseConfigPath
+    }
+
+    # --- addons[] ---
+    $modified = $false
+    if ($ExtraAddons -and $ExtraAddons.Count -gt 0) {
+        $current = @()
+        if ($base.PSObject.Properties.Match('addons').Count -gt 0 -and $base.addons) {
+            $current = @($base.addons)
+        }
+        $merged = @($current + $ExtraAddons | Sort-Object -Unique)
+        if ($base.PSObject.Properties.Match('addons').Count -gt 0) {
+            $base.addons = $merged
+        } else {
+            $base | Add-Member -MemberType NoteProperty -Name addons -Value $merged
+        }
+        Write-Log "  Merged addons: [$($merged -join ', ')]" 'Gray'
+        $modified = $true
+    }
+
+    # --- Guardant flag: разный schema у classic vs IntellectX ---
+    # classic: guardant.remove (nested)        - inverse семантика: true = снять
+    # intellectx: removeGuardant (flat)        - inverse семантика: true = снять
+    # SL HasGuardant=true означает "ставить ключ" -> remove = false
+    # SL HasGuardant=false означает "не ставить"  -> remove = true
+    $removeGuardant = -not $HasGuardant
+    if ($Family -eq 'intellect') {
+        # Ensure guardant: { remove: <bool> }
+        if ($base.PSObject.Properties.Match('guardant').Count -gt 0) {
+            if ($base.guardant.PSObject.Properties.Match('remove').Count -gt 0) {
+                $oldVal = $base.guardant.remove
+                $base.guardant.remove = $removeGuardant
+                if ($oldVal -ne $removeGuardant) {
+                    Write-Log "  guardant.remove: $oldVal -> $removeGuardant (SL has Guardant=$HasGuardant)" 'Cyan'
+                    $modified = $true
+                }
+            } else {
+                $base.guardant | Add-Member -MemberType NoteProperty -Name remove -Value $removeGuardant
+                Write-Log "  guardant.remove: ADDED = $removeGuardant" 'Cyan'
+                $modified = $true
+            }
+        } else {
+            $base | Add-Member -MemberType NoteProperty -Name guardant -Value ([pscustomobject]@{ remove = $removeGuardant })
+            Write-Log "  guardant: ADDED { remove = $removeGuardant }" 'Cyan'
+            $modified = $true
+        }
+    } elseif ($Family -eq 'intellectx') {
+        # Ensure removeGuardant: <bool>
+        if ($base.PSObject.Properties.Match('removeGuardant').Count -gt 0) {
+            $oldVal = $base.removeGuardant
+            $base.removeGuardant = $removeGuardant
+            if ($oldVal -ne $removeGuardant) {
+                Write-Log "  removeGuardant: $oldVal -> $removeGuardant (SL has Guardant=$HasGuardant)" 'Cyan'
+                $modified = $true
+            }
+        } else {
+            $base | Add-Member -MemberType NoteProperty -Name removeGuardant -Value $removeGuardant
+            Write-Log "  removeGuardant: ADDED = $removeGuardant" 'Cyan'
+            $modified = $true
+        }
+    }
+
+    if (-not $modified) {
+        # Ничего не поменялось - возвращаем оригинальный путь
+        return $BaseConfigPath
+    }
+
+    $tmpDir = Join-Path $env:TEMP 'IPDROM_axxon_cfg'
+    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    $tmpPath = Join-Path $tmpDir ("config_{0}.json" -f (Get-Date -Format 'yyyyMMddHHmmssfff'))
+    $base | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $tmpPath -Encoding utf8
+    Write-Log "  Extended config -> $tmpPath" 'Gray'
+    return $tmpPath
+}
 
 # ===================== MAPPING TABLE =====================
 # Возвращает массив hashtable: каждый элемент - один installer call.
@@ -304,6 +507,17 @@ if ($plan.Count -eq 0) {
             $cfgPath    = Join-Path $rootDir $step.Config
             Write-Log ("  [{0}] RUN  {1} -ConfigFile {2}" -f ($i+1), $scriptPath, $cfgPath) 'Gray'
             if ($step.ContainsKey('Note')) { Write-Log ("       note: $($step.Note)") 'DarkGray' }
+
+            # Resolve addons preview (для visibility - что добавится из SL)
+            $r = Resolve-AddonsFromBuildSpec `
+                -Spec $axxonAddons `
+                -Family $step.Family `
+                -LicenseMapPath $LicenseMapPath `
+                -InstallMapPath $InstallMapPath
+            if ($r.Addons.Count -gt 0) {
+                Write-Log ("       extra addons from SL: [{0}]" -f (@($r.Addons) -join ', ')) 'Cyan'
+            }
+            Write-Log ("       Guardant required by SL: {0}" -f $r.HasGuardant) 'Cyan'
         } else {
             Write-Log ("  [{0}] SKIP {1}" -f ($i+1), $step.Reason) 'Yellow'
         }
@@ -362,6 +576,26 @@ foreach ($step in $execSteps) {
         $failures++
         continue
     }
+
+    # Resolve addons from SL axxonsoft_addons -> Module Win -> install-addon-codes,
+    # + extract HasGuardant flag for guardant install/remove decision.
+    Write-Log "Resolving addons from SL axxonsoft_addons..." 'Yellow'
+    $resolved = Resolve-AddonsFromBuildSpec `
+        -Spec $axxonAddons `
+        -Family $step.Family `
+        -LicenseMapPath $LicenseMapPath `
+        -InstallMapPath $InstallMapPath
+    $extraAddons = @($resolved.Addons)
+    $hasGuardant = [bool]$resolved.HasGuardant
+    Write-Log ("Extra addons from SL: [{0}]" -f ($extraAddons -join ', ')) 'Cyan'
+    Write-Log ("Guardant in SL:       {0}" -f $hasGuardant) 'Cyan'
+
+    $cfgPath = Build-ExtendedAxxonConfig `
+        -BaseConfigPath $cfgPath `
+        -ExtraAddons $extraAddons `
+        -HasGuardant $hasGuardant `
+        -Family $step.Family
+    Write-Log "Effective config: $cfgPath" 'Gray'
 
     try {
         # Выбор PS engine: install_intellect.ps1 требует PS7 (pwsh.exe),

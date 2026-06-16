@@ -637,6 +637,27 @@ function Get-FioTargetDriveLetters {
     }
 
     $storCli = Find-StorCliPath -UsbRoot $UsbRoot
+
+    # SL-driven RAID: apply_raid_groups читает group_* из SL-файла и создаёт VD по каждой
+    # data-группе через StorCLI. Запускаем ДО legacy raid_config.json проверки.
+    # Скрипт сам skip'ает system-группы и группы без подходящих дисков.
+    # Если SL нет или в нём нет group_* - apply_raid_groups просто выйдет 0.
+    $raidGroupsScript = Join-Path $UsbRoot 'customization\scripts\apply_raid_groups.ps1'
+    if (Test-Path $raidGroupsScript) {
+        Write-ColorOutput '  Running apply_raid_groups (SL-driven RAID creation)...' 'Yellow'
+        Write-RaidLog '========== apply_raid_groups =========='
+        try {
+            & $raidGroupsScript -UsbRoot $UsbRoot -Execute
+            if ($LASTEXITCODE -ne 0) {
+                Write-RaidLog "apply_raid_groups exited with $LASTEXITCODE (continuing with legacy fallback)"
+            }
+        } catch {
+            Write-RaidLog "apply_raid_groups failed: $_  (continuing with legacy fallback)"
+        }
+    } else {
+        Write-RaidLog "apply_raid_groups.ps1 not found at $raidGroupsScript - using legacy raid_config.json only."
+    }
+
     $raidCfg = Get-RaidConfig -UsbRoot $UsbRoot
     $megaRaidVdExists = Get-MegaRaidVirtualDriveState -StorCliPath $storCli
 
