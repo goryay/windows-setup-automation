@@ -1,0 +1,52 @@
+{
+  "description": "Module Win (из axxon_module_map.json, который parsed из win (v2).xlsx) -> массив реальных addon-кодов (имён подпапок на HTTP-сервере /axxonsoft/<product>/<exe|msi>/main/addons/). Парсер пропускает значения с префиксом _TODO_. Пустой массив [] = ничего ставить не надо, фича настраивается через UI клиента или уже включена в base.",
+
+  "intellect": {
+    "_server_path":                      "axxonsoft/intellectx/exe/main/addons/  (фактический путь, intellectx в URL для classic - historical)",
+    "_available":                        ["acfa", "auto", "face", "pos", "web_report"],
+
+    "Client":                            [],
+    "Интеллект":                         [],
+    "Ключ Guardant":                     [],
+    "Интеллект ACFA":                    ["acfa"],
+    "Auto-Интеллект":                    ["auto"],
+    "Face-Интеллект":                    ["face"],
+    "POS-Интеллект":                     ["pos"],
+    "Detector Pack":                     ["_TODO_no_addon_on_server"],
+    "Detector Pack/Auto-Интеллект":      ["auto", "_TODO_no_detector_pack"],
+    "Подсистема Analytic Pack":          ["_TODO_no_addon_on_server"],
+    "Агент контроля":                    ["_TODO_no_monitoring_addon"],
+    "Пакет аналитики VI":                ["_TODO_no_addon_on_server"],
+    "Пакет аналитики VI / Базовый пакет DetectorPack": ["_TODO_no_addon_on_server"],
+    "-":                                 []
+  },
+
+  "intellectx": {
+    "_server_path":                      "axxonsoft/intellectx/msi/main/addons/",
+    "_available":                        ["acfa", "face_recognition", "iv_audioanalytics", "neuro_pack", "report", "rr_lpr", "rr_sdk", "tva_crowd", "vi", "vi_face_recongnition", "vl_analytics", "vl_face_recognition", "vl_fight", "vl_ppe", "vl_sdk", "vt_lpr"],
+
+    "ServerClient":                                    [],
+    "Ключ Guardant":                                   [],
+    "AxACFA":                                          ["acfa"],
+    "Интеллект ACFA":                                  ["acfa"],
+
+    "Face-ИнтеллектХ face_recognition":                ["face_recognition"],
+    "Face-ИнтеллектХ face_recognition/ Детектор Пак":  ["face_recognition", "vl_face_recognition"],
+
+    "Детектор Пак - Пакет аналитики распознавания номеров RR rr_lpr/ Детектор Пак": ["rr_lpr"],
+    "Детектор Пак - Пакет аналитики распознавания номеров VT vt_lpr/ Детектор Пак": ["vt_lpr"],
+    "Детектор драки VL/ Детектор Пак":                 ["vl_fight"],
+    "Детектор подсчета толпы TV":                      ["tva_crowd"],
+    "Нейропак vl_analytics/ Детектор Пак":             ["vl_analytics"],
+    "Пакет нейроаналитики/ Детектор Пак":              ["neuro_pack"],
+    "Мониторинг":                                      ["_TODO_no_monitoring_addon"]
+  },
+
+  "axxon_next": {
+    "_server_path":                      "axxonsoft/axxon_next/.../addons/  (НЕ ПРИСЛАН - нужно листинг)",
+    "_available":                        [],
+
+    "Axxon Next":   [],
+    "DetectorPack": ["_TODO_no_axxon_next_listing"]
+  }
+}
