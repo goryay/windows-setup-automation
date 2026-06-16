@@ -973,6 +973,27 @@ $testArgs += "$DurationMinutes"
 Write-ColorOutput "  Arguments: $($testArgs -join ' ')" 'Green'
 Write-ColorOutput "  Full aida_fio_furmark call: $testScript $($testArgs -join ' ')" 'DarkGray'
 
+# ===================== [2.5/7] AXXON SOFTWARE INSTALL =====================
+# Router читает build_spec (SL*-*.txt в config\) и зовёт install_intellect[x].ps1
+# по флагам axxonsoft / axxonsoft_install / axxon_LS. Никаких pre/post ребутов
+# - всё в quiet режиме внутри одного процесса. Failed - warning, не валит цикл.
+Write-ColorOutput '[2.5/7] Installing Axxon software per build_spec...' 'Yellow'
+$axxonRouter = Join-Path $scriptDir 'Install-AxxonByBuildSpec.ps1'
+if (Test-Path $axxonRouter) {
+    try {
+        & $axxonRouter -UsbRoot $UsbRoot
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "  Install-AxxonByBuildSpec exited with code $LASTEXITCODE - continuing pipeline."
+        } else {
+            Write-ColorOutput '  Axxon install OK.' 'Green'
+        }
+    } catch {
+        Write-Warning "  Install-AxxonByBuildSpec failed: $_  - continuing pipeline."
+    }
+} else {
+    Write-ColorOutput "  Install-AxxonByBuildSpec.ps1 not found - skipping Axxon install." 'Gray'
+}
+
 Write-ColorOutput '[3/7] Setting up watchdog...' 'Yellow'
 
 $watchdogSeconds = ($DurationMinutes * 60) + 1800
