@@ -407,7 +407,15 @@ function Ensure-WebReportPrereqs {
     "IIS-NetFxExtensibility45",
     "IIS-ISAPIExtensions",
     "IIS-ISAPIFilter",
-    "IIS-ManagementConsole"
+    "IIS-ManagementConsole",
+    # IIS 6 Compatibility - требуется Web Report MSI's CheckCompatibilityError CA.
+    # Без них MSI падает: "IIS 6 Metabase and IIS 6 configuration compatibility
+    # should be installed in your system" -> return value 3 -> exit 1603.
+    "IIS-IIS6ManagementCompatibility",
+    "IIS-Metabase",
+    "IIS-WMICompatibility",
+    "IIS-LegacyScripts",
+    "IIS-LegacySnapIn"
   )
 
   try {
