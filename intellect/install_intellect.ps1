@@ -426,6 +426,26 @@ function Ensure-WebReportPrereqs {
     Write-Warn "Продолжаю установку — но MSI может падать 1603, если IIS отсутствует."
   }
 
+  # SQL Browser нужен для CA `SilentSelectServerInstances` который делает
+  # SqlDataSourceEnumerator.GetDataSources() (UDP 1434). Без него энумерация
+  # возвращает пустой DataTable, CA индексирует [0] и падает IndexOutOfRangeException
+  # -> MSI exit 1603 на InstallFinalize.
+  try {
+    $br = Get-Service -Name SQLBrowser -ErrorAction Stop
+    if ($br.StartType -ne 'Automatic') {
+      Set-Service -Name SQLBrowser -StartupType Automatic -ErrorAction SilentlyContinue
+      Write-Info "SQL Browser: StartupType -> Automatic"
+    }
+    if ($br.Status -ne 'Running') {
+      Start-Service -Name SQLBrowser -ErrorAction Stop
+      Write-Ok "SQL Browser: запущен (нужен Web Report CA SilentSelectServerInstances)."
+    } else {
+      Write-Info "SQL Browser: уже Running."
+    }
+  } catch {
+    Write-Warn ("SQL Browser не доступен: {0}. CA SilentSelectServerInstances может упасть." -f $_.Exception.Message)
+  }
+
   try {
     $iisreset = Join-Path $env:SystemRoot "System32\iisreset.exe"
     if (Test-Path $iisreset) { Start-Process -FilePath $iisreset -ArgumentList "/noforce" -Wait | Out-Null }
