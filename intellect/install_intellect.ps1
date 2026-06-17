@@ -450,11 +450,36 @@ function Ensure-WebReportPrereqs {
   # На Win10/11 NetFx3 по умолчанию ВЫКЛЮЧЕН. Если не включить - при запуске CA
   # вылетает диалог "установить .NET 3.5", в /qn режиме он не нажимается, CA
   # не отрабатывает -> MSI exit 1603. Включаем через DISM.
+  #
+  # Источники в порядке предпочтения:
+  #   1. Локальный sxs (быстро, без интернета) - типично на Ventoy в \sources\sxs
+  #      (потому что Ventoy грузит Windows ISO и этот путь монтируется)
+  #   2. Windows Update (без -LimitAccess, если есть интернет)
   try {
     $netfx3 = Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction Stop
     if ($netfx3.State -ne 'Enabled') {
-      Write-Info "Включаю .NET Framework 3.5 (NetFx3) - может потребоваться интернет/WU..."
-      $r = Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -LimitAccess -ErrorAction Stop
+      # Ищем sxs на всех буквах диска - обычно лежит на смонтированном Windows ISO
+      $sxsCandidates = @('D:\sources\sxs','E:\sources\sxs','F:\sources\sxs','G:\sources\sxs','H:\sources\sxs') |
+        Where-Object { Test-Path $_ }
+      $localSxs = $sxsCandidates | Select-Object -First 1
+
+      $r = $null
+      if ($localSxs) {
+        Write-Info "Включаю .NET Framework 3.5 из локального источника: $localSxs"
+        try {
+          $r = Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart `
+                -Source $localSxs -LimitAccess -ErrorAction Stop
+        } catch {
+          Write-Warn ("Из $localSxs не получилось ({0}), пробую Windows Update..." -f $_.Exception.Message)
+          $r = $null
+        }
+      }
+
+      if (-not $r) {
+        Write-Info "Включаю .NET Framework 3.5 через Windows Update..."
+        $r = Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -ErrorAction Stop
+      }
+
       if ($r.RestartNeeded) {
         Write-Warn ".NET Framework 3.5 включён, требуется перезагрузка. Web Report CA может всё равно работать сразу - попробуем."
       } else {
@@ -466,7 +491,7 @@ function Ensure-WebReportPrereqs {
   } catch {
     Write-Warn (".NET Framework 3.5 включить не удалось: {0}" -f $_.Exception.Message)
     Write-Warn "Web Report CA SilentSelectServerInstances может попросить .NET 3.5 диалогом - MSI упадёт 1603."
-    Write-Warn "Установи руками: Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All"
+    Write-Warn "Установи руками: Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -Source D:\sources\sxs -LimitAccess"
   }
 
   try {
