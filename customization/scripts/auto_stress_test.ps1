@@ -998,18 +998,27 @@ Write-ColorOutput "  Full aida_fio_furmark call: $testScript $($testArgs -join '
 # Router читает build_spec (SL*-*.txt в config\) и зовёт install_intellect[x].ps1
 # по флагам axxonsoft / axxonsoft_install / axxon_LS. Никаких pre/post ребутов
 # - всё в quiet режиме внутри одного процесса. Failed - warning, не валит цикл.
+# ВСЕ сообщения через Write-ColorOutput чтобы они попадали в лог (Write-Warning
+# уходит только в warning stream и в файл лога не пишется).
 Write-ColorOutput '[2.5/7] Installing Axxon software per build_spec...' 'Yellow'
 $axxonRouter = Join-Path $scriptDir 'Install-AxxonByBuildSpec.ps1'
+Write-ColorOutput ("  Router path: {0} (exists={1})" -f $axxonRouter, (Test-Path $axxonRouter)) 'Gray'
 if (Test-Path $axxonRouter) {
+    Write-ColorOutput "  Invoking router (UsbRoot=$UsbRoot)..." 'Gray'
+    $stamp = Get-Date
     try {
         & $axxonRouter -UsbRoot $UsbRoot
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "  Install-AxxonByBuildSpec exited with code $LASTEXITCODE - continuing pipeline."
+        $rc = $LASTEXITCODE
+        $elapsed = [int]((Get-Date) - $stamp).TotalSeconds
+        Write-ColorOutput "  Router returned exit=$rc after ${elapsed}s" 'Gray'
+        if ($rc -ne 0) {
+            Write-ColorOutput "  Install-AxxonByBuildSpec exited with code $rc - continuing pipeline." 'Yellow'
         } else {
             Write-ColorOutput '  Axxon install OK.' 'Green'
         }
     } catch {
-        Write-Warning "  Install-AxxonByBuildSpec failed: $_  - continuing pipeline."
+        Write-ColorOutput "  Install-AxxonByBuildSpec THREW: $($_.Exception.Message) - continuing pipeline." 'Red'
+        Write-ColorOutput "  Stack: $($_.ScriptStackTrace)" 'DarkGray'
     }
 } else {
     Write-ColorOutput "  Install-AxxonByBuildSpec.ps1 not found - skipping Axxon install." 'Gray'
