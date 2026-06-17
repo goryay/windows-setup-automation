@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Triggers FFU capture by rebooting into LOCALLY-STAGED WinPE.
 

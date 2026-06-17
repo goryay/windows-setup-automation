@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Automatic stress test (AIDA64 + FurMark + FIO)
 #>

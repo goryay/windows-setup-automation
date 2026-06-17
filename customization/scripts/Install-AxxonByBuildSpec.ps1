@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Router: читает build_spec.txt и устанавливает Axxon-софт по флагам.
 

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Prepares an IpdromREC recovery flash drive.
 
