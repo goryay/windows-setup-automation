@@ -256,10 +256,24 @@ function Resolve-AddonsFromBuildSpec {
         if (-not $clean) { continue }
         $licName = if ($clean -match '^(.+?)::') { $matches[1].Trim() } else { $clean }
 
-        # Lookup Module Win
+        # Lookup Module Win.
+        # 1) Точное совпадение
+        # 2) Нормализованное: вырезаем "Федеративная" из имени (синоним обычного Интеллект X)
+        # 3) Аналогично с другими вариациями названия которые SL-генератор может добавлять
         $moduleWin = $null
         if ($licenseJson.entries.PSObject.Properties.Match($licName).Count -gt 0) {
             $moduleWin = $licenseJson.entries.$licName
+        }
+        if (-not $moduleWin) {
+            # Нормализация для матчинга с Excel: вырезаем "Федеративная" (и подобные суффиксы продукта)
+            $normName = $licName `
+                -replace '\s+Федеративная\s+', ' ' `
+                -replace 'Федеративная', ''
+            $normName = ($normName -replace '\s+', ' ').Trim()
+            if ($normName -ne $licName -and $licenseJson.entries.PSObject.Properties.Match($normName).Count -gt 0) {
+                $moduleWin = $licenseJson.entries.$normName
+                Write-Log "    n  '$licName' -> normalized '$normName' -> Module Win '$moduleWin'" 'DarkGray'
+            }
         }
         if (-not $moduleWin) {
             Write-Log "    ?  '$licName' - не найден в license map (Excel)" 'Yellow'
