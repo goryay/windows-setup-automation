@@ -65,7 +65,8 @@ function Read-BuildSpec {
     $result = @{}
     # build_spec может быть в UTF-8 (с/без BOM) или ANSI. Get-Content авто-определит BOM;
     # для строк с кириллицей в значениях это не критично (имя ПК - ASCII).
-    foreach ($raw in (Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+    # КРИТИЧНО: -Encoding UTF8. PS5.1 по дефолту читает как ANSI, кириллица в SL ломается.
+    foreach ($raw in (Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop)) {
         $line = $raw.Trim()
         if ($line -eq '') { continue }
         if ($line.StartsWith('#')) { continue }

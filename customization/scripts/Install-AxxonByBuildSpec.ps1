@@ -103,10 +103,14 @@ Write-Log "LogPath:        $LogPath" 'Gray'
 
 # ===================== INI PARSER =====================
 # Тот же подход что в apply_build_spec.ps1: key=value, # - комментарий.
+# КРИТИЧНО: SL-файлы в UTF-8 (с кириллицей). В PS5.1 Get-Content по дефолту
+# читает как ANSI -> кириллица превращается в mojibake -> lookup'ы в Excel-маппинг
+# не совпадают -> Guardant не детектится -> setup.exe запускается с /REMOVE.
+# Явно указываем -Encoding UTF8.
 function Read-BuildSpec {
     param([Parameter(Mandatory)][string]$Path)
     $result = @{}
-    foreach ($raw in (Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+    foreach ($raw in (Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop)) {
         $line = $raw.Trim()
         if ($line -eq '') { continue }
         if ($line.StartsWith('#')) { continue }
@@ -233,8 +237,9 @@ function Resolve-AddonsFromBuildSpec {
     }
 
     try {
-        $licenseJson = Get-Content -LiteralPath $LicenseMapPath -Raw | ConvertFrom-Json
-        $installJson = Get-Content -LiteralPath $InstallMapPath -Raw | ConvertFrom-Json
+        # КРИТИЧНО: -Encoding UTF8. См. комментарий в Read-BuildSpec.
+        $licenseJson = Get-Content -LiteralPath $LicenseMapPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $installJson = Get-Content -LiteralPath $InstallMapPath -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
         Write-Log "  Failed to parse mapping JSON: $_" 'Red'
         return @()
@@ -337,7 +342,7 @@ function Build-ExtendedAxxonConfig {
     }
 
     try {
-        $base = Get-Content -LiteralPath $BaseConfigPath -Raw | ConvertFrom-Json
+        $base = Get-Content -LiteralPath $BaseConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
         Write-Log "  Failed to parse base config: $_" 'Red'
         return $BaseConfigPath
