@@ -964,7 +964,22 @@ function Install-AddonFolder {
       }
     }
     else {
-      $r = Install-Msi-Quiet -MsiPath $msi -TransformsRel $mstRel
+      # Generic addon (auto, pos, face, etc.) - часто требует те же свойства что web_report:
+      #   LICENSE_ACCEPTED=1 (дефолт 0)
+      #   IS_SQL_NOT_LOCAL=0 (дефолт 1, ожидает удалённый SQL)
+      #   SQL_INSTANCE=(local) - наш экземпляр
+      #   SQL_AUTHTYPE=Windows - наш режим аутентификации
+      # Если этих свойств в MSI нет - они игнорируются, ничего не ломается.
+      # Если есть (как у auto, pos, face) - CA "untrusted domain" / "ConnectionString не инициализировано" исчезает.
+      $sql = $script:SqlSettings
+      $sqlInst = if ($sql -and $sql.Instance) { $sql.Instance } else { '(local)' }
+      $sqlAuth = if ($sql -and $sql.AuthType) { $sql.AuthType } else { 'Windows' }
+      $isLocal = ($sqlInst -match '^(\(local\)|localhost|\.|)$') -or ($sqlInst -match '\\') -or ($sqlInst -like "$env:COMPUTERNAME*")
+      $isSqlNotLocal = if ($isLocal) { '0' } else { '1' }
+      $genericProps = ('LICENSE_ACCEPTED="1" SQL_INSTANCE="{0}" SQL_AUTHTYPE="{1}" IS_SQL_NOT_LOCAL="{2}"' -f $sqlInst, $sqlAuth, $isSqlNotLocal)
+      Write-Info ("Generic addon '{0}' MSI extra props: {1}" -f $GroupName, $genericProps)
+
+      $r = Install-Msi-Quiet -MsiPath $msi -TransformsRel $mstRel -ExtraProps $genericProps
       if (-not $r.Ok) { throw "MSI аддона '$GroupName' завершился ошибкой. Код $($r.ExitCode). Лог: $($r.Log)" }
     }
     return
