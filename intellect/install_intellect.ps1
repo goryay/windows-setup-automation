@@ -553,7 +553,14 @@ function Ensure-IntellectSqlRights {
     # CREATE LOGIN [BUILTIN\Administrators] FROM WINDOWS - падает с "user not found".
     # Поэтому каждый блок оборачиваем в TRY/CATCH: если логин уже есть в нужной
     # локализации, или CREATE LOGIN не может разрешить имя - пропускаем.
-    # NT AUTHORITY\NETWORK SERVICE - well-known SID, английское имя работает везде.
+    # NT AUTHORITY\NETWORK SERVICE / NT AUTHORITY\SYSTEM - well-known SID,
+    # английское имя работает везде.
+    #
+    # NT AUTHORITY\SYSTEM нужен потому что MSI-аддоны (auto, web_report и т.п.)
+    # выполняют свои deferred CustomAction под учёткой SYSTEM, а не текущего
+    # Administrator'а. CA подключается к SQL через Integrated Security и создаёт
+    # БД. Без sysadmin у SYSTEM CREATE DATABASE падает -> диалог "Error while
+    # creating/updating databases" -> MSI exit 1603.
     $q = @"
 BEGIN TRY
     IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE sid = SUSER_SID(N'BUILTIN\Administrators'))
@@ -572,6 +579,15 @@ END TRY BEGIN CATCH END CATCH
 BEGIN TRY
     EXEC sp_addsrvrolemember N'NT AUTHORITY\NETWORK SERVICE', N'sysadmin';
 END TRY BEGIN CATCH END CATCH
+
+BEGIN TRY
+    IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = N'NT AUTHORITY\SYSTEM')
+        CREATE LOGIN [NT AUTHORITY\SYSTEM] FROM WINDOWS;
+END TRY BEGIN CATCH END CATCH
+
+BEGIN TRY
+    EXEC sp_addsrvrolemember N'NT AUTHORITY\SYSTEM', N'sysadmin';
+END TRY BEGIN CATCH END CATCH
 "@
 
     # Способ 1 (ОСНОВНОЙ): .NET SqlClient через ADO.NET.
@@ -588,7 +604,7 @@ END TRY BEGIN CATCH END CATCH
             $cmd.CommandText = $q
             $cmd.CommandTimeout = 30
             [void]$cmd.ExecuteNonQuery()
-            Write-Info "SQL права выданы (.NET SqlClient): BUILTIN\Администраторы + NT AUTHORITY\NETWORK SERVICE"
+            Write-Info "SQL права выданы (.NET SqlClient): BUILTIN\Администраторы + NT AUTHORITY\NETWORK SERVICE + NT AUTHORITY\SYSTEM"
             return
         } finally {
             $conn.Close()
@@ -608,7 +624,7 @@ END TRY BEGIN CATCH END CATCH
                 -ArgumentList @("-S", $Server, "-E", "-i", "`"$tmpSql`"", "-b") `
                 -Wait -PassThru -WindowStyle Hidden
             if ($p.ExitCode -ne 0) { throw "sqlcmd.exe exit code: $($p.ExitCode)" }
-            Write-Info "SQL права выданы (sqlcmd.exe): BUILTIN\Администраторы + NT AUTHORITY\NETWORK SERVICE"
+            Write-Info "SQL права выданы (sqlcmd.exe): BUILTIN\Администраторы + NT AUTHORITY\NETWORK SERVICE + NT AUTHORITY\SYSTEM"
             return
         }
         finally {
@@ -622,7 +638,7 @@ END TRY BEGIN CATCH END CATCH
 
     if (Get-Command Invoke-Sqlcmd -ErrorAction SilentlyContinue) {
         Invoke-Sqlcmd -ServerInstance $Server -Query $q -ErrorAction Stop | Out-Null
-        Write-Info "SQL права выданы (Invoke-Sqlcmd): BUILTIN\Администраторы + NT AUTHORITY\NETWORK SERVICE"
+        Write-Info "SQL права выданы (Invoke-Sqlcmd): BUILTIN\Администраторы + NT AUTHORITY\NETWORK SERVICE + NT AUTHORITY\SYSTEM"
         return
     }
 
@@ -969,14 +985,18 @@ function Install-AddonFolder {
       #   IS_SQL_NOT_LOCAL=0 (дефолт 1, ожидает удалённый SQL)
       #   SQL_INSTANCE=(local) - наш экземпляр
       #   SQL_AUTHTYPE=Windows - наш режим аутентификации
+      #   SQLINSTANCENAME=MSSQLSERVER - имя экземпляра. Дефолт MSI = 'SQLEXPRESS2014',
+      #     но у нас default-instance с именем 'MSSQLSERVER'. Если оставить дефолт,
+      #     CA делает connect к (local)\SQLEXPRESS2014 -> fail "untrusted domain".
       # Если этих свойств в MSI нет - они игнорируются, ничего не ломается.
-      # Если есть (как у auto, pos, face) - CA "untrusted domain" / "ConnectionString не инициализировано" исчезает.
       $sql = $script:SqlSettings
       $sqlInst = if ($sql -and $sql.Instance) { $sql.Instance } else { '(local)' }
       $sqlAuth = if ($sql -and $sql.AuthType) { $sql.AuthType } else { 'Windows' }
       $isLocal = ($sqlInst -match '^(\(local\)|localhost|\.|)$') -or ($sqlInst -match '\\') -or ($sqlInst -like "$env:COMPUTERNAME*")
       $isSqlNotLocal = if ($isLocal) { '0' } else { '1' }
-      $genericProps = ('LICENSE_ACCEPTED="1" SQL_INSTANCE="{0}" SQL_AUTHTYPE="{1}" IS_SQL_NOT_LOCAL="{2}"' -f $sqlInst, $sqlAuth, $isSqlNotLocal)
+      # Имя экземпляра. Если SQL_INSTANCE содержит \, имя справа от \. Иначе default = MSSQLSERVER.
+      $sqlInstName = if ($sqlInst -match '\\(.+)$') { $matches[1] } else { 'MSSQLSERVER' }
+      $genericProps = ('LICENSE_ACCEPTED="1" SQL_INSTANCE="{0}" SQL_AUTHTYPE="{1}" IS_SQL_NOT_LOCAL="{2}" SQLINSTANCENAME="{3}"' -f $sqlInst, $sqlAuth, $isSqlNotLocal, $sqlInstName)
       Write-Info ("Generic addon '{0}' MSI extra props: {1}" -f $GroupName, $genericProps)
 
       $r = Install-Msi-Quiet -MsiPath $msi -TransformsRel $mstRel -ExtraProps $genericProps
