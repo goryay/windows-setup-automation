@@ -742,7 +742,12 @@ function Install-Msi-Quiet {
     [Parameter(Mandatory=$true)][string]$MsiPath,
     [string]$ExtraProps = "",
     [string]$TransformsRel = "",
-    [int]$InstallLevel = 2
+    [int]$InstallLevel = 2,
+    # UI режим msiexec. По умолчанию /qn (полностью silent).
+    # Для аддонов с битыми CA, которым нужен InstallUISequence (напр. auto),
+    # передавай /qb! - progress bar без модальных диалогов и без Cancel.
+    [ValidateSet('/qn','/qb','/qb!','/qb-!','/passive')]
+    [string]$UiMode = '/qn'
   )
 
   New-Item -ItemType Directory -Force -Path $Logs | Out-Null
@@ -750,7 +755,7 @@ function Install-Msi-Quiet {
 
   $parts = @(
     "/i `"$MsiPath`""
-    "/qn"
+    $UiMode
     "/norestart"
     "INSTALLLEVEL=$InstallLevel"
     "/l*v `"$log`""
@@ -996,10 +1001,14 @@ function Install-AddonFolder {
       $isSqlNotLocal = if ($isLocal) { '0' } else { '1' }
       # Имя экземпляра. Если SQL_INSTANCE содержит \, имя справа от \. Иначе default = MSSQLSERVER.
       $sqlInstName = if ($sqlInst -match '\\(.+)$') { $matches[1] } else { 'MSSQLSERVER' }
-      $genericProps = ('LICENSE_ACCEPTED="1" SQL_INSTANCE="{0}" SQL_AUTHTYPE="{1}" IS_SQL_NOT_LOCAL="{2}" SQLINSTANCENAME="{3}"' -f $sqlInst, $sqlAuth, $isSqlNotLocal, $sqlInstName)
+      # REBOOT=ReallySuppress - убираем диалог "перезагрузить сейчас?" в /qb! режиме.
+      $genericProps = ('LICENSE_ACCEPTED="1" SQL_INSTANCE="{0}" SQL_AUTHTYPE="{1}" IS_SQL_NOT_LOCAL="{2}" SQLINSTANCENAME="{3}" REBOOT=ReallySuppress' -f $sqlInst, $sqlAuth, $isSqlNotLocal, $sqlInstName)
       Write-Info ("Generic addon '{0}' MSI extra props: {1}" -f $GroupName, $genericProps)
 
-      $r = Install-Msi-Quiet -MsiPath $msi -TransformsRel $mstRel -ExtraProps $genericProps
+      # /qb! вместо /qn: у некоторых аддонов (auto, ...) CA требуют InstallUISequence,
+      # при /qn они валятся с error: 25 / 'ConnectionString не инициализировано'.
+      # /qb! даёт минимальный progress bar без модалок и Cancel - silent на практике.
+      $r = Install-Msi-Quiet -MsiPath $msi -TransformsRel $mstRel -ExtraProps $genericProps -UiMode '/qb!'
       if (-not $r.Ok) { throw "MSI аддона '$GroupName' завершился ошибкой. Код $($r.ExitCode). Лог: $($r.Log)" }
     }
     return
