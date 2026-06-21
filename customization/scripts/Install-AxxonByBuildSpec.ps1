@@ -333,7 +333,8 @@ function Build-ExtendedAxxonConfig {
         [string]$BaseConfigPath,
         [string[]]$ExtraAddons,
         [bool]$HasGuardant,
-        [string]$Family   # 'intellect' | 'intellectx' | 'axxon_next'
+        [string]$Family,         # 'intellect' | 'intellectx' | 'axxon_next'
+        [string]$InstallMapPath  # для чтения _path_overrides
     )
 
     if (-not (Test-Path -LiteralPath $BaseConfigPath)) {
@@ -363,6 +364,49 @@ function Build-ExtendedAxxonConfig {
         }
         Write-Log "  Merged addons: [$($merged -join ', ')]" 'Gray'
         $modified = $true
+    }
+
+    # --- addonPathOverrides: пробрасываем из install_map._path_overrides ---
+    # install_intellect.ps1 по умолчанию зеркалит <baseUrl>/addons/<group>.
+    # Для аддонов вне 'addons/' (напр. detector в drivers/detector) кладём
+    # подпуть в effective config как addonPathOverrides:{<group>:<subpath>}.
+    # Включаем только те overrides, чьи коды реально попали в merged addons[].
+    if ($InstallMapPath -and (Test-Path -LiteralPath $InstallMapPath)) {
+        try {
+            $imap = Get-Content -LiteralPath $InstallMapPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $famNode = $imap.$Family
+            if ($famNode -and $famNode.PSObject.Properties.Match('_path_overrides').Count -gt 0) {
+                $ovNode = $famNode.'_path_overrides'
+                $relevant = @{}
+                # Берём список того, что реально будет ставиться (после merge):
+                $effectiveAddons = @()
+                if ($base.PSObject.Properties.Match('addons').Count -gt 0 -and $base.addons) {
+                    $effectiveAddons = @($base.addons)
+                }
+                foreach ($p in $ovNode.PSObject.Properties) {
+                    if ($p.Name -eq '_comment') { continue }
+                    if ($effectiveAddons -contains $p.Name) {
+                        $relevant[$p.Name] = $p.Value
+                    }
+                }
+                if ($relevant.Count -gt 0) {
+                    $ovObj = New-Object PSObject
+                    foreach ($k in $relevant.Keys) {
+                        $ovObj | Add-Member -MemberType NoteProperty -Name $k -Value $relevant[$k]
+                    }
+                    if ($base.PSObject.Properties.Match('addonPathOverrides').Count -gt 0) {
+                        $base.addonPathOverrides = $ovObj
+                    } else {
+                        $base | Add-Member -MemberType NoteProperty -Name addonPathOverrides -Value $ovObj
+                    }
+                    $pairs = ($relevant.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '
+                    Write-Log "  addonPathOverrides: { $pairs }" 'Cyan'
+                    $modified = $true
+                }
+            }
+        } catch {
+            Write-Log "  Failed to read _path_overrides from install map: $_" 'Yellow'
+        }
     }
 
     # --- Guardant flag: разный schema у classic vs IntellectX ---
@@ -613,7 +657,8 @@ foreach ($step in $execSteps) {
         -BaseConfigPath $cfgPath `
         -ExtraAddons $extraAddons `
         -HasGuardant $hasGuardant `
-        -Family $step.Family
+        -Family $step.Family `
+        -InstallMapPath $InstallMapPath
     Write-Log "Effective config: $cfgPath" 'Gray'
 
     try {

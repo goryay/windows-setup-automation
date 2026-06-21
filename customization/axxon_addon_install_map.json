@@ -3,7 +3,11 @@
 
   "intellect": {
     "_server_path":                      "axxonsoft/intellectx/exe/main/addons/  (фактический путь, intellectx в URL для classic - historical)",
-    "_available":                        ["acfa", "auto", "face", "pos", "web_report"],
+    "_available":                        ["acfa", "auto", "detector", "face", "pos", "web_report"],
+    "_path_overrides":                   {
+      "_comment":                        "addon-code -> подпуть относительно baseUrl (вместо стандартного 'addons/<code>'). Используется для аддонов, которые лежат не в 'addons/'. Прокидывается через router в effective config -> install_intellect читает поле addonPathOverrides.",
+      "detector":                        "drivers/detector"
+    },
 
     "Client":                            [],
     "Интеллект":                         [],
@@ -12,12 +16,13 @@
     "Auto-Интеллект":                    ["auto"],
     "Face-Интеллект":                    ["face"],
     "POS-Интеллект":                     ["pos"],
-    "Detector Pack":                     ["_TODO_no_addon_on_server"],
-    "Detector Pack/Auto-Интеллект":      ["auto", "_TODO_no_detector_pack"],
+    "DetectorPack":                      ["detector"],
+    "Detector Pack":                     ["detector"],
+    "Detector Pack/Auto-Интеллект":      ["auto", "detector"],
     "Подсистема Analytic Pack":          ["_TODO_no_addon_on_server"],
     "Агент контроля":                    ["_TODO_no_monitoring_addon"],
     "Пакет аналитики VI":                ["_TODO_no_addon_on_server"],
-    "Пакет аналитики VI / Базовый пакет DetectorPack": ["_TODO_no_addon_on_server"],
+    "Пакет аналитики VI / Базовый пакет DetectorPack": ["detector"],
     "-":                                 []
   },
 

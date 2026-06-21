@@ -92,6 +92,18 @@ if ($config.PSObject.Properties['addons']) {
     $AddonsList = @($config.addons)
 }
 
+# addonPathOverrides: <addon-code> -> подпуть относительно ShareRoot.
+# По умолчанию аддоны зеркалятся из <ShareRoot>/addons/<group>/. Этот блок
+# позволяет перенаправить отдельные аддоны на другой подпуть (напр. detector ->
+# drivers/detector). Заполняется роутером Install-AxxonByBuildSpec.ps1 из
+# axxon_addon_install_map.json._path_overrides.
+$AddonPathOverrides = @{}
+if ($config.PSObject.Properties['addonPathOverrides']) {
+    foreach ($p in $config.addonPathOverrides.PSObject.Properties) {
+        $AddonPathOverrides[$p.Name] = [string]$p.Value
+    }
+}
+
 $AcfaModules = @()
 if ($config.PSObject.Properties['acfa']) {
     if ($config.acfa.PSObject.Properties['modules']) {
@@ -1254,7 +1266,14 @@ function Install-AddonsFromConfig {
         Write-Host ""
         Write-Host ("==== Установка аддона: {0} ====" -f $group) -ForegroundColor Cyan
 
-        $relDir    = ($script:ShareRoot.TrimEnd('/') + "/addons/" + $group).Trim('/')
+        # По умолчанию: <ShareRoot>/addons/<group>. Override - например drivers/detector.
+        if ($AddonPathOverrides.ContainsKey($group)) {
+            $sub = $AddonPathOverrides[$group].Trim('/')
+            $relDir = ($script:ShareRoot.TrimEnd('/') + '/' + $sub).Trim('/')
+            Write-Info ("Addon '{0}' uses path override: {1}" -f $group, $sub)
+        } else {
+            $relDir = ($script:ShareRoot.TrimEnd('/') + "/addons/" + $group).Trim('/')
+        }
         $dstFolder = Join-Path $Downloads ("addon_" + $group)
 
         if (Test-Path -LiteralPath $dstFolder) {
