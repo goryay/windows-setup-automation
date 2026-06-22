@@ -255,6 +255,7 @@ function Resolve-AddonsFromBuildSpec {
     Write-Log "  Parsed $($items.Count) addon items from SL axxonsoft_addons." 'Gray'
 
     $codes = New-Object 'System.Collections.Generic.HashSet[string]'
+    $acfaFeatures = New-Object 'System.Collections.Generic.HashSet[string]'
     $hasGuardant = $false
     foreach ($item in $items) {
         $clean = $item.Trim().TrimStart('/').TrimEnd(';').Trim()
@@ -312,6 +313,16 @@ function Resolve-AddonsFromBuildSpec {
                 Write-Log "    ~  '$licName' -> '$moduleWin' -> '$code' - НЕ ВЕРИФИЦИРОВАН на сервере, пропускаю" 'Yellow'
                 continue
             }
+            # Спец-нотация acfa_feature:<id> - не отдельный аддон, а feature ACFA MSI.
+            # Идёт в base.acfa.modules effective config (а не в base.addons[]).
+            if ($code -match '^acfa_feature:(.+)$') {
+                $featId = $matches[1].Trim()
+                if ($featId) {
+                    [void]$acfaFeatures.Add($featId)
+                    Write-Log "    A  '$licName' -> '$moduleWin' -> ACFA feature '$featId'" 'Green'
+                }
+                continue
+            }
             if ($code) {
                 [void]$codes.Add($code)
                 Write-Log "    +  '$licName' -> '$moduleWin' -> '$code'" 'Green'
@@ -320,8 +331,9 @@ function Resolve-AddonsFromBuildSpec {
     }
 
     return [pscustomobject]@{
-        Addons      = @($codes)
-        HasGuardant = $hasGuardant
+        Addons       = @($codes)
+        AcfaFeatures = @($acfaFeatures)
+        HasGuardant  = $hasGuardant
     }
 }
 
@@ -332,6 +344,7 @@ function Build-ExtendedAxxonConfig {
     param(
         [string]$BaseConfigPath,
         [string[]]$ExtraAddons,
+        [string[]]$ExtraAcfaFeatures,  # дополнительные ACFA features из SL (для acfa.modules)
         [bool]$HasGuardant,
         [string]$Family,         # 'intellect' | 'intellectx' | 'axxon_next'
         [string]$InstallMapPath  # для чтения _path_overrides
@@ -363,6 +376,25 @@ function Build-ExtendedAxxonConfig {
             $base | Add-Member -MemberType NoteProperty -Name addons -Value $merged
         }
         Write-Log "  Merged addons: [$($merged -join ', ')]" 'Gray'
+        $modified = $true
+    }
+
+    # --- acfa.modules merge ---
+    # Резолверы выдают ACFA-features отдельно (через префикс 'acfa_feature:<id>'),
+    # они должны попасть в base.acfa.modules (это передаётся в Install-AcfaWithFallback
+    # как ADDLOCAL дополнительных features), а не в base.addons[].
+    if ($ExtraAcfaFeatures -and $ExtraAcfaFeatures.Count -gt 0) {
+        # ensure base.acfa exists
+        if ($base.PSObject.Properties.Match('acfa').Count -eq 0) {
+            $base | Add-Member -MemberType NoteProperty -Name acfa -Value ([pscustomobject]@{ modules = @() })
+        } elseif ($base.acfa.PSObject.Properties.Match('modules').Count -eq 0) {
+            $base.acfa | Add-Member -MemberType NoteProperty -Name modules -Value @()
+        }
+        $currentMods = @()
+        if ($base.acfa.modules) { $currentMods = @($base.acfa.modules) }
+        $mergedMods = @($currentMods + $ExtraAcfaFeatures | Sort-Object -Unique)
+        $base.acfa.modules = $mergedMods
+        Write-Log "  Merged acfa.modules: [$($mergedMods -join ', ')]" 'Gray'
         $modified = $true
     }
 
@@ -648,14 +680,20 @@ foreach ($step in $execSteps) {
         -Family $step.Family `
         -LicenseMapPath $LicenseMapPath `
         -InstallMapPath $InstallMapPath
-    $extraAddons = @($resolved.Addons)
+    $extraAddons       = @($resolved.Addons)
+    $extraAcfaFeatures = @()
+    if ($resolved.PSObject.Properties.Match('AcfaFeatures').Count -gt 0) {
+        $extraAcfaFeatures = @($resolved.AcfaFeatures)
+    }
     $hasGuardant = [bool]$resolved.HasGuardant
-    Write-Log ("Extra addons from SL: [{0}]" -f ($extraAddons -join ', ')) 'Cyan'
-    Write-Log ("Guardant in SL:       {0}" -f $hasGuardant) 'Cyan'
+    Write-Log ("Extra addons from SL:      [{0}]" -f ($extraAddons -join ', ')) 'Cyan'
+    Write-Log ("Extra ACFA features from SL: [{0}]" -f ($extraAcfaFeatures -join ', ')) 'Cyan'
+    Write-Log ("Guardant in SL:            {0}" -f $hasGuardant) 'Cyan'
 
     $cfgPath = Build-ExtendedAxxonConfig `
         -BaseConfigPath $cfgPath `
         -ExtraAddons $extraAddons `
+        -ExtraAcfaFeatures $extraAcfaFeatures `
         -HasGuardant $hasGuardant `
         -Family $step.Family `
         -InstallMapPath $InstallMapPath
