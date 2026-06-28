@@ -491,7 +491,13 @@ function Install-MSI-Quiet {
         [string]$Activity = "Установка MSI",
         [string]$StatusPrefix = "Установка пакета",
         [switch]$UseUi,
-        [string]$ExtraProps = ""
+        [string]$ExtraProps = "",
+        # UI режим msiexec. По умолчанию определяется по -UseUi (full/qn).
+        # Для аддонов с битыми CA, которым нужен InstallUISequence (типа
+        # 'Выберите язык установки', Intellect X Reports Wizard) - используй '/qb!'
+        # (progress bar без модальных диалогов и кнопки Cancel).
+        [ValidateSet('','/qn','/qb','/qb!','/qb-!','/passive')]
+        [string]$UiMode = ''
     )
 
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
@@ -501,8 +507,18 @@ function Install-MSI-Quiet {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "$env:SystemRoot\System32\msiexec.exe"
 
+    # Определение UI-флага:
+    #   1. Если UiMode задан явно - используем его (приоритет).
+    #   2. Иначе по -UseUi: switch true = full UI (нет флага), false = /qn (legacy).
+    $effectiveUi = ''
+    if (-not [string]::IsNullOrWhiteSpace($UiMode)) {
+        $effectiveUi = $UiMode
+    } elseif (-not $UseUi) {
+        $effectiveUi = '/qn'
+    }
+
     $argsList = @("/i `"$Path`"")
-    if (-not $UseUi) { $argsList += "/qn" }
+    if ($effectiveUi) { $argsList += $effectiveUi }
     $argsList += "/norestart"
     $argsList += "/l*v `"$log`""
     if ($ExtraProps) { $argsList += $ExtraProps }
@@ -984,11 +1000,54 @@ function Install-IntellectX-BaseAuto {
 #   УСТАНОВКА АДДОНОВ (без меню, по списку из конфига)
 # ============================================================
 
+# Останавливает запущенные процессы/службы Intellect X перед установкой аддонов.
+# После Install-IntellectX-BaseAuto setup.exe автоматически запускает AppHost
+# и сервисы, и MSI-аддоны падают с диалогом 'Installation suspended! Please stop
+# AppHost!' который требует ручного нажатия Cancel/Retry. Гасим всё что мешает.
+# НЕ трогаем PostgreSQL - аддоны (Reports, etc.) пишут в БД во время установки.
+function Stop-IntellectXProcesses {
+    Write-Host "Останавливаю Intellect X процессы перед установкой аддонов..." -ForegroundColor Yellow
+
+    # Сервисы IntellectX (если есть). Не трогаем postgresql-* - аддоны работают с БД.
+    $svcPatterns = @('AppHost*','IntellectX*','ngp_*','axxon*','itv*')
+    foreach ($pat in $svcPatterns) {
+        Get-Service -Name $pat -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' } | ForEach-Object {
+            try {
+                Stop-Service -Name $_.Name -Force -ErrorAction Stop
+                Write-Host ("  -> сервис остановлен: {0}" -f $_.Name) -ForegroundColor DarkGray
+            } catch {
+                Write-Warn ("  -> не удалось остановить {0}: {1}" -f $_.Name, $_.Exception.Message)
+            }
+        }
+    }
+
+    # Процессы, которые MSI просит закрыть в 'Installation suspended'.
+    $procPatterns = @('AppHost','IntellectX','axxon*','itv*','intellect','idb')
+    foreach ($pat in $procPatterns) {
+        Get-Process -Name $pat -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                Stop-Process -Id $_.Id -Force -ErrorAction Stop
+                Write-Host ("  -> процесс убит: {0} (PID {1})" -f $_.Name, $_.Id) -ForegroundColor DarkGray
+            } catch {
+                Write-Warn ("  -> не удалось убить {0} (PID {1}): {2}" -f $_.Name, $_.Id, $_.Exception.Message)
+            }
+        }
+    }
+
+    Start-Sleep -Seconds 3
+    Write-Ok "Intellect X процессы остановлены."
+}
+
 function Install-IntellectX-AddonsAuto {
     param([string[]]$Addons)
     if (-not $Addons -or $Addons.Count -eq 0) { return }
 
     Write-Host "==== Установка аддонов ====" -ForegroundColor Yellow
+
+    # КРИТИЧНО: гасим AppHost/IntellectX/etc. перед установкой аддонов.
+    # Иначе вылазит диалог 'Installation suspended! Please stop AppHost!'
+    # с кнопками Cancel/Retry - в unattended-режиме это блокирует pipeline.
+    Stop-IntellectXProcesses
 
     # Путь к каждому аддону строится напрямую: addons/<name>.
     # Имя должно совпадать с папкой на сервере (включая опечатки, например vi_face_recongnition).
@@ -1021,11 +1080,27 @@ function Install-IntellectX-AddonsAuto {
         $ext = $pkg.Extension
         $installed = $false
         if ($ext -ieq '.msi') {
-            # Устанавливаем тихо, без UI
-            Install-MSI-Quiet -Path $pkgPath -LogDir $Logs -UseUi:$false
+            # /qb! - минимальный progress bar без модалок и Cancel. Нужен потому что
+            # часть аддонов имеет CA в InstallUISequence (диалог 'Выберите язык'),
+            # который при /qn просто не вызывается и MSI валится.
+            # REBOOT=ReallySuppress - чтобы не было диалога 'перезагрузить сейчас?'.
+            Install-MSI-Quiet -Path $pkgPath -LogDir $Logs -UiMode '/qb!' -ExtraProps 'REBOOT=ReallySuppress'
             $installed = $true
         } elseif ($ext -ieq '.exe') {
-            $cands = @('/quiet /norestart', '/S', '/silent')
+            # Расширенный список silent-флагов для разных инсталляторов:
+            #   Inno Setup:     /SILENT /SP- /SUPPRESSMSGBOXES /NORESTART
+            #   NSIS:           /S
+            #   InstallShield:  /s /v"/qn"  или  -s -SMS
+            #   MSI bootstrapper: /quiet /norestart, /q
+            # Intellect X Reports = Inno Setup -> правильный флаг /SILENT /SP- /SUPPRESSMSGBOXES.
+            $cands = @(
+                '/SILENT /SP- /SUPPRESSMSGBOXES /NORESTART',
+                '/VERYSILENT /SP- /SUPPRESSMSGBOXES /NORESTART',
+                '/S',
+                '/silent',
+                '/quiet /norestart',
+                '-s -SMS'
+            )
             foreach ($c in $cands) {
                 $p = Start-Process -FilePath $pkgPath -ArgumentList $c -Wait -PassThru
                 if ($p.ExitCode -in 0,3010,1641) {
@@ -1034,9 +1109,11 @@ function Install-IntellectX-AddonsAuto {
                 }
             }
             if (-not $installed) {
-                Write-Warn "Не удалось тихо установить $addonName, запускаю с UI..."
-                Start-Process -FilePath $pkgPath -Wait
-                $installed = $true
+                # БЫЛО: fallback на интерактивный запуск (Start-Process -Wait без аргументов)
+                # БЛОКИРОВАЛО pipeline когда оператора нет у машины. Теперь - skip + warning.
+                Write-Warn "Не удалось тихо установить $addonName (все silent-флаги вернули non-zero exit). Пропускаю."
+                Write-Warn "  Файл: $pkgPath"
+                Write-Warn "  Чтобы добавить новый silent-флаг - правь \$cands в Install-IntellectX-AddonsAuto."
             }
         } else {
             Write-Warn "Неизвестный тип файла: $pkgPath"
