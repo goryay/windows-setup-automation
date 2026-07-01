@@ -24,7 +24,22 @@ if (-not (Test-Path -LiteralPath $sourceLauncher)) {
 $localLauncher = Join-Path $scriptsDir 'launch_auto_stress_after_reboot.ps1'
 Copy-Item -LiteralPath $sourceLauncher -Destination $localLauncher -Force
 
-$installRootNormalized = [System.IO.Path]::GetFullPath($InstallRoot)
+function Resolve-SubstAlias {
+    param([string]$Path)
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if ($full.Length -lt 2 -or $full.Substring(1,1) -ne ':') { return $full }
+    $letter = $full.Substring(0,2)
+    $rest   = $full.Substring(2).TrimStart('\')
+    foreach ($line in (& subst 2>$null)) {
+        if ($line -match ('^' + [Regex]::Escape($letter) + '\\?: => (.+)$')) {
+            $target = $matches[1].TrimEnd('\')
+            if ($rest) { return (Join-Path $target $rest) } else { return ($target + '\') }
+        }
+    }
+    return $full
+}
+
+$installRootNormalized = Resolve-SubstAlias -Path $InstallRoot
 $installRootNormalized | Out-File -FilePath (Join-Path $stateDir 'InstallRoot.txt') -Encoding ascii -Force
 
 $currentBootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
