@@ -56,13 +56,25 @@ function Ensure-SubstF {
 function Test-InstallRoot {
     param([string]$Root)
     if (-not $Root) { return $false }
+    # Guard against Join-Path throwing "drive does not exist" when the hint
+    # points to a drive letter that was dropped after reboot (e.g. F:\ from
+    # a net use /persistent:no or a subst alias that wasn't restored).
+    if (-not (Test-Path -LiteralPath $Root -ErrorAction SilentlyContinue)) {
+        Write-LauncherLog "Test-InstallRoot: root not accessible: $Root"
+        return $false
+    }
     $needed = @(
         'customization\scripts\auto_stress_test.ps1',
         'test\aida_fio_furmark.ps1',
         'SoftForTest'
     )
     foreach ($rel in $needed) {
-        $full = Join-Path $Root $rel
+        try {
+            $full = Join-Path $Root $rel -ErrorAction Stop
+        } catch {
+            Write-LauncherLog "Test-InstallRoot: Join-Path failed for '$Root' + '$rel': $($_.Exception.Message)"
+            return $false
+        }
         if (-not (Test-Path -LiteralPath $full -ErrorAction SilentlyContinue)) {
             Write-LauncherLog "Test-InstallRoot: missing $full"
             return $false

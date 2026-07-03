@@ -1315,6 +1315,56 @@ if ((Test-Path $prepareScript) -and (Test-Path $patchedWim)) {
     }
 }
 
+# Step 1.5: PXE staging cleanup. On PXE installs unattend-02 copies ~108 GB of
+# installers/scripts to C:\IPDROM so pipeline can run from local FS. Those bytes
+# inflate the FFU beyond what fits on a 57 GB IpdromREC flash. Nuke the staging
+# tree BEFORE reboot into WinPE so DISM captures a lean disk. USB installs never
+# create C:\IPDROM, so this whole block is a no-op there.
+if ($flashReady -and (Test-Path -LiteralPath 'C:\IPDROM')) {
+    Write-ColorOutput '  PXE staging detected - purging C:\IPDROM to shrink FFU image...' 'Yellow'
+    $freeBefore = (Get-PSDrive -Name C).Free
+
+    # Stage trigger script locally so we can still call it after C:\IPDROM is gone.
+    $safeScriptsDir = 'C:\ProgramData\IPDROM\Scripts'
+    New-Item -ItemType Directory -Path $safeScriptsDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $localTrigger = Join-Path $safeScriptsDir 'Invoke-FfuCaptureReboot.ps1'
+    try {
+        Copy-Item -LiteralPath $triggerScript -Destination $localTrigger -Force -ErrorAction Stop
+        $triggerScript = $localTrigger
+        Write-ColorOutput "  Staged trigger script -> $localTrigger" 'Gray'
+    } catch {
+        Write-Warning "  Failed to stage trigger script locally: $_ (aborting PXE cleanup)"
+        $flashReady = $false
+    }
+
+    if ($flashReady) {
+        # Drop Run-key first so the restored image doesn't try to resurrect subst F:.
+        try {
+            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' `
+                -Name 'IPDROM_SubstF' -Force -ErrorAction SilentlyContinue
+            Write-ColorOutput "  Removed HKLM Run key 'IPDROM_SubstF'." 'Gray'
+        } catch {}
+
+        # Drop the F: alias. Script itself is already loaded into memory so this is safe.
+        try { & subst F: /D 2>$null | Out-Null } catch {}
+
+        # Blow away staging. SilentlyContinue tolerates any file still in use.
+        Remove-Item -LiteralPath 'C:\IPDROM' -Recurse -Force -ErrorAction SilentlyContinue
+
+        # Launcher state (completion flag lives at C:\ProgramData\IPDROM_StressTest_Completed.flag,
+        # NOT inside this subtree, and stays intact).
+        Remove-Item -LiteralPath 'C:\ProgramData\IPDROM\State' -Recurse -Force -ErrorAction SilentlyContinue
+
+        $freeAfter = (Get-PSDrive -Name C).Free
+        $freedGB   = [math]::Round(($freeAfter - $freeBefore) / 1GB, 2)
+        if (Test-Path -LiteralPath 'C:\IPDROM') {
+            Write-ColorOutput "  Freed ${freedGB} GB on C: (some locked files remain in C:\IPDROM)." 'Yellow'
+        } else {
+            Write-ColorOutput "  Freed ${freedGB} GB on C:. Staging fully removed." 'Green'
+        }
+    }
+}
+
 # Step 2: arm BootNext and reboot into WinPE (only if flash is ready)
 if ($flashReady -and (Test-Path $triggerScript)) {
     Write-ColorOutput '  Arming BootNext and rebooting into WinPE for FFU capture...' 'Yellow'
