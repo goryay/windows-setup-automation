@@ -786,9 +786,55 @@ if (Test-Path $script:Aida64FullPath) {
     # чтобы оставаться корректной если в другой версии AIDA снова сменит расширение.
     $reportPath = Join-Path $reportsDir 'SystemReport.htm'
 
-    Start-Process -FilePath $script:Aida64FullPath `
+    # AIDA64 was TerminateProcess'd after the stress phase, so it left state
+    # files that trigger a "did not close properly" modal on next launch. The
+    # modal blocks report generation for 17+ minutes until we time out. Clear
+    # residual process + state files BEFORE the second launch, and hard-cap
+    # the report step so even a stray modal costs 5 min max, not 17.
+    try {
+        Get-Process -Name 'AIDA64Port','aida64' -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        $aidaHome    = Split-Path -Parent $script:Aida64FullPath
+        $stalePaths  = @(
+            (Join-Path $aidaHome '*.tmp'),
+            (Join-Path $aidaHome '*.pid'),
+            (Join-Path $aidaHome '*.lock'),
+            (Join-Path $aidaHome '_running*'),
+            (Join-Path $aidaHome 'Data\*.tmp'),
+            (Join-Path $aidaHome 'Data\*.pid'),
+            (Join-Path $aidaHome 'Data\*.lock'),
+            (Join-Path $aidaHome 'Data\_running*'),
+            "$env:LOCALAPPDATA\FinalWire\AIDA64\*.tmp",
+            "$env:LOCALAPPDATA\FinalWire\AIDA64\*.pid",
+            "$env:LOCALAPPDATA\FinalWire\AIDA64\*.lock",
+            "$env:APPDATA\FinalWire\AIDA64\*.tmp",
+            "$env:APPDATA\FinalWire\AIDA64\*.pid",
+            "$env:APPDATA\FinalWire\AIDA64\*.lock",
+            "$env:TEMP\aida64*"
+        )
+        foreach ($p in $stalePaths) {
+            Remove-Item -Path $p -Force -Recurse -ErrorAction SilentlyContinue
+        }
+        Write-Log "AIDA64 state cleared for clean report launch." 'Gray'
+    } catch {
+        Write-Log "AIDA64 pre-launch cleanup partially failed: $_" 'Yellow'
+    }
+
+    $aidaProc = Start-Process -FilePath $script:Aida64FullPath `
         -ArgumentList @('/R', $reportPath, '/ALL', '/SUM', '/HW', '/SW', '/AUDIT', '/HTML') `
-        -Wait -NoNewWindow
+        -PassThru -NoNewWindow
+
+    $reportTimeoutMs = 300000   # 5 min hard cap
+    if ($aidaProc.WaitForExit($reportTimeoutMs)) {
+        Write-Log "AIDA64 report process exited (exit code: $($aidaProc.ExitCode))." 'Gray'
+    } else {
+        Write-Log "AIDA64 report generation timed out after $($reportTimeoutMs/1000)s. Killing." 'Yellow'
+        try { $aidaProc | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
+        Get-Process -Name 'AIDA64Port','aida64' -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
 
     $actualReport = Get-ChildItem -Path $reportsDir -Filter 'SystemReport.htm*' -ErrorAction SilentlyContinue |
                     Sort-Object LastWriteTime -Descending | Select-Object -First 1

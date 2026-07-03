@@ -994,6 +994,40 @@ $testArgs += "$DurationMinutes"
 Write-ColorOutput "  Arguments: $($testArgs -join ' ')" 'Green'
 Write-ColorOutput "  Full aida_fio_furmark call: $testScript $($testArgs -join ' ')" 'DarkGray'
 
+# ===================== [2.4/7] .NET FRAMEWORK 3.5 =====================
+# Intellect Classic MSI custom actions reference .NET 3.5. Without it,
+# WSInstaller shows a modal "Download .NET 3.5?" dialog that blocks the
+# unattended install forever. Enable NetFx3 offline from the Windows sxs
+# source (copied into common\sources\sxs on the PXE server) so no Windows
+# Update access is needed. /LimitAccess forbids WU fallback outright.
+# Failure only warns — Intellect X installs don't need this and will proceed.
+Write-ColorOutput '[2.4/7] Ensuring .NET Framework 3.5 is enabled...' 'Yellow'
+try {
+    $netfx = Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction Stop
+    if ($netfx.State -eq 'Enabled') {
+        Write-ColorOutput '  NetFx3 already enabled.' 'Gray'
+    } else {
+        $sxsCandidates = @(
+            (Join-Path $usbRoot 'sources\sxs'),
+            'C:\IPDROM\sources\sxs'
+        )
+        $sxs = $sxsCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ($sxs) {
+            Write-ColorOutput "  Enabling NetFx3 offline from $sxs..." 'Yellow'
+            & dism.exe /online /enable-feature /featurename:NetFx3 /all /quiet /norestart /source:"$sxs" /LimitAccess | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-ColorOutput '  NetFx3 enabled.' 'Green'
+            } else {
+                Write-Warning "  DISM enable-feature exit=$LASTEXITCODE. Intellect installer may prompt user."
+            }
+        } else {
+            Write-Warning "  sxs folder not found ($($sxsCandidates -join ', ')). Copy Win11 sources\sxs to common\sources\sxs on the PXE server."
+        }
+    }
+} catch {
+    Write-Warning "  NetFx3 check failed: $_"
+}
+
 # ===================== [2.5/7] AXXON SOFTWARE INSTALL =====================
 # Router читает build_spec (SL*-*.txt в config\) и зовёт install_intellect[x].ps1
 # по флагам axxonsoft / axxonsoft_install / axxon_LS. Никаких pre/post ребутов
