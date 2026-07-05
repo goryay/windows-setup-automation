@@ -283,6 +283,31 @@ function Get-PhysicalDrives {
     return $drives
 }
 
+# Clear stale Foreign configuration if any. Drives that belonged to a previous
+# RAID group on this controller sit in 'UGood F' (Foreign) state and StorCLI
+# refuses to include them in a new VD with "resources already in use". On a
+# stress-test/build stand we don't need the old metadata — subsequent steps
+# format everything anyway. Idempotent: if nothing is Foreign, no-op.
+try {
+    $fcheck = & $storcli /c0/fall show 2>&1
+    $foreignPresent = ($fcheck | Out-String) -match '(?i)foreign|frgn'
+    if ($foreignPresent) {
+        Write-Log "Foreign configuration detected on /c0 - clearing to unblock drives." 'Yellow'
+        $fout = & $storcli /c0/fall del 2>&1
+        foreach ($l in $fout) { Write-Log "  | $l" 'DarkGray' }
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "Foreign configuration cleared." 'Green'
+            Start-Sleep -Seconds 3
+        } else {
+            Write-Log "Foreign clear returned exit=$LASTEXITCODE (may need manual 'storcli /c0/fall del')." 'Yellow'
+        }
+    } else {
+        Write-Log "No Foreign configuration present." 'Gray'
+    }
+} catch {
+    Write-Log "Foreign check/clear threw: $_ (continuing anyway)." 'Yellow'
+}
+
 $allDrives = Get-PhysicalDrives -Cli $storcli
 Write-Log "Enumerated $($allDrives.Count) physical drive(s):" 'Gray'
 foreach ($d in $allDrives) {
