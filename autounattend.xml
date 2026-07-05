@@ -474,7 +474,10 @@ try {
     reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization' /v NoLockScreen /t REG_DWORD /d 1 /f | Out-Null
     $sig = '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);'
     $es  = Add-Type -MemberDefinition $sig -Name PInvokeUA02 -Namespace Win32 -PassThru
-    [void]$es::SetThreadExecutionState(0x80000003)
+    # 0x80000003 = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED.
+    # Written as a raw literal it overflows Int32 and PS can't cast the negative
+    # result to UInt32. Parse as hex explicitly to skip the whole Int32 detour.
+    [void]$es::SetThreadExecutionState([Convert]::ToUInt32('80000003', 16))
     W "Anti-idle armed (powercfg cleared + NoLockScreen + SetThreadExecutionState SYSTEM+DISPLAY)."
 } catch {
     W "WARN: anti-idle setup partially failed: $($_.Exception.Message)"
