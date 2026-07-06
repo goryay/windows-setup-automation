@@ -1028,6 +1028,30 @@ try {
     Write-Warning "  NetFx3 check failed: $_"
 }
 
+# ===================== [2.45/7] DOCUMENTATION TO DESKTOP =====================
+# Parse doc= from SL config, copy per-SL PDFs to Desktop\Documentation so the
+# operator sees them right after autologin. Flash copy happens later in [6.6/7].
+Write-ColorOutput '[2.45/7] Deploying documentation to Desktop...' 'Yellow'
+try {
+    $sl = (Get-ItemProperty -Path 'HKLM:\Software\IPDROM' -Name 'SL' -ErrorAction SilentlyContinue).SL
+    $deployDocs = Join-Path $scriptDir 'deploy_docs.ps1'
+    if ($sl -and (Test-Path $deployDocs)) {
+        $slCfg = Join-Path $usbRoot "config\$sl.txt"
+        $docsSrc = Join-Path $usbRoot 'documentation'
+        $desktopDst = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Documentation'
+        if ((Test-Path $slCfg) -and (Test-Path $docsSrc)) {
+            & $deployDocs -SLConfigPath $slCfg -DocsSource $docsSrc -DesktopDest $desktopDst
+            Write-ColorOutput '  Docs deployed to Desktop.' 'Green'
+        } else {
+            Write-ColorOutput "  Skipping: config or docs folder missing (SL=$sl)." 'Yellow'
+        }
+    } else {
+        Write-ColorOutput '  Skipping: no SL in registry or deploy_docs.ps1 not found.' 'Gray'
+    }
+} catch {
+    Write-Warning "  deploy_docs threw: $_"
+}
+
 # ===================== [2.5/7] AXXON SOFTWARE INSTALL =====================
 # Router читает build_spec (SL*-*.txt в config\) и зовёт install_intellect[x].ps1
 # по флагам axxonsoft / axxonsoft_install / axxon_LS. Никаких pre/post ребутов
@@ -1296,6 +1320,56 @@ if (-not $script:PipelineHealthy) {
 }
 
 Write-ColorOutput '  Pipeline healthy - proceeding to FFU capture.' 'Green'
+
+# ===================== [6.6/7] DEPLOY EXTRAS TO IpdromDOCS =====================
+# Copy drivers/, software/, per-SL PDFs to the flash operator picked in WinPE
+# (identified by volume label "IpdromDOCS"). Must run BEFORE C:\IPDROM cleanup
+# in [6.7/7] step 1.5. If no IpdromDOCS flash was labeled, script skips silently.
+Write-ColorOutput '[6.6/7] Deploying drivers/software/docs to IpdromDOCS flash...' 'Yellow'
+$deployExtras = Join-Path $scriptDir 'deploy_extras.ps1'
+if (Test-Path $deployExtras) {
+    try {
+        $sl = (Get-ItemProperty -Path 'HKLM:\Software\IPDROM' -Name 'SL' -ErrorAction SilentlyContinue).SL
+        $slCfgPath = if ($sl) { Join-Path $usbRoot "config\$sl.txt" } else { '' }
+        & $deployExtras -UsbRoot $usbRoot -SLConfigPath $slCfgPath
+        Write-ColorOutput '  deploy_extras finished.' 'Green'
+    } catch {
+        Write-Warning "  deploy_extras threw: $_"
+    }
+} else {
+    Write-ColorOutput '  deploy_extras.ps1 not found - skipping.' 'Gray'
+}
+
+# ===================== [6.65/7] REGISTER PROTECT-IPDROMREC TASK =====================
+# After FFU capture completes in WinPE and machine returns to Windows,
+# a one-shot scheduled task will verify restore.ffu and set the IpdromREC
+# flash disk to readonly. We register it here, BEFORE the reboot, so the
+# task exists on the freshly captured image.
+Write-ColorOutput '[6.65/7] Registering IpdromREC protect task (fires on next Windows boot)...' 'Yellow'
+$protectSrc = Join-Path $scriptDir 'protect_ipdromrec.ps1'
+if (Test-Path $protectSrc) {
+    try {
+        $safeScriptsDir = 'C:\ProgramData\IPDROM\Scripts'
+        New-Item -ItemType Directory -Path $safeScriptsDir -Force -ErrorAction SilentlyContinue | Out-Null
+        $localProtect = Join-Path $safeScriptsDir 'protect_ipdromrec.ps1'
+        Copy-Item -LiteralPath $protectSrc -Destination $localProtect -Force -ErrorAction Stop
+        $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $action = New-ScheduledTaskAction -Execute $psExe `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$localProtect`""
+        # 60s delay after logon gives USB stack time to enumerate the flashes
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $trigger.Delay = 'PT60S'
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -MultipleInstances IgnoreNew
+        Register-ScheduledTask -TaskName 'IPDROM_ProtectRec' -Action $action -Trigger $trigger `
+            -Settings $settings -RunLevel Highest -Force | Out-Null
+        Write-ColorOutput '  Task IPDROM_ProtectRec registered (60s delay after logon).' 'Green'
+    } catch {
+        Write-Warning "  Failed to register protect task: $_"
+    }
+} else {
+    Write-ColorOutput '  protect_ipdromrec.ps1 not found - protect step skipped.' 'Gray'
+}
 
 # ===================== [6.7/7] FFU CAPTURE =====================
 Write-ColorOutput '[6.7/7] Creating FFU recovery image (reboot into WinPE)...' 'Yellow'
