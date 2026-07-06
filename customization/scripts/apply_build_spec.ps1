@@ -120,7 +120,7 @@ function Resolve-ConfigPath {
     }
 
     # Допускаем: SL111111-001.txt (production), SLTEST99-001.txt (тестовые),
-    # SL111111-001 1.txt (Windows-дубликаты). \w = [A-Za-z0-9_].
+    # SL111111-001.txt (Windows-дубликаты). \w = [A-Za-z0-9_].
     $slCandidates = @(Get-ChildItem -Path $Dir -Filter 'SL*.txt' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '^SL\w+-\w+(\s+\d+)?\.txt$' } |
         Sort-Object LastWriteTime -Descending)
