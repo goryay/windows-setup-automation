@@ -56,7 +56,7 @@ if ($ffuGB -lt 5) {
 
 # Get disk number
 $part = Get-Partition -DriveLetter $recLetter -ErrorAction SilentlyContinue
-if (-not $part) { W "Cannot find partition for $recLetter:"; exit 1 }
+if (-not $part) { W "Cannot find partition for ${recLetter}:"; exit 1 }
 $diskNum = $part.DiskNumber
 
 # Safety: confirm target disk is USB before touching it
