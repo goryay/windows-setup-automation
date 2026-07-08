@@ -32,60 +32,85 @@ W "IpdromDOCS flash root: $flashRoot"
 $free = (Get-PSDrive -Name $flashLetter -ErrorAction SilentlyContinue).Free
 if ($free) { W ("Free space on flash: {0:N1} GB" -f ($free / 1GB)) }
 
-# Skip huge install images that don't belong on a repair flash (up to 4 GB each).
-# .swm/.wim/.esd = Windows install media. Repair flash needs drivers + installers,
-# not another copy of the install media — that's what IpdromREC is for.
-$excludeFiles = @('*.swm', '*.wim', '*.esd', '*.iso')
+# =============================================================================
+# Per-SL selection: only what a repair master actually needs for THIS machine.
+# Full drivers/ and software/ folders (~30 GB each with .swm images) are NOT
+# copied — only motherboard-specific drivers, RAID software (if RAID present)
+# and NVIDIA driver (if discrete GPU present). Docs handled via deploy_docs.
+# =============================================================================
 
-# Sum size of folder excluding the big install-image files
-function Measure-CopySize {
-    param([string]$Src)
-    $sum = 0
-    Get-ChildItem -LiteralPath $Src -Recurse -File -Force -ErrorAction SilentlyContinue |
+# Parse SL config into a hashtable (case-insensitive keys)
+$sl = @{}
+if ($SLConfigPath -and (Test-Path -LiteralPath $SLConfigPath)) {
+    foreach ($line in (Get-Content -LiteralPath $SLConfigPath -Encoding UTF8)) {
+        if ($line -match '^\s*([^=#][^=]*?)\s*=\s*(.*)\s*$') {
+            $sl[$matches[1].Trim().ToLower()] = $matches[2].Trim()
+        }
+    }
+    W "Parsed $($sl.Count) SL config keys."
+    W "  mb_model:            $($sl['mb_model'])"
+    W "  gpu_discrete:        $($sl['gpu_discrete']) (model=$($sl['gpu_discrete_model']))"
+    W "  raid1_model:         $($sl['raid1_model'])"
+    W "  raid2_model:         $($sl['raid2_model'])"
+} else {
+    W "WARN: no SL config — will copy nothing selective."
+}
+
+# NOTE: motherboard drivers intentionally NOT copied — repair master doesn't
+# reinstall the OS on the same board, they either restore via IpdromREC FFU or
+# swap boards. Only RAID/GPU/docs go on the flash.
+
+# --- MegaRAID software (LSI/Avago) if any RAID controller declared -------
+$hasRaid = (($sl['raid1_model']) -and ($sl['raid1_model'] -ne 'None')) `
+        -or (($sl['raid2_model']) -and ($sl['raid2_model'] -ne 'None'))
+if ($hasRaid) {
+    foreach ($subdir in @('AvagoMegaRaid', 'DriverAvagoMegaRaid')) {
+        $src = Join-Path $UsbRoot "software\$subdir"
+        $dst = Join-Path $flashRoot "software\$subdir"
+        if (Test-Path -LiteralPath $src) {
+            W "Copying RAID pkg $subdir: $src -> $dst"
+            $rcLog = Join-Path $logDir "deploy_extras_$subdir.log"
+            & robocopy.exe $src $dst /E /XJ /R:2 /W:5 /MT:8 /NFL /NDL /NP /LOG:$rcLog | Out-Null
+            W "  $subdir robocopy exit=$LASTEXITCODE"
+        } else {
+            W "WARN: RAID pkg $subdir not found at $src"
+        }
+    }
+} else {
+    W "No RAID controllers in SL config — RAID software skipped."
+}
+
+# --- NVIDIA driver if discrete GPU declared ------------------------------
+$gpuDisc = ($sl['gpu_discrete'] -eq 'TRUE') `
+        -and ($sl['gpu_discrete_model']) `
+        -and ($sl['gpu_discrete_model'] -ne 'None')
+if ($gpuDisc) {
+    $softwareDir = Join-Path $UsbRoot 'software'
+    # Match: files with 'nvidia' in name (case-insensitive) OR NVIDIA versioned
+    # installer pattern like "551.86-desktop-*.exe"
+    $nvFiles = Get-ChildItem -LiteralPath $softwareDir -File -ErrorAction SilentlyContinue |
         Where-Object {
-            $name = $_.Name
-            -not ($excludeFiles | Where-Object { $name -like $_ })
-        } |
-        ForEach-Object { $sum += $_.Length }
-    return $sum
-}
-
-# --- drivers ---
-$driversSrc = Join-Path $UsbRoot 'drivers'
-$driversDst = Join-Path $flashRoot 'drivers'
-if (Test-Path -LiteralPath $driversSrc) {
-    $needBytes = Measure-CopySize -Src $driversSrc
-    $freeBytes = (Get-PSDrive -Name $flashLetter -ErrorAction SilentlyContinue).Free
-    W ("drivers needs {0:N2} GB (excluding install images); free {1:N2} GB" -f ($needBytes/1GB), ($freeBytes/1GB))
-    if ($needBytes -gt $freeBytes) {
-        W "WARN: drivers would not fit even without install images. Skipping."
+            $_.Extension -eq '.exe' -and (
+                $_.Name -match '(?i)nvidia' -or
+                $_.Name -match '^\d+\.\d{2,}-desktop.*'
+            )
+        }
+    if ($nvFiles) {
+        $nvDst = Join-Path $flashRoot 'software\NVIDIA'
+        New-Item -ItemType Directory -Path $nvDst -Force -ErrorAction SilentlyContinue | Out-Null
+        foreach ($nv in $nvFiles) {
+            W "Copying NVIDIA installer: $($nv.Name) -> $nvDst"
+            try {
+                Copy-Item -LiteralPath $nv.FullName -Destination $nvDst -Force -ErrorAction Stop
+            } catch {
+                W "  Copy failed: $($_.Exception.Message)"
+            }
+        }
     } else {
-        W "Copying drivers: $driversSrc -> $driversDst (excluding install images)"
-        $rcLog = Join-Path $logDir 'deploy_extras_drivers.log'
-        & robocopy.exe $driversSrc $driversDst /E /XJ /R:2 /W:5 /MT:8 /XF $excludeFiles /NFL /NDL /NP /LOG:$rcLog | Out-Null
-        W "  drivers robocopy exit=$LASTEXITCODE"
+        W "WARN: gpu_discrete=TRUE in SL but no NVIDIA installer found in $softwareDir"
     }
 } else {
-    W "WARN: drivers folder not found at $driversSrc - skipping."
-}
-
-# --- software ---
-$softwareSrc = Join-Path $UsbRoot 'software'
-$softwareDst = Join-Path $flashRoot 'software'
-if (Test-Path -LiteralPath $softwareSrc) {
-    $needBytes = Measure-CopySize -Src $softwareSrc
-    $freeBytes = (Get-PSDrive -Name $flashLetter -ErrorAction SilentlyContinue).Free
-    W ("software needs {0:N2} GB (excluding install images); free {1:N2} GB" -f ($needBytes/1GB), ($freeBytes/1GB))
-    if ($needBytes -gt $freeBytes) {
-        W "WARN: software would not fit. Skipping."
-    } else {
-        W "Copying software: $softwareSrc -> $softwareDst (excluding install images)"
-        $rcLog = Join-Path $logDir 'deploy_extras_software.log'
-        & robocopy.exe $softwareSrc $softwareDst /E /XJ /R:2 /W:5 /MT:8 /XF $excludeFiles /NFL /NDL /NP /LOG:$rcLog | Out-Null
-        W "  software robocopy exit=$LASTEXITCODE"
-    }
-} else {
-    W "WARN: software folder not found at $softwareSrc - skipping."
+    W "No discrete GPU in SL config — NVIDIA driver skipped."
 }
 
 # --- documentation via deploy_docs ---
