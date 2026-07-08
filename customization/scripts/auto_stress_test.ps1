@@ -1038,7 +1038,8 @@ try {
     if ($sl -and (Test-Path $deployDocs)) {
         $slCfg = Join-Path $usbRoot "config\$sl.txt"
         $docsSrc = Join-Path $usbRoot 'documentation'
-        $desktopDst = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Documentation'
+        # PDFs go directly on Desktop root (per SL doc= list). No subfolder.
+        $desktopDst = [Environment]::GetFolderPath('Desktop')
         if ((Test-Path $slCfg) -and (Test-Path $docsSrc)) {
             & $deployDocs -SLConfigPath $slCfg -DocsSource $docsSrc -DesktopDest $desktopDst
             Write-ColorOutput '  Docs deployed to Desktop.' 'Green'

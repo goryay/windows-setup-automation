@@ -32,14 +32,39 @@ W "IpdromDOCS flash root: $flashRoot"
 $free = (Get-PSDrive -Name $flashLetter -ErrorAction SilentlyContinue).Free
 if ($free) { W ("Free space on flash: {0:N1} GB" -f ($free / 1GB)) }
 
+# Skip huge install images that don't belong on a repair flash (up to 4 GB each).
+# .swm/.wim/.esd = Windows install media. Repair flash needs drivers + installers,
+# not another copy of the install media — that's what IpdromREC is for.
+$excludeFiles = @('*.swm', '*.wim', '*.esd', '*.iso')
+
+# Sum size of folder excluding the big install-image files
+function Measure-CopySize {
+    param([string]$Src)
+    $sum = 0
+    Get-ChildItem -LiteralPath $Src -Recurse -File -Force -ErrorAction SilentlyContinue |
+        Where-Object {
+            $name = $_.Name
+            -not ($excludeFiles | Where-Object { $name -like $_ })
+        } |
+        ForEach-Object { $sum += $_.Length }
+    return $sum
+}
+
 # --- drivers ---
 $driversSrc = Join-Path $UsbRoot 'drivers'
 $driversDst = Join-Path $flashRoot 'drivers'
 if (Test-Path -LiteralPath $driversSrc) {
-    W "Copying drivers: $driversSrc -> $driversDst"
-    $rcLog = Join-Path $logDir 'deploy_extras_drivers.log'
-    & robocopy.exe $driversSrc $driversDst /E /XJ /R:2 /W:5 /MT:8 /NFL /NDL /NP /LOG:$rcLog | Out-Null
-    W "  drivers robocopy exit=$LASTEXITCODE"
+    $needBytes = Measure-CopySize -Src $driversSrc
+    $freeBytes = (Get-PSDrive -Name $flashLetter -ErrorAction SilentlyContinue).Free
+    W ("drivers needs {0:N2} GB (excluding install images); free {1:N2} GB" -f ($needBytes/1GB), ($freeBytes/1GB))
+    if ($needBytes -gt $freeBytes) {
+        W "WARN: drivers would not fit even without install images. Skipping."
+    } else {
+        W "Copying drivers: $driversSrc -> $driversDst (excluding install images)"
+        $rcLog = Join-Path $logDir 'deploy_extras_drivers.log'
+        & robocopy.exe $driversSrc $driversDst /E /XJ /R:2 /W:5 /MT:8 /XF $excludeFiles /NFL /NDL /NP /LOG:$rcLog | Out-Null
+        W "  drivers robocopy exit=$LASTEXITCODE"
+    }
 } else {
     W "WARN: drivers folder not found at $driversSrc - skipping."
 }
@@ -48,10 +73,17 @@ if (Test-Path -LiteralPath $driversSrc) {
 $softwareSrc = Join-Path $UsbRoot 'software'
 $softwareDst = Join-Path $flashRoot 'software'
 if (Test-Path -LiteralPath $softwareSrc) {
-    W "Copying software: $softwareSrc -> $softwareDst"
-    $rcLog = Join-Path $logDir 'deploy_extras_software.log'
-    & robocopy.exe $softwareSrc $softwareDst /E /XJ /R:2 /W:5 /MT:8 /NFL /NDL /NP /LOG:$rcLog | Out-Null
-    W "  software robocopy exit=$LASTEXITCODE"
+    $needBytes = Measure-CopySize -Src $softwareSrc
+    $freeBytes = (Get-PSDrive -Name $flashLetter -ErrorAction SilentlyContinue).Free
+    W ("software needs {0:N2} GB (excluding install images); free {1:N2} GB" -f ($needBytes/1GB), ($freeBytes/1GB))
+    if ($needBytes -gt $freeBytes) {
+        W "WARN: software would not fit. Skipping."
+    } else {
+        W "Copying software: $softwareSrc -> $softwareDst (excluding install images)"
+        $rcLog = Join-Path $logDir 'deploy_extras_software.log'
+        & robocopy.exe $softwareSrc $softwareDst /E /XJ /R:2 /W:5 /MT:8 /XF $excludeFiles /NFL /NDL /NP /LOG:$rcLog | Out-Null
+        W "  software robocopy exit=$LASTEXITCODE"
+    }
 } else {
     W "WARN: software folder not found at $softwareSrc - skipping."
 }
@@ -61,7 +93,9 @@ if ($SLConfigPath -and (Test-Path -LiteralPath $SLConfigPath)) {
     $deployDocs = Join-Path $PSScriptRoot 'deploy_docs.ps1'
     if (Test-Path -LiteralPath $deployDocs) {
         $docsSrc = Join-Path $UsbRoot 'documentation'
-        $desktopDst = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Documentation'
+        # Desktop root (no subfolder) — PDFs appear as icons directly on Desktop
+        $desktopDst = [Environment]::GetFolderPath('Desktop')
+        # Flash keeps a Documentation subfolder for organization
         $flashDocsDst = Join-Path $flashRoot 'Documentation'
         W "Calling deploy_docs to copy per-SL PDFs to flash + refresh desktop..."
         try {

@@ -411,6 +411,23 @@ function Mount-PxeIfNeeded {
         if (Test-Connection 10.0.6.42 -Count 1 -Quiet -ErrorAction SilentlyContinue) { break }
         Start-Sleep -Seconds 2
     }
+    # If F: is currently taken by a USB volume (typically IpdromDOCS auto-mounted
+    # after WinPE format), move it to a high letter so F: is free for SMB mount.
+    try {
+        $part = Get-Partition -DriveLetter F -ErrorAction SilentlyContinue
+        if ($part) {
+            $disk = Get-Disk -Number $part.DiskNumber -ErrorAction SilentlyContinue
+            if ($disk -and $disk.BusType -eq 'USB') {
+                foreach ($newLtr in 'XWQPONMKJIH'.ToCharArray()) {
+                    if (-not (Get-Volume -DriveLetter $newLtr -ErrorAction SilentlyContinue)) {
+                        Set-Partition -DiskNumber $part.DiskNumber -PartitionNumber $part.PartitionNumber -NewDriveLetter $newLtr -ErrorAction SilentlyContinue
+                        W "Moved USB volume from F: to ${newLtr}: to free F: for SMB mount."
+                        break
+                    }
+                }
+            }
+        }
+    } catch { W "Failed to check/move F: - $($_.Exception.Message)" }
     &amp; net use F: \\10.0.6.42\winpxe\common /user:pxe pxe /persistent:no 2&gt;&amp;1 | Out-String | ForEach-Object { W $_ }
 }
 
