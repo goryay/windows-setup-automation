@@ -279,7 +279,7 @@ exit 0
 # ===================== FIND CANDIDATE FLASH =====================
 Write-Log "Scanning for candidate USB flash drives..." 'Yellow'
 
-$pipelineLabels = @('Ventoy','VTOYEFI','IPDROM_Recovery','RECOVERY','VTOY')
+$pipelineLabels = @('Ventoy','VTOYEFI','IPDROM_Recovery','RECOVERY','VTOY','IPDROM')
 
 $allUsbDisks = @(Get-Disk -ErrorAction SilentlyContinue |
     Where-Object { $_.BusType -eq 'USB' -and $_.IsBoot -eq $false -and $_.IsSystem -eq $false })
@@ -451,9 +451,29 @@ Write-Log "FRESH: wiping and partitioning Disk $($disk.Number)..." 'Cyan'
 # создаётся автоматически при наличии removable USB с bootx64.efi).
 # В Invoke-FfuCaptureReboot.ps1 fallback на этот generic-entry и работает в проде,
 # когда в системе только наша IpdromREC флешка.
-$dpScript = @"
+#
+# ВАЖНО: `clean` на USB-flash кратковременно "отсоединяет" диск от PnP-слоя
+# Windows, и следующий `convert gpt` в том же diskpart-сессии падает с
+# "Указано несуществующее устройство" (0x80070491). Разбиваем на две сессии
+# с `rescan` и паузой между ними — стандартный workaround.
+$dpClean = @"
 select disk $($disk.Number)
 clean
+rescan
+exit
+"@
+
+$rc = Invoke-Diskpart -Script $dpClean
+if ($rc -ne 0) {
+    Write-Log "diskpart clean failed with exit code $rc. Aborting." 'Red'
+    exit 6
+}
+
+# Wait for PnP to re-enumerate the wiped disk before the next diskpart session.
+Start-Sleep -Seconds 5
+
+$dpScript = @"
+select disk $($disk.Number)
 convert gpt
 create partition primary size=$WinreSizeMB
 format fs=fat32 label="WINRE" quick
@@ -466,7 +486,7 @@ exit
 
 $rc = Invoke-Diskpart -Script $dpScript
 if ($rc -ne 0) {
-    Write-Log "diskpart failed with exit code $rc. Aborting." 'Red'
+    Write-Log "diskpart partitioning failed with exit code $rc. Aborting." 'Red'
     exit 6
 }
 

@@ -1322,11 +1322,11 @@ if (-not $script:PipelineHealthy) {
 
 Write-ColorOutput '  Pipeline healthy - proceeding to FFU capture.' 'Green'
 
-# ===================== [6.6/7] DEPLOY EXTRAS TO IpdromDOCS =====================
+# ===================== [6.6/7] DEPLOY EXTRAS TO IPDROM =====================
 # Copy drivers/, software/, per-SL PDFs to the flash operator picked in WinPE
-# (identified by volume label "IpdromDOCS"). Must run BEFORE C:\IPDROM cleanup
-# in [6.7/7] step 1.5. If no IpdromDOCS flash was labeled, script skips silently.
-Write-ColorOutput '[6.6/7] Deploying drivers/software/docs to IpdromDOCS flash...' 'Yellow'
+# (identified by volume label "IPDROM"). Must run BEFORE C:\IPDROM cleanup
+# in [6.7/7] step 1.5. If no IPDROM flash was labeled, script skips silently.
+Write-ColorOutput '[6.6/7] Deploying drivers/software/docs to IPDROM flash...' 'Yellow'
 $deployExtras = Join-Path $scriptDir 'deploy_extras.ps1'
 if (Test-Path $deployExtras) {
     try {

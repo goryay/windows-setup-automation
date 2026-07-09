@@ -16,18 +16,18 @@ W "=== deploy_extras started ==="
 W "UsbRoot:      $UsbRoot"
 W ("SLConfigPath: " + $(if ($SLConfigPath) { $SLConfigPath } else { '<none>' }))
 
-# Find IpdromDOCS flash by volume label
-$vol = Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.FileSystemLabel -eq 'IpdromDOCS' } | Select-Object -First 1
+# Find IPDROM flash by volume label
+$vol = Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.FileSystemLabel -eq 'IPDROM' } | Select-Object -First 1
 if (-not $vol) {
-    W "IpdromDOCS flash not found (label 'IpdromDOCS' not present on any volume)."
+    W "IPDROM flash not found (label 'IPDROM' not present on any volume)."
     W "Operator either chose SKIP in WinPE, or docs flash was not prepared. Nothing to do."
     exit 0
 }
 
 $flashLetter = $vol.DriveLetter
-if (-not $flashLetter) { W "IpdromDOCS volume has no drive letter assigned. Cannot copy."; exit 1 }
+if (-not $flashLetter) { W "IPDROM volume has no drive letter assigned. Cannot copy."; exit 1 }
 $flashRoot = "$($flashLetter):\"
-W "IpdromDOCS flash root: $flashRoot"
+W "IPDROM flash root: $flashRoot"
 
 $free = (Get-PSDrive -Name $flashLetter -ErrorAction SilentlyContinue).Free
 if ($free) { W ("Free space on flash: {0:N1} GB" -f ($free / 1GB)) }
@@ -61,20 +61,28 @@ if ($SLConfigPath -and (Test-Path -LiteralPath $SLConfigPath)) {
 # swap boards. Only RAID/GPU/docs go on the flash.
 
 # --- MegaRAID software (LSI/Avago) if any RAID controller declared -------
+# Копируем .zip-архив как есть — репаир-мастер сам распакует на месте.
 $hasRaid = (($sl['raid1_model']) -and ($sl['raid1_model'] -ne 'None')) `
         -or (($sl['raid2_model']) -and ($sl['raid2_model'] -ne 'None'))
 if ($hasRaid) {
-    foreach ($subdir in @('AvagoMegaRaid', 'DriverAvagoMegaRaid')) {
-        $src = Join-Path $UsbRoot "software\$subdir"
-        $dst = Join-Path $flashRoot "software\$subdir"
-        if (Test-Path -LiteralPath $src) {
-            W "Copying RAID pkg $subdir: $src -> $dst"
-            $rcLog = Join-Path $logDir "deploy_extras_$subdir.log"
-            & robocopy.exe $src $dst /E /XJ /R:2 /W:5 /MT:8 /NFL /NDL /NP /LOG:$rcLog | Out-Null
-            W "  $subdir robocopy exit=$LASTEXITCODE"
-        } else {
-            W "WARN: RAID pkg $subdir not found at $src"
+    $softwareDir = Join-Path $UsbRoot 'software'
+    $raidZips = Get-ChildItem -LiteralPath $softwareDir -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Extension -eq '.zip' -and $_.Name -match '(?i)avago|megaraid|lsi'
         }
+    if ($raidZips) {
+        $raidDst = Join-Path $flashRoot 'software'
+        New-Item -ItemType Directory -Path $raidDst -Force -ErrorAction SilentlyContinue | Out-Null
+        foreach ($z in $raidZips) {
+            W "Copying RAID archive: $($z.Name) -> $raidDst"
+            try {
+                Copy-Item -LiteralPath $z.FullName -Destination $raidDst -Force -ErrorAction Stop
+            } catch {
+                W "  Copy failed: $($_.Exception.Message)"
+            }
+        }
+    } else {
+        W "WARN: RAID controller in SL but no *.zip (avago|megaraid|lsi) archive found in $softwareDir"
     }
 } else {
     W "No RAID controllers in SL config — RAID software skipped."

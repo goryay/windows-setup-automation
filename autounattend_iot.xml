@@ -411,7 +411,7 @@ function Mount-PxeIfNeeded {
         if (Test-Connection 10.0.6.42 -Count 1 -Quiet -ErrorAction SilentlyContinue) { break }
         Start-Sleep -Seconds 2
     }
-    # If F: is currently taken by a USB volume (typically IpdromDOCS auto-mounted
+    # If F: is currently taken by a USB volume (typically IPDROM auto-mounted
     # after WinPE format), move it to a high letter so F: is free for SMB mount.
     try {
         $part = Get-Partition -DriveLetter F -ErrorAction SilentlyContinue
