@@ -315,9 +315,20 @@ foreach ($d in $allUsbDisks) {
     $hasIpdromLabel = $labels -icontains 'IpdromREC'
     $isOurs   = ($hasWinreLabel -and $hasIpdromLabel)
     $isEmpty  = ($partitions.Count -eq 0) -or ($d.PartitionStyle -eq 'RAW')
-    # "Foreign" = has partitions, but not ours
-    if (-not ($isOurs -or $isEmpty) -and -not $hasPipelineMark) {
+    # Recyclable = disk has partitions but ALL labels are empty AND no user-recognizable
+    # files (no filesystem-level pipeline markers). This covers the case where a previous
+    # install.bat or Prepare-IpdromRecFlash FRESH run partially succeeded and left the
+    # flash in a half-formatted state (e.g. WINRE partition created RAW, format failed,
+    # IpdromREC never created). Since there are no labels and no visible files, we can
+    # safely wipe and retry — no user data is at risk.
+    $anyLabel = ($labels.Count -gt 0)
+    $isRecyclable = ($partitions.Count -gt 0) -and (-not $anyLabel) -and (-not $hasPipelineMark)
+    # "Foreign" = has partitions with unrecognized labels, but not ours
+    if (-not ($isOurs -or $isEmpty -or $isRecyclable) -and -not $hasPipelineMark) {
         [void]$reasons.Add("foreign partitions/data (labels: $($labels -join ',' )))")
+    }
+    if ($isRecyclable) {
+        Write-Log ("  note:      Disk {0} has {1} unlabeled partition(s) — treating as recyclable (previous half-format)." -f $d.Number, $partitions.Count) 'DarkYellow'
     }
 
     $entry = [pscustomobject]@{
@@ -472,9 +483,19 @@ if ($rc -ne 0) {
 # Wait for PnP to re-enumerate the wiped disk before the next diskpart session.
 Start-Sleep -Seconds 5
 
+# Check current partition style. Windows 11 on UEFI often auto-initializes a freshly
+# cleaned removable disk to GPT before we get a chance to convert. In that case
+# `convert gpt` fails with 0x80070057 ("disk is not MBR format") and takes down the
+# whole diskpart script. Only issue `convert gpt` if the disk is RAW or MBR.
+$diskAfterClean = Get-Disk -Number $disk.Number -ErrorAction SilentlyContinue
+$partStyle = if ($diskAfterClean) { $diskAfterClean.PartitionStyle } else { 'RAW' }
+Write-Log "  Disk $($disk.Number) partition style after clean: $partStyle" 'Gray'
+
+$convertLine = if ($partStyle -eq 'GPT') { '' } else { "convert gpt`n" }
+
 $dpScript = @"
 select disk $($disk.Number)
-convert gpt
+$convertLine
 create partition primary size=$WinreSizeMB
 format fs=fat32 label="WINRE" quick
 assign
@@ -541,8 +562,29 @@ try {
     & dism /Mount-Wim "/WimFile:$targetBootWim" /Index:1 "/MountDir:$wimMount" /ReadOnly 2>&1 | ForEach-Object { Write-Log "  | $_" 'DarkGray' }
     if ($LASTEXITCODE -ne 0) { throw "Mount of boot.wim failed (exit $LASTEXITCODE)" }
 
-    & bcdboot "$wimMount\Windows" /s $winreRoot /f UEFI 2>&1 | ForEach-Object { Write-Log "  | $_" 'DarkGray' }
-    if ($LASTEXITCODE -ne 0) { throw "bcdboot failed (exit $LASTEXITCODE)" }
+    # bcdboot on a freshly-formatted FAT32 removable partition sometimes fails with
+    # BFSVC Error c00000bb (STATUS_NOT_SUPPORTED) "Failed to set element application
+    # device". Cause: partition isn't fully settled in the volume manager. Wait, then
+    # retry with a fresh handle. Also try /f ALL as a fallback (BIOS+UEFI).
+    Start-Sleep -Seconds 5
+    $bcdbootAttempts = @(
+        @{ Args = @("$wimMount\Windows", '/s', $winreRoot, '/f', 'UEFI');           Label = 'UEFI' },
+        @{ Args = @("$wimMount\Windows", '/s', $winreRoot, '/f', 'UEFI', '/l', 'en-US'); Label = 'UEFI+en-US' },
+        @{ Args = @("$wimMount\Windows", '/s', $winreRoot, '/f', 'ALL');            Label = 'ALL' }
+    )
+    $bcdbootOK = $false
+    foreach ($att in $bcdbootAttempts) {
+        Write-Log "  bcdboot attempt: $($att.Label) $($att.Args -join ' ')" 'Gray'
+        & bcdboot $att.Args 2>&1 | ForEach-Object { Write-Log "  | $_" 'DarkGray' }
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "  bcdboot succeeded ($($att.Label))." 'Green'
+            $bcdbootOK = $true
+            break
+        }
+        Write-Log "  bcdboot $($att.Label) failed (exit $LASTEXITCODE), sleeping 5s and trying next..." 'Yellow'
+        Start-Sleep -Seconds 5
+    }
+    if (-not $bcdbootOK) { throw "bcdboot failed after $($bcdbootAttempts.Count) attempts" }
 
     Write-Log "Bootloader installed on $winreRoot." 'Green'
 

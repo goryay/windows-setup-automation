@@ -1329,13 +1329,18 @@ Write-ColorOutput '  Pipeline healthy - proceeding to FFU capture.' 'Green'
 Write-ColorOutput '[6.6/7] Deploying drivers/software/docs to IPDROM flash...' 'Yellow'
 $deployExtras = Join-Path $scriptDir 'deploy_extras.ps1'
 if (Test-Path $deployExtras) {
+    Write-ColorOutput ("  deploy_extras.ps1 found at: $deployExtras") 'Gray'
     try {
         $sl = (Get-ItemProperty -Path 'HKLM:\Software\IPDROM' -Name 'SL' -ErrorAction SilentlyContinue).SL
         $slCfgPath = if ($sl) { Join-Path $usbRoot "config\$sl.txt" } else { '' }
-        & $deployExtras -UsbRoot $usbRoot -SLConfigPath $slCfgPath
-        Write-ColorOutput '  deploy_extras finished.' 'Green'
+        Write-ColorOutput ("  Invoking with UsbRoot=$usbRoot SLConfigPath=$slCfgPath") 'Gray'
+        & $deployExtras -UsbRoot $usbRoot -SLConfigPath $slCfgPath 2>&1 | ForEach-Object {
+            Write-ColorOutput ("    | $_") 'DarkGray'
+        }
+        Write-ColorOutput ("  deploy_extras exit code: $LASTEXITCODE") 'Green'
     } catch {
-        Write-Warning "  deploy_extras threw: $_"
+        Write-ColorOutput ("  deploy_extras threw: $($_.Exception.Message)") 'Red'
+        Write-ColorOutput ("  stack: $($_.ScriptStackTrace)") 'DarkRed'
     }
 } else {
     Write-ColorOutput '  deploy_extras.ps1 not found - skipping.' 'Gray'

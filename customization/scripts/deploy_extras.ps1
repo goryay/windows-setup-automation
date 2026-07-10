@@ -35,7 +35,7 @@ if ($free) { W ("Free space on flash: {0:N1} GB" -f ($free / 1GB)) }
 # =============================================================================
 # Per-SL selection: only what a repair master actually needs for THIS machine.
 # Full drivers/ and software/ folders (~30 GB each with .swm images) are NOT
-# copied — only motherboard-specific drivers, RAID software (if RAID present)
+# copied -- only motherboard-specific drivers, RAID software (if RAID present)
 # and NVIDIA driver (if discrete GPU present). Docs handled via deploy_docs.
 # =============================================================================
 
@@ -53,15 +53,15 @@ if ($SLConfigPath -and (Test-Path -LiteralPath $SLConfigPath)) {
     W "  raid1_model:         $($sl['raid1_model'])"
     W "  raid2_model:         $($sl['raid2_model'])"
 } else {
-    W "WARN: no SL config — will copy nothing selective."
+    W "WARN: no SL config -- will copy nothing selective."
 }
 
-# NOTE: motherboard drivers intentionally NOT copied — repair master doesn't
+# NOTE: motherboard drivers intentionally NOT copied -- repair master doesn't
 # reinstall the OS on the same board, they either restore via IpdromREC FFU or
 # swap boards. Only RAID/GPU/docs go on the flash.
 
 # --- MegaRAID software (LSI/Avago) if any RAID controller declared -------
-# Копируем .zip-архив как есть — репаир-мастер сам распакует на месте.
+# Copy the .zip archive as-is - repair master unpacks on the target machine.
 $hasRaid = (($sl['raid1_model']) -and ($sl['raid1_model'] -ne 'None')) `
         -or (($sl['raid2_model']) -and ($sl['raid2_model'] -ne 'None'))
 if ($hasRaid) {
@@ -85,7 +85,7 @@ if ($hasRaid) {
         W "WARN: RAID controller in SL but no *.zip (avago|megaraid|lsi) archive found in $softwareDir"
     }
 } else {
-    W "No RAID controllers in SL config — RAID software skipped."
+    W "No RAID controllers in SL config -- RAID software skipped."
 }
 
 # --- NVIDIA driver if discrete GPU declared ------------------------------
@@ -118,7 +118,7 @@ if ($gpuDisc) {
         W "WARN: gpu_discrete=TRUE in SL but no NVIDIA installer found in $softwareDir"
     }
 } else {
-    W "No discrete GPU in SL config — NVIDIA driver skipped."
+    W "No discrete GPU in SL config -- NVIDIA driver skipped."
 }
 
 # --- documentation via deploy_docs ---
@@ -126,7 +126,7 @@ if ($SLConfigPath -and (Test-Path -LiteralPath $SLConfigPath)) {
     $deployDocs = Join-Path $PSScriptRoot 'deploy_docs.ps1'
     if (Test-Path -LiteralPath $deployDocs) {
         $docsSrc = Join-Path $UsbRoot 'documentation'
-        # Desktop root (no subfolder) — PDFs appear as icons directly on Desktop
+        # Desktop root (no subfolder) -- PDFs appear as icons directly on Desktop
         $desktopDst = [Environment]::GetFolderPath('Desktop')
         # Flash keeps a Documentation subfolder for organization
         $flashDocsDst = Join-Path $flashRoot 'Documentation'
