@@ -4,6 +4,32 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Disable console Quick Edit Mode. When enabled (Windows default), clicking
+# inside the console starts a text selection which BLOCKS every subsequent
+# WriteFile to stdout from child processes (msiexec, installers, etc.) until
+# the user presses Enter/Escape. Symptom: pipeline appears frozen mid-install
+# but resumes the instant user presses Enter. Also add ENABLE_EXTENDED_FLAGS
+# (0x80) so the SetConsoleMode change actually sticks.
+try {
+    $sig = @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+'@
+    $t = Add-Type -MemberDefinition $sig -Name 'IpdromConsole' -Namespace 'Win32' -PassThru -ErrorAction Stop
+    $STD_INPUT_HANDLE       = -10
+    $ENABLE_QUICK_EDIT_MODE = 0x40
+    $ENABLE_EXTENDED_FLAGS  = 0x80
+    $h = $t::GetStdHandle($STD_INPUT_HANDLE)
+    $m = 0
+    if ($t::GetConsoleMode($h, [ref]$m)) {
+        $m = ($m -band (-bnot $ENABLE_QUICK_EDIT_MODE)) -bor $ENABLE_EXTENDED_FLAGS
+        [void]$t::SetConsoleMode($h, $m)
+    }
+} catch {
+    # Non-fatal - the pipeline still runs, just susceptible to accidental clicks.
+}
+
 $programDataRoot = Join-Path $env:ProgramData 'IPDROM'
 $logDir           = Join-Path $programDataRoot 'Logs'
 $stateDir         = Join-Path $programDataRoot 'State'
