@@ -76,20 +76,57 @@ if (-not $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
 }
 
 # ===================== FIND IpdromREC / WINRE PARTITIONS =====================
-$ipdromVol = Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.FileSystemLabel -ieq $FlashLabel -and $_.DriveLetter } | Select-Object -First 1
-$winreVol  = Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.FileSystemLabel -ieq $WinreLabel -and $_.DriveLetter } | Select-Object -First 1
+# Two-tier lookup:
+#   1. Get-Volume (WMI-based) - fast path when MSFT_Volume objects are registered
+#   2. System.IO.DriveInfo (native Win32 filesystem APIs) - bypasses WMI entirely
+# The fallback is critical because Windows Volume Manager sometimes fails to
+# register MSFT_Volume for freshly-formatted FAT32 removable partitions after
+# Prepare-IpdromRecFlash. DriveInfo reads the label directly from the volume
+# boot sector via the OS filesystem stack, so it works regardless of WMI state.
+function Find-DriveByLabel {
+    param([string]$Label)
+    # Try Get-Volume first
+    $v = Get-Volume -ErrorAction SilentlyContinue | Where-Object {
+        $_.FileSystemLabel -ieq $Label -and $_.DriveLetter
+    } | Select-Object -First 1
+    if ($v) {
+        return [pscustomobject]@{ DriveLetter = [char]$v.DriveLetter; Source = 'Get-Volume' }
+    }
+    # Fallback: enumerate via native Win32 file system APIs
+    foreach ($di in [System.IO.DriveInfo]::GetDrives()) {
+        if (-not $di.IsReady) { continue }
+        try {
+            if ($di.VolumeLabel -ieq $Label) {
+                $letter = $di.Name.Substring(0, 1)
+                return [pscustomobject]@{ DriveLetter = [char]$letter; Source = 'System.IO.DriveInfo' }
+            }
+        } catch { }
+    }
+    return $null
+}
 
-if (-not $ipdromVol) {
-    Write-Log "Volume '$FlashLabel' not found. Run Prepare-IpdromRecFlash.ps1 first." 'Red'
+$ipdromFound = Find-DriveByLabel -Label $FlashLabel
+$winreFound  = Find-DriveByLabel -Label $WinreLabel
+
+if (-not $ipdromFound) {
+    Write-Log "Volume '$FlashLabel' not found via Get-Volume nor DriveInfo. Run Prepare-IpdromRecFlash.ps1 first." 'Red'
     exit 4
 }
-if (-not $winreVol) {
-    Write-Log "Volume '$WinreLabel' not found. Run Prepare-IpdromRecFlash.ps1 first." 'Red'
+if (-not $winreFound) {
+    Write-Log "Volume '$WinreLabel' not found via Get-Volume nor DriveInfo. Run Prepare-IpdromRecFlash.ps1 first." 'Red'
     exit 5
 }
 
-$ipdromRoot = "$($ipdromVol.DriveLetter):"
-$winreRoot  = "$($winreVol.DriveLetter):"
+Write-Log "IpdromREC found via $($ipdromFound.Source): $($ipdromFound.DriveLetter):" 'Gray'
+Write-Log "WINRE     found via $($winreFound.Source): $($winreFound.DriveLetter):" 'Gray'
+
+$ipdromRoot = "$($ipdromFound.DriveLetter):"
+$winreRoot  = "$($winreFound.DriveLetter):"
+
+# Compat: create $ipdromVol / $winreVol shims so downstream code (which still
+# uses .DriveLetter) doesn't need to change.
+$ipdromVol = [pscustomobject]@{ DriveLetter = $ipdromFound.DriveLetter }
+$winreVol  = [pscustomobject]@{ DriveLetter = $winreFound.DriveLetter }
 Write-Log "IpdromREC: $ipdromRoot" 'Green'
 Write-Log "WINRE:     $winreRoot"  'Green'
 

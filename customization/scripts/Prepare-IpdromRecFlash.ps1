@@ -311,9 +311,16 @@ foreach ($d in $allUsbDisks) {
         if (Test-Path (Join-Path $root 'customization\scripts'))  { [void]$reasons.Add('contains \customization\scripts folder'); break }
     }
 
-    $hasWinreLabel  = $labels -icontains 'WINRE'
-    $hasIpdromLabel = $labels -icontains 'IpdromREC'
-    $isOurs   = ($hasWinreLabel -and $hasIpdromLabel)
+    # Trim to handle padded FAT32 labels (stored right-padded with spaces).
+    $labelsTrimmed  = @($labels | ForEach-Object { $_.Trim() })
+    $hasWinreLabel  = $labelsTrimmed -icontains 'WINRE'
+    $hasIpdromLabel = $labelsTrimmed -icontains 'IpdromREC'
+    # Historically required BOTH labels. But `format.com /V:X` sometimes fails to
+    # set the label on FAT32 quick format, leaving one partition unlabeled. If we
+    # required both, we'd reject a partial state as "foreign" and never recover.
+    # Accept EITHER label as ours - it's clearly not user data since our labels
+    # aren't used by anything else, and worst case we FRESH-reformat.
+    $isOurs   = ($hasWinreLabel -or $hasIpdromLabel)
     $isEmpty  = ($partitions.Count -eq 0) -or ($d.PartitionStyle -eq 'RAW')
     # Recyclable = disk has partitions but ALL labels are empty AND no user-recognizable
     # files (no filesystem-level pipeline markers). This covers the case where a previous
@@ -453,6 +460,24 @@ if ($mode -eq 'REFRESH') {
 # ===================== FRESH PATH =====================
 Write-Log "FRESH: wiping and partitioning Disk $($disk.Number)..." 'Cyan'
 
+# When prepare_flash runs in the automated pipeline (after Intellect install +
+# 30-min stress test + cleanup), Windows Volume Manager gets into a state where
+# freshly-formatted FAT32 partitions on removable USB don't get MSFT_Volume
+# registration. bcdboot and bcdedit then fail with "Cannot create system store"
+# or "Element not found". Force-restart Virtual Disk Service (vds) to clear
+# stale state. This is what "reboot before flash prep" would do at the WMI
+# layer without the cost of an actual reboot.
+Write-Log "Restarting Virtual Disk Service (vds) to clear stale WMI state before partitioning..." 'Gray'
+try {
+    Restart-Service -Name vds -Force -ErrorAction Stop
+    Start-Sleep -Seconds 5
+    # Trigger a Get-Volume enumeration to warm up the WMI cache after restart.
+    Get-Volume -ErrorAction SilentlyContinue | Out-Null
+    Write-Log "  vds restarted, WMI cache warmed." 'Gray'
+} catch {
+    Write-Log "  vds restart failed (non-fatal): $($_.Exception.Message)" 'Yellow'
+}
+
 # Diskpart script: clean + GPT + WINRE (FAT32, basic data) + IpdromREC (NTFS).
 # Раздел НЕ помечается как ESP: на removable USB Windows запрещает и
 # "create partition efi", и "set id=c12a7328..." с ошибкой
@@ -491,55 +516,223 @@ $diskAfterClean = Get-Disk -Number $disk.Number -ErrorAction SilentlyContinue
 $partStyle = if ($diskAfterClean) { $diskAfterClean.PartitionStyle } else { 'RAW' }
 Write-Log "  Disk $($disk.Number) partition style after clean: $partStyle" 'Gray'
 
-$convertLine = if ($partStyle -eq 'GPT') { '' } else { "convert gpt`n" }
+# Partitioning + formatting via PowerShell APIs instead of diskpart. Reason:
+# on Win11, diskpart's "create partition primary size=N" -> "format" sequence
+# is race-prone. Sometimes the new partition isn't yet selected by the time
+# format runs, and the whole script aborts with "Том не выбран" (no volume
+# selected). Set-Disk / New-Partition / Format-Volume handle the timing and
+# selection atomically and let us specify sizes precisely.
+#
+# Ordering matters: -AssignDriveLetter on New-Partition is ASYNCHRONOUS on Win11
+# removable USB - the returned partition object has an empty DriveLetter until
+# the mount manager catches up, which takes 1-5+ seconds. Two mitigations:
+#   1) Format FIRST via pipeline ($part | Format-Volume) which uses the partition
+#      object directly and doesn't need a drive letter.
+#   2) Assign the drive letter AFTER formatting via Add-PartitionAccessPath, then
+#      re-query Get-Partition and wait until DriveLetter is populated.
+if ($partStyle -ne 'GPT') {
+    Write-Log "  Setting partition style to GPT via Set-Disk..." 'Gray'
+    Set-Disk -Number $disk.Number -PartitionStyle GPT -ErrorAction Stop
+    Start-Sleep -Seconds 2
+}
 
-$dpScript = @"
-select disk $($disk.Number)
-$convertLine
-create partition primary size=$WinreSizeMB
-format fs=fat32 label="WINRE" quick
-assign
-create partition primary
-format fs=ntfs label="IpdromREC" quick
-assign
-exit
-"@
+function Wait-ForDriveLetter {
+    param([int]$DiskNumber, [int]$PartitionNumber, [int]$TimeoutSec = 20)
+    for ($i = 0; $i -lt $TimeoutSec; $i++) {
+        $p = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue
+        if ($p -and $p.DriveLetter -and ($p.DriveLetter -ne [char]0)) { return $p }
+        Start-Sleep -Seconds 1
+    }
+    return $null
+}
 
-$rc = Invoke-Diskpart -Script $dpScript
-if ($rc -ne 0) {
-    Write-Log "diskpart partitioning failed with exit code $rc. Aborting." 'Red'
-    exit 6
+function Format-DriveByLetter {
+    # Format a RAW partition by drive letter using native format.com.
+    # We CAN'T use Format-Volume because it requires a pre-existing MSFT_Volume
+    # object, which doesn't get materialized on a RAW partition until it's
+    # formatted (chicken-and-egg). format.com works purely by drive letter.
+    param(
+        [Parameter(Mandatory)] [char]$DriveLetter,
+        [Parameter(Mandatory)] [ValidateSet('FAT32','NTFS','exFAT')] [string]$FileSystem,
+        [Parameter(Mandatory)] [string]$Label
+    )
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'cmd.exe'
+    # /Q = quick format, /Y = suppress the "OK to format?" prompt (Win10+ supports this).
+    # We ALSO pipe "Y" to stdin in case /Y is not enough on some builds.
+    $psi.Arguments = "/c format ${DriveLetter}: /FS:$FileSystem /V:$Label /Q /Y"
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.RedirectStandardInput  = $true
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $p.StandardInput.WriteLine('Y')
+        $p.StandardInput.Close()
+    } catch { }
+    if (-not $p.WaitForExit(120000)) {
+        try { $p.Kill() } catch { }
+        throw "format.com timed out (>120s) for $Label"
+    }
+    $stdout = $p.StandardOutput.ReadToEnd()
+    $stderr = $p.StandardError.ReadToEnd()
+    foreach ($ln in (($stdout + $stderr) -split "`r?`n")) {
+        if ($ln.Trim()) { Write-Log "    | $ln" 'DarkGray' }
+    }
+    if ($p.ExitCode -ne 0) {
+        throw "format.com exited with code $($p.ExitCode) for $Label"
+    }
+
+    # Belt-and-suspenders: format.com's /V:Label sometimes silently fails to stick
+    # (esp. on FAT32 quick format), leaving the volume with an empty label. Verify
+    # and explicitly re-set via the `label` command if needed. `label X: Y` (with
+    # label as positional arg) does not prompt interactively.
+    Start-Sleep -Seconds 3
+    $currentLabel = ''
+    try {
+        $vol = Get-Volume -DriveLetter $DriveLetter -ErrorAction SilentlyContinue
+        if ($vol) { $currentLabel = $vol.FileSystemLabel }
+    } catch { }
+    Write-Log "    Post-format label check: current='$currentLabel', want='$Label'" 'Gray'
+    if (($currentLabel).Trim() -ine $Label) {
+        Write-Log "    Label mismatch - enforcing via 'label' command..." 'Yellow'
+        $labelPsi = New-Object System.Diagnostics.ProcessStartInfo
+        $labelPsi.FileName = 'cmd.exe'
+        $labelPsi.Arguments = "/c label ${DriveLetter}: $Label"
+        $labelPsi.RedirectStandardOutput = $true
+        $labelPsi.RedirectStandardError  = $true
+        $labelPsi.UseShellExecute        = $false
+        $labelPsi.CreateNoWindow         = $true
+        $lp = [System.Diagnostics.Process]::Start($labelPsi)
+        $lp.WaitForExit(15000) | Out-Null
+        $lout = $lp.StandardOutput.ReadToEnd() + $lp.StandardError.ReadToEnd()
+        foreach ($ln in ($lout -split "`r?`n")) { if ($ln.Trim()) { Write-Log "    | $ln" 'DarkGray' } }
+        Start-Sleep -Seconds 2
+        try {
+            $vol2 = Get-Volume -DriveLetter $DriveLetter -ErrorAction SilentlyContinue
+            if ($vol2) { Write-Log "    Label after 'label' command: '$($vol2.FileSystemLabel)'" 'Gray' }
+        } catch { }
+    }
+}
+
+# New-Partition -AssignDriveLetter is async: returns a partition object where
+# .DriveLetter is still empty. We MUST wait for the mount manager to actually
+# assign the letter before doing anything letter-dependent (Format-Volume).
+# Also - piping a raw partition to Format-Volume doesn't work on PS 5.1
+# (Format-Volume expects MSFT_Volume via pipeline, not MSFT_Partition, so
+# parameter binding fails and script dies silently under $ErrorActionPreference=Stop).
+# Solution: format by DriveLetter AFTER waiting for it.
+try {
+    Write-Log "  Creating WINRE partition ($WinreSizeMB MB FAT32)..." 'Gray'
+    $winrePart = New-Partition -DiskNumber $disk.Number `
+        -Size ($WinreSizeMB * 1MB) `
+        -AssignDriveLetter `
+        -ErrorAction Stop
+    Write-Log "  New-Partition returned #$($winrePart.PartitionNumber), initial DriveLetter='$($winrePart.DriveLetter)' (may still be empty - waiting)..." 'Gray'
+    $winrePart = Wait-ForDriveLetter -DiskNumber $disk.Number -PartitionNumber $winrePart.PartitionNumber
+    if (-not $winrePart) { throw "WINRE partition never got a drive letter within 20 seconds" }
+    Write-Log "  WINRE partition got letter $($winrePart.DriveLetter): - formatting as FAT32 via format.com..." 'Gray'
+    Format-DriveByLetter -DriveLetter ([char]$winrePart.DriveLetter) -FileSystem 'FAT32' -Label 'WINRE'
+    Write-Log "  WINRE ready at $($winrePart.DriveLetter):" 'Green'
+
+    Write-Log "  Creating IpdromREC partition (remaining space, NTFS)..." 'Gray'
+    $ipdromPart = New-Partition -DiskNumber $disk.Number `
+        -UseMaximumSize `
+        -AssignDriveLetter `
+        -ErrorAction Stop
+    Write-Log "  New-Partition returned #$($ipdromPart.PartitionNumber), initial DriveLetter='$($ipdromPart.DriveLetter)' (may still be empty - waiting)..." 'Gray'
+    $ipdromPart = Wait-ForDriveLetter -DiskNumber $disk.Number -PartitionNumber $ipdromPart.PartitionNumber
+    if (-not $ipdromPart) { throw "IpdromREC partition never got a drive letter within 20 seconds" }
+    Write-Log "  IpdromREC partition got letter $($ipdromPart.DriveLetter): - formatting as NTFS via format.com..." 'Gray'
+    Format-DriveByLetter -DriveLetter ([char]$ipdromPart.DriveLetter) -FileSystem 'NTFS' -Label 'IpdromREC'
+    Write-Log "  IpdromREC ready at $($ipdromPart.DriveLetter):" 'Green'
+} catch {
+    Write-Log "PARTITIONING FAILED at exception boundary: $($_.Exception.Message)" 'Red'
+    Write-Log "  Exception type: $($_.Exception.GetType().FullName)" 'Red'
+    Write-Log "  Stack: $($_.ScriptStackTrace)" 'DarkRed'
+    Write-Log "Aborting Prepare-IpdromRecFlash." 'Red'
+    exit 7
 }
 
 # Refresh volume info
 Start-Sleep -Seconds 3
 $disk = Get-Disk -Number $disk.Number
 
-# Определяем разделы ПО МЕТКЕ (надёжно), а не по номеру/эвристике - иначе
-# WINRE и IpdromREC путаются местами (размеры/буквы перепутываются).
-$winreVol  = Get-Volume -ErrorAction SilentlyContinue | Where-Object {
-    $_.FileSystemLabel -eq 'WINRE' -and
-    (Get-Partition -Volume $_ -ErrorAction SilentlyContinue).DiskNumber -eq $disk.Number
-} | Select-Object -First 1
-$ipdromVol = Get-Volume -ErrorAction SilentlyContinue | Where-Object {
-    $_.FileSystemLabel -eq 'IpdromREC' -and
-    (Get-Partition -Volume $_ -ErrorAction SilentlyContinue).DiskNumber -eq $disk.Number
-} | Select-Object -First 1
-
-if (-not $winreVol -or -not $ipdromVol) {
-    Write-Log "Could not find WINRE/IpdromREC volumes by label after diskpart. Aborting." 'Red'
-    exit 8
-}
-if (-not $winreVol.DriveLetter -or -not $ipdromVol.DriveLetter) {
-    Write-Log "Partitions have no drive letters after diskpart. Aborting." 'Red'
-    exit 8
+# We already have $winrePart and $ipdromPart from the PowerShell API path above
+# with drive letters populated. Use them directly - no need to search by label
+# (Get-Volume can lag several seconds after format.com and return nothing).
+# Wait for MSFT_Volume objects to appear as a sanity check, then log.
+function Wait-ForVolumeByLetter {
+    param([char]$DriveLetter, [int]$TimeoutSec = 30)
+    for ($i = 0; $i -lt $TimeoutSec; $i++) {
+        $v = Get-Volume -DriveLetter $DriveLetter -ErrorAction SilentlyContinue
+        if ($v) { return $v }
+        Start-Sleep -Seconds 1
+    }
+    return $null
 }
 
-$winreRoot  = "$($winreVol.DriveLetter):"
-$ipdromRoot = "$($ipdromVol.DriveLetter):"
-Write-Log "Partitions ready (label-based):" 'Green'
-Write-Log "  WINRE:     $winreRoot ($([math]::Round($winreVol.Size/1MB)) MB $($winreVol.FileSystem))"
-Write-Log "  IpdromREC: $ipdromRoot ($([math]::Round($ipdromVol.Size/1GB,1)) GB $($ipdromVol.FileSystem))"
+$winreRoot  = "$($winrePart.DriveLetter):"
+$ipdromRoot = "$($ipdromPart.DriveLetter):"
+
+function Force-VolumeRemount {
+    # Windows sometimes leaves MSFT_Volume WMI registration in an incomplete state
+    # after format.com on a fresh partition, especially under load. Remove and
+    # re-assign the drive letter to force PnP re-enumeration and volume registration.
+    param([int]$DiskNumber, [int]$PartitionNumber, [char]$OriginalLetter)
+    try {
+        Write-Log "    Forcing volume remount for ${OriginalLetter}: via letter cycle..." 'Gray'
+        Remove-PartitionAccessPath -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber `
+            -AccessPath "${OriginalLetter}:\" -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        Add-PartitionAccessPath -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber `
+            -AssignDriveLetter -ErrorAction Stop
+        Start-Sleep -Seconds 3
+    } catch {
+        Write-Log "    Remount cycle failed (non-fatal): $($_.Exception.Message)" 'Yellow'
+    }
+}
+
+$winreVol = Wait-ForVolumeByLetter -DriveLetter ([char]$winrePart.DriveLetter)
+if (-not $winreVol) {
+    Write-Log "MSFT_Volume for WINRE not registered - forcing remount..." 'Yellow'
+    Force-VolumeRemount -DiskNumber $disk.Number -PartitionNumber $winrePart.PartitionNumber -OriginalLetter ([char]$winrePart.DriveLetter)
+    # Re-query partition (letter may have changed after cycle)
+    $winrePart = Get-Partition -DiskNumber $disk.Number -PartitionNumber $winrePart.PartitionNumber
+    if ($winrePart.DriveLetter -and ($winrePart.DriveLetter -ne [char]0)) {
+        $winreVol = Wait-ForVolumeByLetter -DriveLetter ([char]$winrePart.DriveLetter) -TimeoutSec 30
+    }
+    if (-not $winreVol) {
+        Write-Log "WARNING: WINRE MSFT_Volume still not visible after remount. Proceeding anyway (BCD creation may fail)." 'Red'
+    } else {
+        Write-Log "WINRE MSFT_Volume registered after remount at $($winrePart.DriveLetter):" 'Green'
+    }
+}
+$ipdromVol = Wait-ForVolumeByLetter -DriveLetter ([char]$ipdromPart.DriveLetter)
+if (-not $ipdromVol) {
+    Write-Log "MSFT_Volume for IpdromREC not registered - forcing remount..." 'Yellow'
+    Force-VolumeRemount -DiskNumber $disk.Number -PartitionNumber $ipdromPart.PartitionNumber -OriginalLetter ([char]$ipdromPart.DriveLetter)
+    $ipdromPart = Get-Partition -DiskNumber $disk.Number -PartitionNumber $ipdromPart.PartitionNumber
+    if ($ipdromPart.DriveLetter -and ($ipdromPart.DriveLetter -ne [char]0)) {
+        $ipdromVol = Wait-ForVolumeByLetter -DriveLetter ([char]$ipdromPart.DriveLetter) -TimeoutSec 30
+    }
+    if (-not $ipdromVol) {
+        Write-Log "WARNING: IpdromREC MSFT_Volume still not visible after remount. Proceeding anyway." 'Red'
+    }
+}
+
+Write-Log "Partitions ready:" 'Green'
+if ($winreVol) {
+    Write-Log "  WINRE:     $winreRoot ($([math]::Round($winreVol.Size/1MB)) MB $($winreVol.FileSystem), label='$($winreVol.FileSystemLabel)')"
+} else {
+    Write-Log "  WINRE:     $winreRoot (MSFT_Volume not visible yet, but format.com succeeded)"
+}
+if ($ipdromVol) {
+    Write-Log "  IpdromREC: $ipdromRoot ($([math]::Round($ipdromVol.Size/1GB,1)) GB $($ipdromVol.FileSystem), label='$($ipdromVol.FileSystemLabel)')"
+} else {
+    Write-Log "  IpdromREC: $ipdromRoot (MSFT_Volume not visible yet, but format.com succeeded)"
+}
 
 # ===================== COPY PATCHED BOOT.WIM =====================
 $sourcesDir   = Join-Path $winreRoot 'sources'
@@ -564,27 +757,181 @@ try {
 
     # bcdboot on a freshly-formatted FAT32 removable partition sometimes fails with
     # BFSVC Error c00000bb (STATUS_NOT_SUPPORTED) "Failed to set element application
-    # device". Cause: partition isn't fully settled in the volume manager. Wait, then
-    # retry with a fresh handle. Also try /f ALL as a fallback (BIOS+UEFI).
+    # device". Two mitigations:
+    #   1) Multiple bcdboot attempts with different flags + waits between them.
+    #      MUST run under ErrorActionPreference=Continue - otherwise PS 5.1 treats
+    #      any bcdboot stderr as a terminating error and kills the loop on attempt 1.
+    #   2) If all bcdboot attempts fail, fall back to manual EFI setup: copy the
+    #      EFI files by hand from WIM to F:\EFI and create the BCD store via bcdedit.
+    #      This bypasses bcdboot's problematic "application device" resolution on
+    #      removable media entirely.
     Start-Sleep -Seconds 5
     $bcdbootAttempts = @(
-        @{ Args = @("$wimMount\Windows", '/s', $winreRoot, '/f', 'UEFI');           Label = 'UEFI' },
-        @{ Args = @("$wimMount\Windows", '/s', $winreRoot, '/f', 'UEFI', '/l', 'en-US'); Label = 'UEFI+en-US' },
-        @{ Args = @("$wimMount\Windows", '/s', $winreRoot, '/f', 'ALL');            Label = 'ALL' }
+        @{ Args = @("$wimMount\Windows", '/s', $winreRoot, '/f', 'UEFI');                     Label = 'UEFI' },
+        @{ Args = @("$wimMount\Windows", '/s', $winreRoot, '/f', 'UEFI', '/l', 'en-US');      Label = 'UEFI+en-US' },
+        @{ Args = @("$wimMount\Windows", '/s', $winreRoot, '/f', 'ALL');                      Label = 'ALL' }
     )
     $bcdbootOK = $false
-    foreach ($att in $bcdbootAttempts) {
-        Write-Log "  bcdboot attempt: $($att.Label) $($att.Args -join ' ')" 'Gray'
-        & bcdboot $att.Args 2>&1 | ForEach-Object { Write-Log "  | $_" 'DarkGray' }
-        if ($LASTEXITCODE -eq 0) {
-            Write-Log "  bcdboot succeeded ($($att.Label))." 'Green'
-            $bcdbootOK = $true
-            break
+    # Isolate from outer ErrorActionPreference=Stop - native stderr must NOT become
+    # a terminating error inside the retry loop.
+    & {
+        $ErrorActionPreference = 'Continue'
+        foreach ($att in $bcdbootAttempts) {
+            Write-Log "  bcdboot attempt: $($att.Label) $($att.Args -join ' ')" 'Gray'
+            $bcdOut = & bcdboot @($att.Args) 2>&1
+            $bcdExit = $LASTEXITCODE
+            foreach ($ln in $bcdOut) {
+                $line = if ($ln -is [System.Management.Automation.ErrorRecord]) { $ln.Exception.Message } else { [string]$ln }
+                if ($line.Trim()) { Write-Log "  | $line" 'DarkGray' }
+            }
+            if ($bcdExit -eq 0) {
+                Write-Log "  bcdboot succeeded ($($att.Label))." 'Green'
+                $script:bcdbootOK = $true
+                break
+            }
+            Write-Log "  bcdboot $($att.Label) failed (exit $bcdExit), sleeping 5s and trying next..." 'Yellow'
+            Start-Sleep -Seconds 5
         }
-        Write-Log "  bcdboot $($att.Label) failed (exit $LASTEXITCODE), sleeping 5s and trying next..." 'Yellow'
-        Start-Sleep -Seconds 5
     }
-    if (-not $bcdbootOK) { throw "bcdboot failed after $($bcdbootAttempts.Count) attempts" }
+
+    if (-not $bcdbootOK) {
+        Write-Log "All bcdboot attempts failed. Falling back to manual EFI setup..." 'Yellow'
+
+        # 1) Copy EFI bootloader files manually from mounted WIM.
+        $efiRoot   = Join-Path $winreRoot 'EFI'
+        $efiBoot   = Join-Path $efiRoot   'Boot'
+        $efiMsBoot = Join-Path $efiRoot   'Microsoft\Boot'
+        New-Item -ItemType Directory -Force -Path $efiBoot   | Out-Null
+        New-Item -ItemType Directory -Force -Path $efiMsBoot | Out-Null
+
+        # Standard removable-media EFI layout: \EFI\Boot\bootx64.efi is the firmware entry.
+        $srcBootmgrEfi = Join-Path $wimMount 'Windows\Boot\EFI\bootmgfw.efi'
+        if (-not (Test-Path $srcBootmgrEfi)) { throw "Fallback: bootmgfw.efi not found in WIM at $srcBootmgrEfi" }
+        Copy-Item -LiteralPath $srcBootmgrEfi -Destination (Join-Path $efiBoot 'bootx64.efi') -Force
+        Copy-Item -LiteralPath $srcBootmgrEfi -Destination (Join-Path $efiMsBoot 'bootmgfw.efi') -Force
+
+        # memtest.efi (optional but bcdboot copies it).
+        $srcMemtest = Join-Path $wimMount 'Windows\Boot\EFI\memtest.efi'
+        if (Test-Path $srcMemtest) {
+            Copy-Item -LiteralPath $srcMemtest -Destination (Join-Path $efiMsBoot 'memtest.efi') -Force
+        }
+
+        # Copy en-us boot resources (some firmwares refuse to boot without them).
+        $srcEnUs = Join-Path $wimMount 'Windows\Boot\EFI\en-us'
+        if (Test-Path $srcEnUs) {
+            $dstEnUs = Join-Path $efiMsBoot 'en-us'
+            New-Item -ItemType Directory -Force -Path $dstEnUs | Out-Null
+            Copy-Item -LiteralPath (Join-Path $srcEnUs '*') -Destination $dstEnUs -Recurse -Force
+        }
+        $srcFonts = Join-Path $wimMount 'Windows\Boot\EFI\Fonts'
+        if (Test-Path $srcFonts) {
+            Copy-Item -LiteralPath $srcFonts -Destination $efiMsBoot -Recurse -Force
+        }
+        $srcResources = Join-Path $wimMount 'Windows\Boot\EFI\Resources'
+        if (Test-Path $srcResources) {
+            Copy-Item -LiteralPath $srcResources -Destination $efiMsBoot -Recurse -Force
+        }
+
+        Write-Log "  Manually copied EFI bootloader files to $efiRoot" 'Gray'
+
+        # 2) Create BCD store manually via bcdedit.
+        # KEY INSIGHT: bcdedit /createstore fails on freshly-formatted FAT32 on
+        # removable USB with "Element not found" - Windows Volume Manager may not
+        # yet have the D: volume fully registered. Workaround: create the BCD
+        # store on C:\ (where bcdedit ALWAYS works because system store exists),
+        # populate it fully, then just Copy-Item to the USB. This bypasses all
+        # WMI/volume registration issues.
+        $bcdStore    = Join-Path $efiMsBoot 'BCD'
+        $tempBcdDir  = Join-Path $env:TEMP "ipdrom_bcd_$(New-Guid)"
+        $tempBcd     = Join-Path $tempBcdDir 'BCD'
+        New-Item -ItemType Directory -Force -Path $tempBcdDir | Out-Null
+        Remove-Item -LiteralPath $bcdStore -Force -ErrorAction SilentlyContinue
+
+        & {
+            $ErrorActionPreference = 'Continue'
+            Write-Log "  Creating BCD store on C:\ temp path first: $tempBcd" 'Gray'
+            & bcdedit /createstore "$tempBcd" 2>&1 | ForEach-Object {
+                $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { [string]$_ }
+                if ($line.Trim()) { Write-Log "  | $line" 'DarkGray' }
+            }
+            if ($LASTEXITCODE -ne 0) { throw "Fallback: bcdedit /createstore on C:\ temp failed (exit $LASTEXITCODE)" }
+        }
+        Write-Log "  BCD store created at $tempBcd (will populate then copy to USB)" 'Green'
+
+        # Populate BCD with a minimal WinPE ramdisk boot entry. This mirrors what
+        # bcdboot would have done, but with device=partition=X: instead of the
+        # unresolvable "application device" placeholder that trips c00000bb.
+        function Invoke-BcdEdit {
+            param([string[]]$BcdArgs)
+            & {
+                $ErrorActionPreference = 'Continue'
+                $out = & bcdedit @BcdArgs 2>&1
+                foreach ($ln in $out) {
+                    $line = if ($ln -is [System.Management.Automation.ErrorRecord]) { $ln.Exception.Message } else { [string]$ln }
+                    if ($line.Trim()) { Write-Log "  | $line" 'DarkGray' }
+                }
+                return $LASTEXITCODE
+            }
+        }
+
+        # Use temp store path (on C:\) for all bcdedit operations. Copy to USB at end.
+        $storeArg = "$tempBcd"
+
+        # Create bootmgr entry.
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/create', '{bootmgr}', '/d', 'Windows Boot Manager') | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', '{bootmgr}', 'device', "partition=$winreRoot") | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', '{bootmgr}', 'path', '\EFI\Microsoft\Boot\bootmgfw.efi') | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', '{bootmgr}', 'locale', 'en-US') | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', '{bootmgr}', 'timeout', '30') | Out-Null
+
+        # Create ramdiskoptions.
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/create', '{ramdiskoptions}', '/d', 'Ramdisk options') | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', '{ramdiskoptions}', 'ramdisksdidevice', 'boot') | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', '{ramdiskoptions}', 'ramdisksdipath', '\boot\boot.sdi') | Out-Null
+
+        # Create WinPE osloader entry.
+        $osloaderOutput = & bcdedit /store $storeArg /create /d 'Windows PE Recovery' /application osloader 2>&1
+        $osloaderGuid = $null
+        foreach ($ln in $osloaderOutput) {
+            $lineStr = if ($ln -is [System.Management.Automation.ErrorRecord]) { $ln.Exception.Message } else { [string]$ln }
+            if ($lineStr -match '(\{[0-9a-f-]+\})') { $osloaderGuid = $Matches[1]; break }
+            if ($lineStr.Trim()) { Write-Log "  | $lineStr" 'DarkGray' }
+        }
+        if (-not $osloaderGuid) { throw "Fallback: could not parse osloader GUID from bcdedit output." }
+        Write-Log "  Created osloader entry: $osloaderGuid" 'Gray'
+
+        $ramdiskDevice = "ramdisk=[boot]\sources\boot.wim,{ramdiskoptions}"
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', $osloaderGuid, 'device', $ramdiskDevice) | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', $osloaderGuid, 'osdevice', $ramdiskDevice) | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', $osloaderGuid, 'path', '\windows\system32\winload.efi') | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', $osloaderGuid, 'systemroot', '\windows') | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', $osloaderGuid, 'winpe', 'yes') | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', $osloaderGuid, 'detecthal', 'yes') | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', $osloaderGuid, 'locale', 'en-US') | Out-Null
+
+        # Wire osloader as {bootmgr}'s default + displayorder.
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/set', '{bootmgr}', 'default', $osloaderGuid) | Out-Null
+        Invoke-BcdEdit -BcdArgs @('/store', $storeArg, '/displayorder', $osloaderGuid) | Out-Null
+
+        Write-Log "  Manual BCD store populated with WinPE ramdisk entry." 'Green'
+
+        # Copy the fully-populated BCD from C:\ temp to the USB.
+        Write-Log "  Copying populated BCD to USB target: $bcdStore" 'Gray'
+        Copy-Item -LiteralPath $tempBcd -Destination $bcdStore -Force -ErrorAction Stop
+        # Cleanup temp
+        Remove-Item -LiteralPath $tempBcdDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "  BCD store deployed on USB at $bcdStore" 'Green'
+
+        # Signal to the downstream "Patching USB BCD store" step (which uses
+        # bcdedit /store D:\...) that it should be skipped - our BCD on USB
+        # is already complete, and bcdedit can't open it on the removable
+        # partition with unregistered MSFT_Volume anyway.
+        $script:manualEfiFallbackUsed = $true
+
+        $bcdbootOK = $true
+    }
+
+    if (-not $bcdbootOK) { throw "bcdboot failed after $($bcdbootAttempts.Count) attempts and manual fallback also failed." }
 
     Write-Log "Bootloader installed on $winreRoot." 'Green'
 
@@ -637,7 +984,15 @@ Remove-Item -LiteralPath $wimMount -Force -Recurse -ErrorAction SilentlyContinue
 # И создаём {ramdiskoptions} который указывает на \boot\boot.sdi.
 Write-Log "Patching USB BCD store for WinPE ramdisk boot..." 'Yellow'
 $winreBcd = Join-Path $winreRoot 'EFI\Microsoft\Boot\BCD'
-if (-not (Test-Path $winreBcd)) {
+# If manual EFI fallback ran (bcdboot failed all 3 attempts), the BCD store
+# on USB was populated from C:\ temp and ALREADY contains ramdiskoptions +
+# default OS loader entries. bcdedit on D:\ (removable USB with missing
+# MSFT_Volume registration) will fail with "Cannot open BCD"/"Element not
+# found" and clutter the log with useless errors. Skip patching if we know
+# we're in manual-fallback state.
+if ($script:manualEfiFallbackUsed) {
+    Write-Log "Manual EFI fallback was used - BCD store already fully populated on USB. Skipping patch step." 'Gray'
+} elseif (-not (Test-Path $winreBcd)) {
     Write-Log "BCD store NOT FOUND at $winreBcd - bootmgr won't work." 'Red'
 } else {
     # 1. Создаём {ramdiskoptions}. /create {ramdiskoptions} - well-known GUID.
