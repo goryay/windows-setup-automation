@@ -134,6 +134,118 @@ if errorlevel 1 (
 echo === Flash roles configured. Continuing Windows install. ===
 echo.
 
+echo ===============================================================
+echo   WINDOWS INSTALL TARGET (SYSDISK)
+echo ===============================================================
+echo Detected fixed (non-USB) disks:
+echo.
+wmic diskdrive where "InterfaceType!='USB'" get Index,Model,Size /format:table
+echo.
+echo Sizes are in bytes. Divide by 1000000000 for GB.
+echo For IoT this MUST be a chosen index (Setup fails without prep).
+echo For Pro type SKIP if you want autounattend to pick the target.
+echo.
+
+set "SYSDISK="
+set /p SYSDISK=Index for SYSDISK (Windows install target)?
+if /i "%SYSDISK%"=="" set "SYSDISK=SKIP"
+
+if /i "%SYSDISK%"=="SKIP" (
+  echo [sys ] SKIP - autounattend will pick target on its own.
+  goto SYS_DONE
+)
+
+echo.
+echo *** WARNING: disk %SYSDISK% will be WIPED and split into
+echo *** EFI(300MB)/MSR(16MB)/Windows(rest). ALL data will be LOST.
+set "CONFIRM="
+set /p CONFIRM=Type YES to confirm (anything else cancels SYS prep):
+if /i not "%CONFIRM%"=="YES" (
+  echo [sys ] cancelled by operator.
+  set "SYSDISK=SKIP"
+  goto SYS_DONE
+)
+
+echo === Preparing disk %SYSDISK% for Windows install ===
+(
+  echo select disk %SYSDISK%
+  echo clean
+  echo convert gpt
+  echo create partition efi size=300
+  echo format quick fs=fat32 label="System"
+  echo assign letter=S
+  echo create partition msr size=16
+  echo create partition primary
+  echo format quick fs=ntfs label="Windows"
+  echo assign letter=W
+  echo exit
+) > X:\sys_format.txt
+diskpart /s X:\sys_format.txt
+if errorlevel 1 (
+  echo *** diskpart SYS failed with errorlevel %errorlevel% ***
+  echo *** Autounattend may still try but Setup likely fails.
+) else (
+  echo [sys ] OK - EFI/MSR/Windows partitions ready on disk %SYSDISK%.
+)
+
+:SYS_DONE
+echo.
+
+echo ===============================================================
+echo   EXTRA DISKS CLEANUP (prevent boot into old OS)
+echo ===============================================================
+echo Other fixed disks may contain OLD Windows installs whose EFI
+echo boot entries BIOS could pick instead of the new install.
+echo Listed disks will get their partition table WIPED (fast clean,
+echo no full format). ALL data on them is LOST.
+echo.
+echo Comma-separated indices, e.g. 2 or 0,2 - empty/SKIP to skip.
+echo (SYSDISK/RECDISK/DOCSDISK entries auto-ignored.)
+echo (Skip Disk 0 if it is your data RAID.)
+echo.
+set "CLEANDISKS="
+set /p CLEANDISKS=Extra disks to clean?
+if /i "%CLEANDISKS%"=="" set "CLEANDISKS=SKIP"
+if /i "%CLEANDISKS%"=="SKIP" (
+  echo [clean] SKIP - no extra disks cleaned.
+  goto CLEAN_DONE
+)
+
+echo.
+echo *** WARNING: disks [ %CLEANDISKS% ] will lose ALL data.
+set "CONFIRM="
+set /p CONFIRM=Type YES to confirm (anything else cancels cleanup):
+if /i not "%CONFIRM%"=="YES" (
+  echo [clean] cancelled by operator.
+  goto CLEAN_DONE
+)
+
+for %%d in (%CLEANDISKS%) do (
+  if "%%d"=="%SYSDISK%" (
+    echo [clean] disk %%d = SYSDISK - skipping to preserve install target.
+  ) else if "%%d"=="%RECDISK%" (
+    echo [clean] disk %%d = RECDISK - skipping.
+  ) else if "%%d"=="%DOCSDISK%" (
+    echo [clean] disk %%d = DOCSDISK - skipping.
+  ) else (
+    echo === Cleaning disk %%d ===
+    (
+      echo select disk %%d
+      echo clean
+      echo exit
+    ) > X:\clean_%%d.txt
+    diskpart /s X:\clean_%%d.txt
+    if errorlevel 1 (
+      echo *** clean of disk %%d FAILED
+    ) else (
+      echo [clean] disk %%d cleaned.
+    )
+  )
+)
+
+:CLEAN_DONE
+echo.
+
 echo === Mounting SMB share (10 retries with state reset) ===
 set RETRIES=0
 :MOUNT_RETRY
@@ -174,6 +286,16 @@ if exist "%STAGE%\autounattend.xml" (
 ) else (
   set "UAFILE=Y:\%WINVER%\autounattend.xml"
   echo === Pre-patched autounattend missing - using original ***
+)
+
+if /i not "%SYSDISK%"=="SKIP" (
+  echo === Patching autounattend: DiskID -^> %SYSDISK% ===
+  powershell.exe -NoProfile -Command "$f='%UAFILE%'; $c=[System.IO.File]::ReadAllText($f); $c=[regex]::Replace($c,'<DiskID>\d+</DiskID>','<DiskID>%SYSDISK%</DiskID>'); [System.IO.File]::WriteAllText($f,$c,[System.Text.UTF8Encoding]::new($false))"
+  if errorlevel 1 (
+    echo *** DiskID patch FAILED - Setup will use hardcoded DiskID.
+  ) else (
+    findstr /C:"<DiskID>" "%UAFILE%"
+  )
 )
 
 echo === Starting Windows Setup with %UAFILE% ===
