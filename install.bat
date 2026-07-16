@@ -114,21 +114,37 @@ if /i not "%CONFIRM%"=="YES" (
 )
 
 echo === Formatting disk %DOCSDISK% as IPDROM ===
+:: DOCS flash is data-only, MBR is fine (no boot needed).
+:: 'convert gpt' after 'clean' silently fails in WinPE diskpart on raw disks
+:: (needs MBR-initialized first), which then skips create/format/assign quietly
+:: - so we skip GPT entirely. Letter=Q assigned explicitly, then format.com
+:: enforces the IPDROM label reliably (diskpart's label=... is flaky on USB).
 (
   echo select disk %DOCSDISK%
   echo clean
-  echo convert gpt
   echo create partition primary
-  echo format fs=ntfs label="IPDROM" quick
-  echo assign
+  echo format fs=ntfs quick
+  echo assign letter=Q
   echo exit
 ) > X:\docs_format.txt
 diskpart /s X:\docs_format.txt
 if errorlevel 1 (
   echo *** diskpart DOCS failed with errorlevel %errorlevel% ***
-) else (
-  echo [docs] OK - IPDROM partition ready.
+  goto DOCS_END
 )
+:: Verify Q: actually got assigned before touching format.com
+if not exist Q:\ (
+  echo *** Q: not assigned by diskpart, aborting format ***
+  goto DOCS_END
+)
+echo [docs] diskpart OK. Enforcing IPDROM label via format.com...
+format Q: /q /fs:ntfs /v:IPDROM /y
+if errorlevel 1 (
+  echo *** format.com failed, falling back to label command ***
+  label Q: IPDROM
+)
+echo [docs] OK - IPDROM partition ready on Q: with label 'IPDROM'.
+:DOCS_END
 
 :FLASH_DONE
 echo === Flash roles configured. Continuing Windows install. ===
