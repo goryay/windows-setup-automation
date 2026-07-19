@@ -28,8 +28,14 @@ $DOCS_MIN_GB = 8
 $DOCS_MAX_GB = 32     # anything >=32 GB is a REC candidate, not DOCS
 
 function Find-IpdromDocsVolume {
+    # Volume + not-subst filter: subst F: -> C:\IPDROM doesn't register as a
+    # distinct MSFT_Volume, so Get-Volume already excludes it. But belt-and-
+    # suspenders: enforce a real drive letter with a physical disk backing.
     Get-Volume -ErrorAction SilentlyContinue |
-        Where-Object { $_.FileSystemLabel -eq 'IPDROM' } |
+        Where-Object {
+            $_.FileSystemLabel -eq 'IPDROM' -and $_.DriveLetter -and
+            ($null -ne (Get-Partition -DriveLetter $_.DriveLetter -ErrorAction SilentlyContinue))
+        } |
         Select-Object -First 1
 }
 
@@ -49,8 +55,6 @@ if (-not $vol) {
             W ("  reject: Disk {0} '{1}' {2} GB - out of DOCS size band {3}..{4}" -f $d.Number, $d.FriendlyName, $sizeGB, $DOCS_MIN_GB, $DOCS_MAX_GB)
             continue
         }
-        # Check that partitions are unlabeled or empty. Refuse to touch a flash
-        # with any recognizable user data (labeled volumes, ventoy, etc).
         $parts = @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue)
         $vols  = @(Get-Volume -ErrorAction SilentlyContinue | Where-Object {
             $parts.AccessPaths -contains "$($_.DriveLetter):\" -or $parts.DriveLetter -contains $_.DriveLetter
@@ -77,13 +81,6 @@ if (-not $vol) {
     $docs = $candidates[0]
     W "Autoformatting Disk $($docs.Number) '$($docs.FriendlyName)' as IPDROM (NTFS)..."
 
-    # Two-pass diskpart, same pattern as Prepare-IpdromRecFlash:
-    #   Pass 1: clean + rescan (releases handles, forces PnP re-enumeration)
-    #   Wait 3-5s for Windows to settle
-    #   Check partition style - Win11 auto-initializes cleaned USB flashes to GPT.
-    #   If already GPT, skip "convert gpt" (it requires MBR/RAW source, otherwise
-    #   fails with 0x80070057 "The specified disk is not MBR format").
-    #   Pass 2: (optional convert) + create partition + format + assign
     function Invoke-DocsDiskpart {
         param([string]$Script)
         $tmp = Join-Path $env:TEMP "ipdrom_docs_fmt_$(New-Guid).txt"
@@ -115,12 +112,15 @@ exit
     W "  Disk $($docs.Number) partition style after clean: $partStyle"
     $convertLine = if ($partStyle -eq 'GPT') { '' } else { "convert gpt`n" }
 
+    # Force letter=T to avoid collision with subst F: -> C:\IPDROM
+    # (subst is process-level and can mask a physically-assigned F:, causing all
+    # copies to land back inside C:\IPDROM. T: is far from any expected letter.)
     $dpFormat = @"
 select disk $($docs.Number)
 $convertLine
 create partition primary
 format fs=ntfs label="IPDROM" quick
-assign
+assign letter=T
 exit
 "@
     W "  diskpart pass 2: partition + format + assign"
@@ -148,13 +148,25 @@ $free = (Get-PSDrive -Name $flashLetter -ErrorAction SilentlyContinue).Free
 if ($free) { W ("Free space on flash: {0:N1} GB" -f ($free / 1GB)) }
 
 # =============================================================================
-# Per-SL selection: only what a repair master actually needs for THIS machine.
-# Full drivers/ and software/ folders (~30 GB each with .swm images) are NOT
-# copied -- only motherboard-specific drivers, RAID software (if RAID present)
-# and NVIDIA driver (if discrete GPU present). Docs handled via deploy_docs.
+# Sources and destinations
 # =============================================================================
+$softsSrc    = Join-Path $UsbRoot 'software\docs\softs'
+$driversSrc  = Join-Path $UsbRoot 'software\docs\drivers'
+$softwareDst = Join-Path $flashRoot 'software'
+$driversDst  = Join-Path $flashRoot 'drivers'
 
+foreach ($p in @($softsSrc, $driversSrc)) {
+    if (-not (Test-Path -LiteralPath $p)) {
+        W "WARN: source dir missing: $p"
+    }
+}
+
+New-Item -ItemType Directory -Path $softwareDst -Force -ErrorAction SilentlyContinue | Out-Null
+New-Item -ItemType Directory -Path $driversDst  -Force -ErrorAction SilentlyContinue | Out-Null
+
+# =============================================================================
 # Parse SL config into a hashtable (case-insensitive keys)
+# =============================================================================
 $sl = @{}
 if ($SLConfigPath -and (Test-Path -LiteralPath $SLConfigPath)) {
     foreach ($line in (Get-Content -LiteralPath $SLConfigPath -Encoding UTF8)) {
@@ -167,85 +179,211 @@ if ($SLConfigPath -and (Test-Path -LiteralPath $SLConfigPath)) {
     W "  gpu_discrete:        $($sl['gpu_discrete']) (model=$($sl['gpu_discrete_model']))"
     W "  raid1_model:         $($sl['raid1_model'])"
     W "  raid2_model:         $($sl['raid2_model'])"
+    W "  axxonsoft:           $($sl['axxonsoft'])"
+    W "  guardant_num:        $($sl['guardant_num'])"
 } else {
-    W "WARN: no SL config -- will copy nothing selective."
+    W "WARN: no SL config -- selective copies will be skipped."
 }
 
-# NOTE: motherboard drivers intentionally NOT copied -- repair master doesn't
-# reinstall the OS on the same board, they either restore via IpdromREC FFU or
-# swap boards. Only RAID/GPU/docs go on the flash.
+# Helper: copy file OR folder from $Src into $DstDir with logging
+function Copy-ToFlash {
+    param(
+        [Parameter(Mandatory)] [string]$Src,
+        [Parameter(Mandatory)] [string]$DstDir,
+        [string]$Reason = ''
+    )
+    if (-not (Test-Path -LiteralPath $Src)) {
+        W "  MISS: $Src (reason: $Reason)"
+        return
+    }
+    if (-not (Test-Path -LiteralPath $DstDir)) {
+        New-Item -ItemType Directory -Path $DstDir -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    $item = Get-Item -LiteralPath $Src -ErrorAction SilentlyContinue
+    if (-not $item) { W "  MISS: cannot Get-Item $Src"; return }
+    $name = $item.Name
+    try {
+        if ($item.PSIsContainer) {
+            # Copy folder recursively into DstDir (preserves folder name)
+            Copy-Item -LiteralPath $Src -Destination $DstDir -Recurse -Force -ErrorAction Stop
+        } else {
+            Copy-Item -LiteralPath $Src -Destination $DstDir -Force -ErrorAction Stop
+        }
+        W "  OK: $name -> $DstDir ($Reason)"
+    } catch {
+        W "  FAILED: $name -> $DstDir : $($_.Exception.Message)"
+    }
+}
 
-# --- MegaRAID software (LSI/Avago) if any RAID controller declared -------
-# Copy the .zip archive as-is - repair master unpacks on the target machine.
+# Helper: find files in $Dir matching regex on Name (case-insensitive)
+function Find-BySrcRegex {
+    param([string]$Dir, [string]$Pattern)
+    if (-not (Test-Path -LiteralPath $Dir)) { return @() }
+    Get-ChildItem -LiteralPath $Dir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match $Pattern }
+}
+
+# =============================================================================
+# 1) Fixed items: 7-Zip + Adobe Reader (always, regardless of SL)
+# =============================================================================
+W "--- Fixed items (7-Zip + Adobe Reader) ---"
+$fixedPatterns = @('(?i)^7z.*\.exe$', '(?i)^AdbeRdr.*\.exe$|(?i)Adobe.*Reader.*\.exe$')
+foreach ($pat in $fixedPatterns) {
+    $matches_ = Find-BySrcRegex -Dir $softsSrc -Pattern $pat
+    foreach ($f in $matches_) { Copy-ToFlash -Src $f.FullName -DstDir $softwareDst -Reason "fixed" }
+}
+
+# =============================================================================
+# 2) MegaRAID: software + driver, if any RAID controller declared in SL
+# =============================================================================
 $hasRaid = (($sl['raid1_model']) -and ($sl['raid1_model'] -ne 'None')) `
         -or (($sl['raid2_model']) -and ($sl['raid2_model'] -ne 'None'))
 if ($hasRaid) {
-    $softwareDir = Join-Path $UsbRoot 'software'
-    $raidZips = Get-ChildItem -LiteralPath $softwareDir -File -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Extension -eq '.zip' -and $_.Name -match '(?i)avago|megaraid|lsi'
-        }
-    if ($raidZips) {
-        $raidDst = Join-Path $flashRoot 'software'
-        New-Item -ItemType Directory -Path $raidDst -Force -ErrorAction SilentlyContinue | Out-Null
-        foreach ($z in $raidZips) {
-            W "Copying RAID archive: $($z.Name) -> $raidDst"
-            try {
-                Copy-Item -LiteralPath $z.FullName -Destination $raidDst -Force -ErrorAction Stop
-            } catch {
-                W "  Copy failed: $($_.Exception.Message)"
-            }
-        }
-    } else {
-        W "WARN: RAID controller in SL but no *.zip (avago|megaraid|lsi) archive found in $softwareDir"
+    W "--- RAID controller declared in SL -> copying MegaRAID software + driver ---"
+    foreach ($f in (Find-BySrcRegex -Dir $softsSrc   -Pattern '(?i)(avago|megaraid|lsi).*\.(zip|exe|msi)$')) {
+        Copy-ToFlash -Src $f.FullName -DstDir $softwareDst -Reason "RAID software"
+    }
+    foreach ($f in (Find-BySrcRegex -Dir $driversSrc -Pattern '(?i)(avago|megaraid|lsi).*\.(zip|exe|msi|7z)$')) {
+        Copy-ToFlash -Src $f.FullName -DstDir $driversDst -Reason "RAID driver"
     }
 } else {
-    W "No RAID controllers in SL config -- RAID software skipped."
+    W "No RAID controllers in SL -- MegaRAID software+driver skipped."
 }
 
-# --- NVIDIA driver if discrete GPU declared ------------------------------
+# =============================================================================
+# 3) Axxon Intellect / IntellectX (based on axxonsoft key)
+# =============================================================================
+$axxonsoft = if ($sl['axxonsoft']) { $sl['axxonsoft'].ToLower() } else { '' }
+switch ($axxonsoft) {
+    'i' {
+        W "--- axxonsoft=i -> Intellect ---"
+        foreach ($f in (Find-BySrcRegex -Dir $softsSrc -Pattern '(?i)^Intellect_.*\.zip$')) {
+            Copy-ToFlash -Src $f.FullName -DstDir $softwareDst -Reason "Intellect"
+        }
+    }
+    'ix' {
+        W "--- axxonsoft=ix -> IntellectX ---"
+        foreach ($f in (Find-BySrcRegex -Dir $softsSrc -Pattern '(?i)IntellectX.*\.zip$')) {
+            Copy-ToFlash -Src $f.FullName -DstDir $softwareDst -Reason "IntellectX"
+        }
+    }
+    default { W "axxonsoft='$axxonsoft' -- no Intellect/IntellectX copied." }
+}
+
+# =============================================================================
+# 4) Detector Pack (if axxonsoft_addons mentions any Detector item)
+# =============================================================================
+$addons = if ($sl['axxonsoft_addons']) { $sl['axxonsoft_addons'] } else { '' }
+# Cyrillic 'Детектор' constructed via char codes so .ps1 file encoding doesn't
+# matter -- Windows PowerShell in RU locale reads BOM-less UTF-8 as Windows-1251
+# and mangles literals like 'Детектор' into 'Р”РµС‚РµРєС‚РѕСЂ' at parse time.
+$rusDetector = -join @(0x0414,0x0435,0x0442,0x0435,0x043A,0x0442,0x043E,0x0440 | ForEach-Object { [char]$_ })
+$hasDetector = $addons -match ("(?i)" + [regex]::Escape($rusDetector) + '|Detector')
+if ($hasDetector) {
+    W "--- Detector Pack requested in SL addons ---"
+    foreach ($f in (Find-BySrcRegex -Dir $softsSrc -Pattern '(?i)DetectorPack')) {
+        Copy-ToFlash -Src $f.FullName -DstDir $softwareDst -Reason "Detector Pack"
+    }
+} else {
+    W "No Detector Pack in SL addons -- skipped."
+}
+
+# =============================================================================
+# 5) Guardant drivers (if any guardant key OR addon Guardant/Senselock)
+# =============================================================================
+$guardantNum = 0
+[void][int]::TryParse(("" + $sl['guardant_num']), [ref]$guardantNum)
+$hasGuardant = ($guardantNum -gt 0) -or ($addons -match '(?i)Guardant|Senselock')
+if ($hasGuardant) {
+    W "--- Guardant key present (guardant_num=$guardantNum or addon match) -> copying driver ---"
+    foreach ($f in (Find-BySrcRegex -Dir $softsSrc -Pattern '(?i)(^Grd|Guardant).*\.exe$')) {
+        Copy-ToFlash -Src $f.FullName -DstDir $softwareDst -Reason "Guardant"
+    }
+} else {
+    W "No Guardant in SL -- Guardant driver skipped."
+}
+
+# =============================================================================
+# 6) NVIDIA / discrete GPU driver (from drivers/ folder)
+# =============================================================================
 $gpuDisc = ($sl['gpu_discrete'] -eq 'TRUE') `
         -and ($sl['gpu_discrete_model']) `
         -and ($sl['gpu_discrete_model'] -ne 'None')
 if ($gpuDisc) {
-    $softwareDir = Join-Path $UsbRoot 'software'
-    # Match: files with 'nvidia' in name (case-insensitive) OR NVIDIA versioned
-    # installer pattern like "551.86-desktop-*.exe"
-    $nvFiles = Get-ChildItem -LiteralPath $softwareDir -File -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Extension -eq '.exe' -and (
-                $_.Name -match '(?i)nvidia' -or
-                $_.Name -match '^\d+\.\d{2,}-desktop.*'
-            )
-        }
-    if ($nvFiles) {
-        $nvDst = Join-Path $flashRoot 'software\NVIDIA'
-        New-Item -ItemType Directory -Path $nvDst -Force -ErrorAction SilentlyContinue | Out-Null
-        foreach ($nv in $nvFiles) {
-            W "Copying NVIDIA installer: $($nv.Name) -> $nvDst"
-            try {
-                Copy-Item -LiteralPath $nv.FullName -Destination $nvDst -Force -ErrorAction Stop
-            } catch {
-                W "  Copy failed: $($_.Exception.Message)"
-            }
-        }
-    } else {
-        W "WARN: gpu_discrete=TRUE in SL but no NVIDIA installer found in $softwareDir"
+    W "--- Discrete GPU declared -> copying NVIDIA/Quadro driver ---"
+    foreach ($f in (Find-BySrcRegex -Dir $driversSrc -Pattern '(?i)(nvidia|quadro|geforce|whql).*\.exe$|^\d+\.\d{2,}-.*\.exe$')) {
+        Copy-ToFlash -Src $f.FullName -DstDir $driversDst -Reason "GPU driver"
     }
 } else {
-    W "No discrete GPU in SL config -- NVIDIA driver skipped."
+    W "No discrete GPU in SL -- NVIDIA driver skipped."
 }
 
-# --- documentation via deploy_docs ---
+# =============================================================================
+# 7) Motherboard drivers (auto-match by mb_model against drivers/ folder)
+# =============================================================================
+function Get-DriverTokens {
+    param([string]$Text)
+    if (-not $Text) { return @() }
+    $normalized = $Text -replace '[^A-Za-z0-9]+', ' '
+    @($normalized.ToUpper() -split '\s+' | Where-Object { $_ -and $_.Length -ge 2 })
+}
+
+function Find-MbDriverAsset {
+    param([string]$MbModel, [string]$DriversDir)
+    if (-not $MbModel -or -not (Test-Path -LiteralPath $DriversDir)) { return $null }
+    $mbTokens = @(Get-DriverTokens $MbModel)
+    if ($mbTokens.Count -lt 2) { return $null }
+
+    $items = Get-ChildItem -LiteralPath $DriversDir -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSIsContainer -or $_.Name -match '(?i)\.(7z|zip)$' }
+
+    $best = $null
+    $bestScore = -1
+    foreach ($it in $items) {
+        # Skip well-known non-mb items (RAID driver zip, NVIDIA/PCIe SATA cards)
+        if ($it.Name -match '(?i)avago|megaraid|lsi|nvidia|quadro|geforce|whql|pcie.*sata|^\d+\.\d{2,}-') { continue }
+
+        $baseName = if ($it.PSIsContainer) { $it.Name } else { [IO.Path]::GetFileNameWithoutExtension($it.Name) }
+        $drvTokens = @(Get-DriverTokens $baseName)
+        if ($drvTokens.Count -lt 2) { continue }
+
+        $matched = @($drvTokens | Where-Object { $mbTokens -contains $_ }).Count
+        if ($matched -lt 2) { continue }
+        $extra   = $drvTokens.Count - $matched
+        $score   = $matched - ($extra * 0.5)
+
+        W ("    candidate: '$baseName' matched=$matched extra=$extra score=$score")
+
+        if ($score -gt $bestScore) {
+            $bestScore = $score
+            $best = $it
+        }
+    }
+
+    if ($best) {
+        W ("  best mb driver match: '$($best.Name)' score=$bestScore")
+    }
+    return $best
+}
+
+W "--- Motherboard driver auto-match ---"
+$mbAsset = Find-MbDriverAsset -MbModel $sl['mb_model'] -DriversDir $driversSrc
+if ($mbAsset) {
+    Copy-ToFlash -Src $mbAsset.FullName -DstDir $driversDst -Reason "MB drivers ($($sl['mb_model']))"
+} else {
+    W "  No mb driver matched for mb_model='$($sl['mb_model'])'."
+}
+
+# =============================================================================
+# 8) Documentation (unchanged: via deploy_docs)
+# =============================================================================
 if ($SLConfigPath -and (Test-Path -LiteralPath $SLConfigPath)) {
     $deployDocs = Join-Path $PSScriptRoot 'deploy_docs.ps1'
     if (Test-Path -LiteralPath $deployDocs) {
         $docsSrc = Join-Path $UsbRoot 'documentation'
-        # Desktop root (no subfolder) -- PDFs appear as icons directly on Desktop
         $desktopDst = [Environment]::GetFolderPath('Desktop')
-        # Flash keeps a Documentation subfolder for organization
         $flashDocsDst = Join-Path $flashRoot 'Documentation'
-        W "Calling deploy_docs to copy per-SL PDFs to flash + refresh desktop..."
+        W "--- Documentation via deploy_docs ---"
         try {
             & $deployDocs -SLConfigPath $SLConfigPath -DocsSource $docsSrc -DesktopDest $desktopDst -FlashDest $flashDocsDst
         } catch { W "deploy_docs threw: $($_.Exception.Message)" }

@@ -569,18 +569,22 @@ function Ensure-DataDiskHasDriveLetter {
         Sort-Object Size -Descending
     )
 
-    # Случай: диск инициализирован (GPT/MBR), но партиций нет вообще
-    # (например диск 0 - RAID 6TB Не распределена; диски 2/3 - чистые NVMe).
-    # Используем ту же логику что и для RAW: создаём партицию + форматируем NTFS.
-    if ($allPartitions.Count -eq 0) {
+    # Случай: диск инициализирован (GPT/MBR), но usable data-партиций нет
+    # (например диск 0 - RAID 6TB Не распределена; диски 2/3 - чистые NVMe;
+    # свежесозданный MegaRAID VD с одним только MSR/Reserved — тоже сюда).
+    # Проверяем именно $partitions.Count (после фильтра), не $allPartitions.Count:
+    # если единственная партиция — Reserved/MSR (16 MB), пользовательских данных нет,
+    # надо создать data-партицию поверх свободного места (New-Partition -UseMaximumSize
+    # аллокирует оставшееся пространство после MSR).
+    if ($partitions.Count -eq 0) {
         if (-not $AllowCreatePartition) {
-            Write-RaidLog "Disk $($Disk.Number) has no partitions but auto-create is not allowed. Skipped."
+            Write-RaidLog "Disk $($Disk.Number) has no usable partitions but auto-create is not allowed. Skipped."
             return @()
         }
         try {
             $letter = Get-FreeDriveLetter
             Write-ColorOutput "  Disk $($Disk.Number) initialized but empty. Creating NTFS partition, letter $letter`: ..." 'Yellow'
-            Write-RaidLog "Disk $($Disk.Number) has $($Disk.PartitionStyle) but 0 partitions - creating NTFS volume $letter`:"
+            Write-RaidLog "Disk $($Disk.Number) has $($Disk.PartitionStyle) with $($allPartitions.Count) non-data partition(s) - creating NTFS volume $letter`:"
 
             $partition = New-Partition -DiskNumber $Disk.Number -UseMaximumSize -DriveLetter $letter -ErrorAction Stop
             Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel 'IPDROM_RAID_TEST' -Confirm:$false -Force -ErrorAction Stop | Out-Null
@@ -718,6 +722,13 @@ function Get-FioTargetDriveLetters {
 
     Invoke-StorageRescan -SkipDiskpart $skipDiskpart
 
+    # Финальная выборка букв для FIO. К прежним фильтрам (не boot/system, не USB,
+    # диск Online, буква не совпадает с системной) добавлен фильтр по файловой
+    # системе — берём только NTFS. Причина: недоинициализированные MegaRAID VD
+    # могут получить букву от Windows на RAW/MSR-партицию (Explorer покажет её как
+    # "Локальный диск (X:)" без размера); FIO при попытке открыть файл на RAW-томе
+    # падает с exit 1 и рушит весь стресс-тест. NTFS-фильтр гарантирует что каждая
+    # буква в списке — реально пригодный для записи том.
     $finalLetters = @(
         Get-Disk -ErrorAction SilentlyContinue |
         Where-Object {
@@ -730,6 +741,19 @@ function Get-FioTargetDriveLetters {
         Where-Object {
             $_.DriveLetter -and
             $_.DriveLetter.ToString().ToUpper() -ne $SystemDriveLetter.ToUpper()
+        } |
+        Where-Object {
+            $letter = $_.DriveLetter.ToString()
+            $vol = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue
+            if (-not $vol) {
+                Write-RaidLog "Skipping drive $letter`: no Get-Volume result (partition without accessible volume)."
+                return $false
+            }
+            if ($vol.FileSystemType -ne 'NTFS') {
+                Write-RaidLog "Skipping drive $letter`: FileSystemType='$($vol.FileSystemType)', want NTFS (RAW/FAT partitions are not FIO-safe)."
+                return $false
+            }
+            return $true
         } |
         ForEach-Object {
             $_.DriveLetter.ToString().ToUpper()

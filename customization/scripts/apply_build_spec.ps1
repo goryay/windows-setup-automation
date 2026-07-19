@@ -119,6 +119,22 @@ function Resolve-ConfigPath {
         return $null
     }
 
+    # Priority: PXE preselection via HKLM\Software\IPDROM\SL (set by Specialize.ps1
+    # from __INSTALL_SL__ marker in autounattend). Fallback to $env:IPDROM_FORCE_SL
+    # which launcher exports from the same HKLM key. Only if neither yields a
+    # matching file do we fall back to the mtime-sort auto-discovery.
+    $forcedSL = $null
+    try { $forcedSL = (Get-ItemProperty -Path 'HKLM:\Software\IPDROM' -Name 'SL' -ErrorAction Stop).SL } catch {}
+    if (-not $forcedSL -and $env:IPDROM_FORCE_SL) { $forcedSL = $env:IPDROM_FORCE_SL }
+    if ($forcedSL -and $forcedSL -match '^SL\w+-\w+$') {
+        $forcedPath = Join-Path $Dir "$forcedSL.txt"
+        if (Test-Path -LiteralPath $forcedPath) {
+            Write-Log "Using PXE-preselected SL: $forcedSL -> $forcedPath" 'Green'
+            return $forcedPath
+        }
+        Write-Log "PXE preselection SL=$forcedSL, but $forcedPath not found -- falling back to auto-discovery." 'Yellow'
+    }
+
     # Допускаем: SL111111-001.txt (production), SLTEST99-001.txt (тестовые),
     # SL111111-001.txt (Windows-дубликаты). \w = [A-Za-z0-9_].
     $slCandidates = @(Get-ChildItem -Path $Dir -Filter 'SL*.txt' -File -ErrorAction SilentlyContinue |

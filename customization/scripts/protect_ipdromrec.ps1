@@ -69,15 +69,32 @@ if ($busType -ne 'USB') {
     exit 1
 }
 
-# Apply readonly via diskpart
-$scriptFile = Join-Path $env:TEMP 'ipdrom_protect_rec.txt'
-@"
-select disk $diskNum
-attributes disk set readonly
-exit
-"@ | Set-Content -LiteralPath $scriptFile -Encoding ascii
+# Enumerate partitions to hide them from Windows Explorer before locking readonly
+# Sequence in diskpart: remove drive letters -> set GPT 'no auto-letter' attribute
+# (persists across reboots) -> lock whole disk readonly (must be LAST — after this
+# no more writes possible). UEFI-boot from EFI partition and WinPE-side FFU restore
+# (label-based lookup via Get-Volume -FileSystemLabel) both keep working.
+$partitions = @(Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Sort-Object PartitionNumber)
+W "Partitions on disk $diskNum to hide: $($partitions.Count)"
+foreach ($p in $partitions) {
+    $letter = if ($p.DriveLetter) { "$($p.DriveLetter):" } else { '<none>' }
+    W "  #$($p.PartitionNumber) letter=$letter size=$([math]::Round($p.Size / 1MB, 1)) MB"
+}
 
-W "Running: diskpart /s $scriptFile (select disk $diskNum, attributes disk set readonly)"
+$dpLines = @("select disk $diskNum")
+foreach ($p in $partitions) {
+    $dpLines += "select partition $($p.PartitionNumber)"
+    $dpLines += "remove noerr"
+    $dpLines += "gpt attributes=0x8000000000000000"
+}
+$dpLines += "select disk $diskNum"
+$dpLines += "attributes disk set readonly"
+$dpLines += "exit"
+
+$scriptFile = Join-Path $env:TEMP 'ipdrom_protect_rec.txt'
+($dpLines -join "`r`n") | Set-Content -LiteralPath $scriptFile -Encoding ascii
+
+W "Running: diskpart /s $scriptFile (hide partitions from Explorer, then set disk readonly)"
 $dpOut = & diskpart.exe /s $scriptFile 2>&1
 foreach ($l in $dpOut) { W "  | $l" }
 $dpExit = $LASTEXITCODE
