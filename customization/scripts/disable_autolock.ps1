@@ -61,5 +61,21 @@ try {
     Write-Log "Console lock timeout tweak skipped: $_" 'Yellow'
 }
 
+# 6. Отключаем сам lock screen как экран (NoLockScreen). Без этого Windows
+#    всё равно может показывать lock screen при wake/session switch, даже если
+#    idle-таймаут = 0. Policy применяется на всех пользователей.
+reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization" /v NoLockScreen /t REG_DWORD /d 1 /f | Out-Null
+Write-Log "NoLockScreen = 1 (lock screen disabled entirely)" 'Green'
+
+# 7. Не требовать пароль при пробуждении из сна (на случай если сон случится).
+try {
+    powercfg.exe /SETACVALUEINDEX SCHEME_CURRENT SUB_NONE CONSOLELOCK 0 2>$null
+    powercfg.exe /SETDCVALUEINDEX SCHEME_CURRENT SUB_NONE CONSOLELOCK 0 2>$null
+    powercfg.exe /SETACTIVE SCHEME_CURRENT 2>$null
+    Write-Log "Password on wake = disabled (both AC/DC)" 'Green'
+} catch {
+    Write-Log "Password-on-wake tweak skipped: $_" 'Yellow'
+}
+
 Write-Log "=== disable_autolock finished ===" 'Cyan'
 exit 0
