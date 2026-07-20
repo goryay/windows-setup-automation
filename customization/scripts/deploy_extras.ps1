@@ -375,6 +375,57 @@ if ($mbAsset) {
 }
 
 # =============================================================================
+# 7.5) Intel RST driver (setuprst.exe) — if any group has disk_system=TRUE
+# System RAID is created manually in BIOS by the operator. If SL has any group
+# marked as system (disk_system=TRUE), we assume the operator will/did build
+# system-level RAID and thus needs the Intel RST driver both installed on the
+# live system (for RAID management/monitoring) and copied to the IPDROM flash
+# (so a repair master has the installer for future restore/reinstall).
+# =============================================================================
+$hasSystemRaid = $false
+foreach ($k in $sl.Keys) {
+    if ($k -match '^group_\d+_disk_system$' -and $sl[$k] -match '^(?i)true$') {
+        $hasSystemRaid = $true
+        break
+    }
+}
+if ($hasSystemRaid) {
+    W "--- System RAID detected (group_*_disk_system=TRUE) -> Intel RST driver ---"
+    $rstFiles = @(Find-BySrcRegex -Dir $softsSrc -Pattern '(?i)^setuprst\.exe$')
+    if ($rstFiles.Count -gt 0) {
+        foreach ($rst in $rstFiles) {
+            # Copy to IPDROM flash first (repair-master will have it even if install fails)
+            Copy-ToFlash -Src $rst.FullName -DstDir $softwareDst -Reason "Intel RST installer (system RAID)"
+
+            # Silent install on live system. Intel setuprst.exe common flags:
+            #   -s = silent
+            #   -f = force (accept EULA/overwrite)
+            #   -a = accept all (some builds)
+            #   -r n = no restart
+            # Exit codes: 0 = OK, 3010 = OK but needs reboot, others = failure.
+            W "  Silent install: $($rst.FullName) -s -f -acceptall -r n"
+            try {
+                $proc = Start-Process -FilePath $rst.FullName `
+                    -ArgumentList '-s','-f','-acceptall','-r','n' `
+                    -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                $rc = $proc.ExitCode
+                if ($rc -eq 0 -or $rc -eq 3010) {
+                    W "  setuprst.exe OK (exit=$rc)"
+                } else {
+                    W "  setuprst.exe returned exit=$rc (non-zero; may indicate incompatible flags or install error)"
+                }
+            } catch {
+                W "  setuprst.exe launch FAILED: $($_.Exception.Message)"
+            }
+        }
+    } else {
+        W "  WARN: system RAID declared in SL but setuprst.exe not found in $softsSrc"
+    }
+} else {
+    W "No group has disk_system=TRUE -- Intel RST driver skipped."
+}
+
+# =============================================================================
 # 8) Documentation (unchanged: via deploy_docs)
 # =============================================================================
 if ($SLConfigPath -and (Test-Path -LiteralPath $SLConfigPath)) {
