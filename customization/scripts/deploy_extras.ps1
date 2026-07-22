@@ -253,6 +253,10 @@ if ($hasRaid) {
 # =============================================================================
 # 3) Axxon Intellect / IntellectX (based on axxonsoft key)
 # =============================================================================
+# Значения ключа - те же, что понимает Install-AxxonByBuildSpec:
+#   i = Intellect classic | x = IntellectX | a = Axxon Next
+# Здесь раньше стояло 'ix' вместо 'x', поэтому для SL с IntellectX (SL002)
+# дистрибутив на флешку не копировался вообще - ветка уходила в default.
 $axxonsoft = if ($sl['axxonsoft']) { $sl['axxonsoft'].ToLower() } else { '' }
 switch ($axxonsoft) {
     'i' {
@@ -261,13 +265,21 @@ switch ($axxonsoft) {
             Copy-ToFlash -Src $f.FullName -DstDir $softwareDst -Reason "Intellect"
         }
     }
-    'ix' {
-        W "--- axxonsoft=ix -> IntellectX ---"
-        foreach ($f in (Find-BySrcRegex -Dir $softsSrc -Pattern '(?i)IntellectX.*\.zip$')) {
+    'x' {
+        W "--- axxonsoft=x -> IntellectX ---"
+        foreach ($f in (Find-BySrcRegex -Dir $softsSrc -Pattern '(?i)^IntellectX.*\.zip$')) {
             Copy-ToFlash -Src $f.FullName -DstDir $softwareDst -Reason "IntellectX"
         }
     }
-    default { W "axxonsoft='$axxonsoft' -- no Intellect/IntellectX copied." }
+    'a' {
+        W "--- axxonsoft=a -> Axxon Next ---"
+        $anFiles = @(Find-BySrcRegex -Dir $softsSrc -Pattern '(?i)axxon.*next.*\.(zip|exe|msi)$')
+        if ($anFiles.Count -eq 0) {
+            W "  WARN: Axxon Next requested in SL but no installer found in $softsSrc"
+        }
+        foreach ($f in $anFiles) { Copy-ToFlash -Src $f.FullName -DstDir $softwareDst -Reason "Axxon Next" }
+    }
+    default { W "axxonsoft='$axxonsoft' -- unknown value, no Axxon distribution copied." }
 }
 
 # =============================================================================
@@ -375,22 +387,39 @@ if ($mbAsset) {
 }
 
 # =============================================================================
-# 7.5) Intel RST driver (setuprst.exe) — if any group has disk_system=TRUE
-# System RAID is created manually in BIOS by the operator. If SL has any group
-# marked as system (disk_system=TRUE), we assume the operator will/did build
-# system-level RAID and thus needs the Intel RST driver both installed on the
-# live system (for RAID management/monitoring) and copied to the IPDROM flash
-# (so a repair master has the installer for future restore/reinstall).
+# 7.5) Intel RST driver (setuprst.exe) — only for a real SYSTEM-LEVEL RAID.
+# Two conditions must hold together on the same group:
+#   group_N_disk_system = TRUE   -> this is the system disk group
+#   group_N_Type        = RAID-x -> and it is an actual RAID array
+# disk_system=TRUE alone is NOT enough: a system group can be 'wo_RAID'
+# (single disk, no array) — that needs no RAID driver at all.
+# System RAID itself is built manually in BIOS by the operator; we only ship
+# and install the driver so Windows can see/manage the array.
 # =============================================================================
 $hasSystemRaid = $false
+$sysRaidType   = ''
+$sysRaidHost   = ''
 foreach ($k in $sl.Keys) {
-    if ($k -match '^group_\d+_disk_system$' -and $sl[$k] -match '^(?i)true$') {
+    # NOTE: capture the group number immediately. Chaining a second -match in the
+    # same if-condition overwrites $matches and would blank out $gn.
+    if ($k -notmatch '^group_(\d+)_disk_system$') { continue }
+    $gn = $matches[1]
+    if ($sl[$k] -notmatch '^(?i)true$') { continue }
+
+    # SL keys are lower-cased at parse time, so group_1_Type -> group_1_type
+    $typeRaw  = "" + $sl["group_${gn}_type"]
+    # "RAID-1" / "RAID 1" / "raid_1" -> "RAID1";  "wo_RAID" -> "WORAID"
+    $typeNorm = ($typeRaw -replace '[\s\-_]', '').ToUpper()
+    if ($typeNorm -match '^RAID\d+$') {
         $hasSystemRaid = $true
+        $sysRaidType   = $typeRaw
+        $sysRaidHost   = "" + $sl["group_${gn}_host"]
         break
     }
+    W "  group_${gn}: disk_system=TRUE but Type='$typeRaw' is not a RAID level -- not a system RAID."
 }
 if ($hasSystemRaid) {
-    W "--- System RAID detected (group_*_disk_system=TRUE) -> Intel RST driver ---"
+    W "--- System RAID detected (Type='$sysRaidType', host='$sysRaidHost') -> Intel RST driver ---"
     $rstFiles = @(Find-BySrcRegex -Dir $softsSrc -Pattern '(?i)^setuprst\.exe$')
     if ($rstFiles.Count -gt 0) {
         foreach ($rst in $rstFiles) {
@@ -422,7 +451,7 @@ if ($hasSystemRaid) {
         W "  WARN: system RAID declared in SL but setuprst.exe not found in $softsSrc"
     }
 } else {
-    W "No group has disk_system=TRUE -- Intel RST driver skipped."
+    W "No system-level RAID in SL (no group with disk_system=TRUE + Type=RAID-x) -- Intel RST skipped."
 }
 
 # =============================================================================

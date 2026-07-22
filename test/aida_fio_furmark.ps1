@@ -60,6 +60,72 @@ public const uint ES_DISPLAY_REQUIRED = 0x00000002;
     Write-Log "Power keep-alive failed: $_" 'Yellow'
 }
 
+# ===================== SCHEDULING PRIORITY =====================
+# FIO across several RAID volumes plus AIDA64 and FurMark saturate the machine.
+# This script itself mostly sleeps, but it has to wake up on time to take the
+# timed screenshots - and under that load the wake-ups drift by minutes.
+# Nudging OUR OWN priority up fixes the punctuality without touching the load.
+# Deliberately NOT lowering the stress tools' priority: throttling them would
+# weaken the very test we are running.
+try {
+    (Get-Process -Id $PID).PriorityClass = [System.Diagnostics.ProcessPriorityClass]::AboveNormal
+    Write-Log "Orchestrator priority raised to AboveNormal (stress tools untouched)." 'DarkGray'
+} catch {
+    Write-Log "Could not raise orchestrator priority: $_" 'Yellow'
+}
+
+# ===================== WIN32 TYPES (PRE-COMPILED) =====================
+# Add-Type compiles C# at runtime: it writes temporary assemblies to disk and
+# spins up the compiler. That costs a fraction of a second on an idle machine,
+# but becomes brutal once four FIO jobs saturate the disks - the first
+# Bring-AidaToFront call under load spent TEN MINUTES right here, which ate the
+# whole screenshot schedule and cost us the AidaAuto and AidaFinal shots.
+# The AidaCap type never showed the problem only because AidaEarly compiles it
+# BEFORE FIO starts. So: compile everything up front, while the machine is idle.
+# The functions below keep their own guards and simply short-circuit afterwards.
+function Initialize-Win32Types {
+    if (-not ('IPDROM.WinFG' -as [type])) {
+        Add-Type -Namespace IPDROM -Name WinFG -MemberDefinition @'
+public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpfn, System.IntPtr lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode)] public static extern int GetWindowText(System.IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern int GetWindowTextLength(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint lpdwProcessId);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindowAsync(System.IntPtr hWnd, int nCmdShow);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool BringWindowToTop(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetWindowPos(System.IntPtr hWnd, System.IntPtr hWndAfter, int X, int Y, int cx, int cy, uint uFlags);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, System.UIntPtr dwExtraInfo);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+'@
+    }
+    if (-not ('IPDROM.AidaCap' -as [type])) {
+        Add-Type -Namespace IPDROM -Name AidaCap -MemberDefinition @'
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool GetWindowRect(System.IntPtr hWnd, out RECT rect);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool PrintWindow(System.IntPtr hWnd, System.IntPtr hdcBlt, int nFlags);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hWnd);
+'@
+    }
+}
+
+try {
+    Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    $swTypes = [System.Diagnostics.Stopwatch]::StartNew()
+    Initialize-Win32Types
+    $swTypes.Stop()
+    Write-Log ("Win32 types pre-compiled in {0:N1}s (done while machine is still idle)." -f $swTypes.Elapsed.TotalSeconds) 'DarkGray'
+} catch {
+    Write-Log "Win32 type pre-compile failed: $_ (will retry lazily)" 'Yellow'
+}
+
 # ===================== PATHS =====================
 if (-not $UsbRoot) { $UsbRoot = [System.IO.Path]::GetPathRoot($PSScriptRoot) }
 $script:Aida64FullPath  = Join-Path $UsbRoot 'SoftForTest\AIDA64\AIDA64Port.exe'
@@ -201,27 +267,23 @@ function Bring-AidaToFront {
     # Win32 SetForegroundWindow имеет foreground-lock, который обходится
     # эмуляцией нажатия Alt (keybd_event) - стандартный хак.
     # Окно ищем по заголовку, потому что в трее MainWindowHandle ненадёжен.
-    try {
-        if (-not ('IPDROM.WinFG' -as [type])) {
-            Add-Type -Namespace IPDROM -Name WinFG -MemberDefinition @'
-public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpfn, System.IntPtr lParam);
-[System.Runtime.InteropServices.DllImport("user32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode)] public static extern int GetWindowText(System.IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern int GetWindowTextLength(System.IntPtr hWnd);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hWnd);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint lpdwProcessId);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindowAsync(System.IntPtr hWnd, int nCmdShow);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hWnd);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool BringWindowToTop(System.IntPtr hWnd);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetWindowPos(System.IntPtr hWnd, System.IntPtr hWndAfter, int X, int Y, int cx, int cy, uint uFlags);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, System.UIntPtr dwExtraInfo);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
-'@
+
+    # Поднятие окна - это косметика: Save-AidaScreenshotInline снимает через
+    # PrintWindow, которому foreground не нужен. Поэтому если до конца AIDA
+    # осталось меньше минуты, лучше пропустить этот шаг и успеть снять кадр,
+    # чем застрять здесь и потерять скриншот целиком.
+    if ($script:AidaDeadline) {
+        $left = ($script:AidaDeadline - (Get-Date)).TotalSeconds
+        if ($left -lt 45) {
+            Write-Log ("Bring-AidaToFront skipped: only {0:N0}s left before AIDA ends - going straight to capture." -f $left) 'Yellow'
+            return
         }
+    }
+
+    try {
+        # Типы уже скомпилированы на старте скрипта (машина была без нагрузки).
+        # Этот вызов - страховка: если пре-компиляция упала, он сделает работу здесь.
+        Initialize-Win32Types
 
         # AIDA-процессы для фильтрации (по PID)
         $aidaProcs = @()
@@ -357,16 +419,8 @@ function Save-AidaScreenshotInline {
         Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 
-        # Inject Win32 types для PrintWindow / GetWindowRect (один раз на сессию)
-        if (-not ('IPDROM.AidaCap' -as [type])) {
-            Add-Type -Namespace IPDROM -Name AidaCap -MemberDefinition @'
-[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool GetWindowRect(System.IntPtr hWnd, out RECT rect);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool PrintWindow(System.IntPtr hWnd, System.IntPtr hdcBlt, int nFlags);
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hWnd);
-'@
-        }
+        # Win32-типы для PrintWindow / GetWindowRect (скомпилированы на старте скрипта)
+        Initialize-Win32Types
 
         $screensDir = Join-Path (Join-Path ([Environment]::GetFolderPath('Desktop')) $env:COMPUTERNAME) 'Screens'
         New-Item -ItemType Directory -Force -Path $screensDir | Out-Null
@@ -448,6 +502,30 @@ public struct RECT { public int Left; public int Top; public int Right; public i
         }
     } catch {
         Write-Log "Save-AidaScreenshotInline error: $_" 'Red'
+    }
+}
+
+function Save-DesktopScreenshot {
+    # Снимок ВСЕГО экрана, без привязки к какому-либо окну.
+    # Нужен для диагностики: когда AIDA64 молча висит и не пишет отчёт, ни в
+    # stdout, ни в stderr ничего нет - единственный способ понять, что
+    # происходит, это посмотреть на экран. Модальное окно с вопросом
+    # ("была закрыта некорректно", запрос лицензии и т.п.) видно только так.
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+        $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+        $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+        try {
+            $gfx.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bmp.Size)
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+            $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+            Write-Log ("  diagnostic desktop screenshot ({0}x{1}): {2}" -f $bounds.Width, $bounds.Height, $Path) 'Yellow'
+        } finally { $gfx.Dispose(); $bmp.Dispose() }
+    } catch {
+        Write-Log "  diagnostic desktop screenshot failed: $_" 'DarkGray'
     }
 }
 
@@ -611,6 +689,10 @@ $midShotTime   = $testStartTime.AddSeconds([int]($totalSeconds / 2))  # T/2 : Ai
 $autoShotTime  = $aidaEndTime.AddSeconds(-300)   # T - 5 min : AidaAuto
 $finalShotTime = $aidaEndTime.AddSeconds(-30)    # T - 30 s  : AidaFinal (AIDA ТОЧНО ещё открыта)
 
+# Дедлайн для Bring-AidaToFront: у неё нет своего представления о расписании,
+# поэтому отдаём его сюда - см. проверку в начале функции.
+$script:AidaDeadline = $aidaEndTime
+
 function Wait-Until {
     # Resilient wait until $Target wall-clock time.
     # Uses small (max 30s) Start-Sleep chunks in a loop so that if Windows
@@ -631,7 +713,29 @@ function Wait-Until {
         if ($remaining -le 0) { break }
         $chunk = [int][Math]::Min(30, $remaining)
         if ($chunk -lt 1) { $chunk = 1 }
+
+        # Re-arm the "do not sleep" request on every iteration. The flag set at
+        # script start is bound to whichever thread set it and only lasts for
+        # that thread's life - if PowerShell moves the pipeline to another
+        # thread, or anything clears the flag, the machine silently becomes
+        # sleepable again mid-test. Re-arming here is cheap and keeps it alive.
+        try {
+            if ('IPDROM.Power' -as [type]) {
+                [IPDROM.Power]::SetThreadExecutionState([IPDROM.Power]::ES_CONTINUOUS -bor [IPDROM.Power]::ES_SYSTEM_REQUIRED -bor [IPDROM.Power]::ES_DISPLAY_REQUIRED) | Out-Null
+            }
+        } catch {}
+
+        $sleepStart = Get-Date
         Start-Sleep -Seconds $chunk
+        # A chunk that takes far longer than asked means the machine really was
+        # suspended (or badly starved). Log it at the moment it happens, with
+        # exact times - otherwise this only surfaces as a late wake-up at the
+        # end and there is no way to tell suspend from slow screenshots.
+        $slept = ((Get-Date) - $sleepStart).TotalSeconds
+        if ($slept -gt ($chunk + 10)) {
+            Write-Log ("    STALL: Start-Sleep {0}s actually took {1:N0}s ({2} -> {3})" -f $chunk, $slept, $sleepStart.ToString('HH:mm:ss'), (Get-Date).ToString('HH:mm:ss')) 'Yellow'
+        }
+
         # Heartbeat every 2 minutes so it's visible in log that we're alive
         if (((Get-Date) - $lastLog).TotalSeconds -ge 120) {
             $remNow = [int](($Target - (Get-Date)).TotalSeconds)
@@ -667,8 +771,15 @@ if ((Get-Date) -lt $autoShotTime) {
     Write-Log "Taking AidaAuto screenshot (5 min before AIDA end)..." 'Yellow'
     Bring-AidaToFront
     Save-AidaScreenshotInline -Prefix 'AIDA64_auto'
+} elseif ((Get-Date) -lt $aidaEndTime) {
+    # A stall pushed us past the exact T-300s mark, but AIDA is still running.
+    # A late shot carries the same information and is far better than none,
+    # so take it immediately instead of skipping the step outright.
+    Write-Log "AidaAuto target already passed, but AIDA is still running - taking the shot late." 'Yellow'
+    Bring-AidaToFront
+    Save-AidaScreenshotInline -Prefix 'AIDA64_auto'
 } else {
-    Write-Log "AidaAuto window missed (we are already past T-300s). Skipping AidaAuto." 'Yellow'
+    Write-Log "AidaAuto window missed (already past AIDA end). Skipping AidaAuto." 'Yellow'
 }
 
 # --- AidaFinal (T-30s) - ЭТОТ скриншот критичен, делаем всегда, пока AIDA жива
@@ -821,28 +932,136 @@ if (Test-Path $script:Aida64FullPath) {
         Write-Log "AIDA64 pre-launch cleanup partially failed: $_" 'Yellow'
     }
 
-    $aidaProc = Start-Process -FilePath $script:Aida64FullPath `
-        -ArgumentList @('/R', $reportPath, '/ALL', '/SUM', '/HW', '/SW', '/AUDIT', '/HTML') `
-        -PassThru -NoNewWindow
+    # This step kept timing out on the bench: AIDA64 never exits within the cap
+    # and the old code only looked for the file AFTER the wait, so a report that
+    # was written but followed by a hung process counted as "not created".
+    # Reworked to be both more forgiving and self-diagnosing:
+    #   * poll for the output file while waiting instead of only checking at the end
+    #   * once the file stops growing, take it and kill the stuck process
+    #   * capture stdout/stderr so a future failure leaves evidence behind
+    #   * fall back to a summary-only report so the uploaded archive always has one
+    function Invoke-AidaReport {
+        param(
+            [Parameter(Mandatory)][string]$Exe,
+            [Parameter(Mandatory)][string]$OutFile,
+            [Parameter(Mandatory)][string[]]$PageArgs,
+            [Parameter(Mandatory)][int]$TimeoutSec,
+            [Parameter(Mandatory)][string]$Label
+        )
 
-    $reportTimeoutMs = 300000   # 5 min hard cap
-    if ($aidaProc.WaitForExit($reportTimeoutMs)) {
-        Write-Log "AIDA64 report process exited (exit code: $($aidaProc.ExitCode))." 'Gray'
-    } else {
-        Write-Log "AIDA64 report generation timed out after $($reportTimeoutMs/1000)s. Killing." 'Yellow'
-        try { $aidaProc | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
-        Get-Process -Name 'AIDA64Port','aida64' -ErrorAction SilentlyContinue |
+        $outDir = Split-Path -Parent $OutFile
+
+        # Kill leftovers and drop previous output, so a stale file from an
+        # earlier attempt cannot be mistaken for a fresh report.
+        Get-Process -Name 'AIDA64*' -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+
+        # 2 s was not enough: after Stop-Process the killed AIDA64 still holds
+        # its lock/tmp files for a while, and the next instance can come up with
+        # a modal "previous session ended unexpectedly" dialog - which would
+        # explain a process that hangs forever while writing nothing at all.
+        # Give the OS real time to tear it down before relaunching.
+        Start-Sleep -Seconds 20
+        Get-ChildItem -Path $outDir -Filter 'SystemReport.htm*' -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+
+        $soPath  = Join-Path $script:TestLogDir ("aida_report_{0}_stdout.txt" -f $Label)
+        $sePath  = Join-Path $script:TestLogDir ("aida_report_{0}_stderr.txt" -f $Label)
+        $cliArgs = @('/R', $OutFile) + $PageArgs + @('/HTML')
+
+        Write-Log ("  [{0}] launching: {1} {2}" -f $Label, (Split-Path $Exe -Leaf), ($cliArgs -join ' ')) 'DarkGray'
+
+        $proc = $null
+        try {
+            $proc = Start-Process -FilePath $Exe -ArgumentList $cliArgs -PassThru -NoNewWindow `
+                        -RedirectStandardOutput $soPath -RedirectStandardError $sePath -ErrorAction Stop
+        } catch {
+            Write-Log ("  [{0}] output redirection refused ({1}); launching without it." -f $Label, $_.Exception.Message) 'DarkGray'
+            $proc = Start-Process -FilePath $Exe -ArgumentList $cliArgs -PassThru -NoNewWindow
+        }
+
+        $deadline  = (Get-Date).AddSeconds($TimeoutSec)
+        $lastSize  = -1
+        $stableFor = 0
+        $found     = $null
+
+        while ((Get-Date) -lt $deadline) {
+            if ($proc.HasExited) {
+                Write-Log ("  [{0}] process exited with code {1}." -f $Label, $proc.ExitCode) 'Gray'
+                break
+            }
+
+            $f = Get-ChildItem -Path $outDir -Filter 'SystemReport.htm*' -ErrorAction SilentlyContinue |
+                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($f) {
+                if ($f.Length -eq $lastSize -and $f.Length -gt 4KB) {
+                    $stableFor += 5
+                    # 20 s without growth means AIDA finished writing and is now
+                    # just hanging around - take the file and move on.
+                    if ($stableFor -ge 20) {
+                        Write-Log ("  [{0}] report stopped growing at {1:N1} KB while the process is still alive - taking it." -f $Label, ($f.Length / 1KB)) 'Yellow'
+                        $found = $f
+                        break
+                    }
+                } else {
+                    $stableFor = 0
+                    $lastSize  = $f.Length
+                }
+            }
+            Start-Sleep -Seconds 5
+        }
+
+        # Диагностика ДО убийства процесса: если отчёта нет, а AIDA всё ещё
+        # жива, снимаем экран. Логи в прошлый раз ничего не дали (stdout и
+        # stderr оказались пустыми), так что единственная оставшаяся версия -
+        # модальное окно, ждущее клика. Скриншот её подтвердит или опровергнет.
+        if (-not $found -and -not $proc.HasExited) {
+            $shot = Join-Path $script:TestLogDir ("aida_report_{0}_stuck.png" -f $Label)
+            Write-Log ("  [{0}] no report after {1}s and AIDA still alive - capturing screen before kill." -f $Label, $TimeoutSec) 'Yellow'
+            Save-DesktopScreenshot -Path $shot
+        }
+
+        if (-not $proc.HasExited) {
+            Write-Log ("  [{0}] killing AIDA64 (cap {1}s reached or report already taken)." -f $Label, $TimeoutSec) 'DarkGray'
+            try { $proc | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        Get-Process -Name 'AIDA64*' -ErrorAction SilentlyContinue |
             Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
+
+        if (-not $found) {
+            $found = Get-ChildItem -Path $outDir -Filter 'SystemReport.htm*' -ErrorAction SilentlyContinue |
+                     Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        }
+        if ($found -and $found.Length -le 4KB) {
+            Write-Log ("  [{0}] report is only {1} bytes - too small to be real, treating as failure." -f $Label, $found.Length) 'Yellow'
+            $found = $null
+        }
+        if (-not $found) {
+            foreach ($diag in @($sePath, $soPath)) {
+                if ((Test-Path $diag) -and ((Get-Item $diag).Length -gt 0)) {
+                    $head = (Get-Content -LiteralPath $diag -TotalCount 5 -ErrorAction SilentlyContinue) -join ' | '
+                    Write-Log ("  [{0}] {1}: {2}" -f $Label, (Split-Path $diag -Leaf), $head) 'DarkGray'
+                }
+            }
+        }
+        return $found
     }
 
-    $actualReport = Get-ChildItem -Path $reportsDir -Filter 'SystemReport.htm*' -ErrorAction SilentlyContinue |
-                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $actualReport = Invoke-AidaReport -Exe $script:Aida64FullPath -OutFile $reportPath `
+        -PageArgs @('/ALL', '/SUM', '/HW', '/SW', '/AUDIT') -TimeoutSec 300 -Label 'full'
+
+    if (-not $actualReport) {
+        Write-Log "Full AIDA64 report did not complete - retrying with summary pages only." 'Yellow'
+        $actualReport = Invoke-AidaReport -Exe $script:Aida64FullPath -OutFile $reportPath `
+            -PageArgs @('/SUM') -TimeoutSec 120 -Label 'summary'
+    }
+
     if ($actualReport) {
         $sizeKb = [math]::Round($actualReport.Length / 1KB, 1)
         Write-Log "AIDA64 report saved: $($actualReport.FullName) ($sizeKb KB)" 'Green'
     } else {
-        Write-Log "AIDA64 report was NOT created." 'Red'
+        Write-Log "AIDA64 report was NOT created (full and summary attempts both failed)." 'Red'
     }
 } else {
     Write-Log "AIDA64 not found at $script:Aida64FullPath, report skipped." 'Yellow'

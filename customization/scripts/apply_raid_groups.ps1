@@ -299,6 +299,38 @@ function Get-PhysicalDrives {
     return $drives
 }
 
+# Уже существующие виртуальные диски. Разбираем `/c0/vall show all`:
+#   - строка "DG/VD TYPE ... Size" даёт уровень RAID и ёмкость
+#   - "OS Drive Name = Disk N" привязывает VD к номеру диска в Windows, по нему
+#     отличаем системный массив от data-массивов
+# Нужно, чтобы повторные прогоны на одной машине не плодили дубликаты: каждая
+# группа сначала пытается «занять» уже существующий VD своего уровня и только
+# если занимать нечего - создаёт новый.
+function Get-ExistingVirtualDrives {
+    param([string]$Cli)
+    $raw = & $Cli /c0/vall show all 2>&1
+    $vds = New-Object System.Collections.ArrayList
+    $cur = $null
+    foreach ($line in $raw) {
+        $s = "$line"
+        if ($s -match '^/c\d+/v(\d+)\s*:') {
+            if ($cur) { [void]$vds.Add($cur) }
+            $cur = [pscustomobject]@{ Vd = [int]$matches[1]; Level = $null; SizeGB = $null; OsDisk = $null }
+            continue
+        }
+        if (-not $cur) { continue }
+        if (-not $cur.Level -and
+            $s -match '^\s*\d+/\d+\s+(RAID\d+)\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+([\d.]+)\s*(TB|GB)') {
+            $cur.Level  = $matches[1]
+            $num        = [double]$matches[2]
+            $cur.SizeGB = if ($matches[3] -eq 'TB') { [int]($num * 1000) } else { [int]$num }
+        }
+        if ($s -match '^\s*OS Drive Name\s*=\s*Disk\s+(\d+)') { $cur.OsDisk = [int]$matches[1] }
+    }
+    if ($cur) { [void]$vds.Add($cur) }
+    return $vds
+}
+
 # Clear stale Foreign configuration if any. Drives that belonged to a previous
 # RAID group on this controller sit in 'UGood F' (Foreign) state and StorCLI
 # refuses to include them in a new VD with "resources already in use". On a
@@ -339,9 +371,32 @@ foreach ($d in $allDrives) {
 Write-Log "Free (Unconfigured Good) drives available: $($freeDrives.Count)" 'Cyan'
 
 if ($freeDrives.Count -eq 0) {
-    Write-Log "No free (UGood) drives - nothing can be created. All disks are in arrays." 'Yellow'
-    Write-Log "(This is expected if the system array uses all disks, or data disks aren't inserted.)" 'Gray'
-    exit 0
+    Write-Log "No free (UGood) drives on the controller." 'Yellow'
+    Write-Log "Groups matching an existing array are still fine; the rest cannot be created." 'Gray'
+}
+
+# ===================== УЖЕ СУЩЕСТВУЮЩИЕ МАССИВЫ =====================
+$existingVds = @(Get-ExistingVirtualDrives -Cli $storcli)
+Write-Log "" 'White'
+Write-Log "Existing virtual drives on controller: $($existingVds.Count)" 'Cyan'
+
+# Системный VD в пул не берём: его создаёт оператор в RAID BIOS вручную, и он
+# не должен «закрывать» потребность в data-массиве того же уровня.
+$sysDiskNumber = $null
+try {
+    $sysLetter     = ($env:SystemDrive).TrimEnd(':')
+    $sysDiskNumber = (Get-Partition -DriveLetter $sysLetter -ErrorAction Stop).DiskNumber
+} catch {
+    Write-Log "Could not resolve the system disk number: $_" 'DarkGray'
+}
+
+$claimable = New-Object System.Collections.ArrayList
+foreach ($v in $existingVds) {
+    $isSys = (($null -ne $sysDiskNumber) -and ($v.OsDisk -eq $sysDiskNumber))
+    $osTxt = if ($null -ne $v.OsDisk) { "Disk $($v.OsDisk)" } else { 'Disk ?' }
+    $note  = if ($isSys) { '  <-- SYSTEM array, not claimable' } else { '' }
+    Write-Log ("  VD{0}: {1}  ~{2}GB  {3}{4}" -f $v.Vd, $v.Level, $v.SizeGB, $osTxt, $note) 'DarkGray'
+    if (-not $isSys) { [void]$claimable.Add($v) }
 }
 
 # ===================== ПОДБОР ДИСКОВ + СОЗДАНИЕ =====================
@@ -351,6 +406,17 @@ $used = @{}   # Slot -> $true
 foreach ($p in $plan) {
     Write-Log "" 'White'
     Write-Log ("--- Group {0}: need {1}x {2} (~{3}GB) for {4} ---" -f $p.Group, $p.Quantity, $p.DiskType, $p.DiskSizeGB, $p.Level) 'Cyan'
+
+    # Уже есть незанятый массив нужного уровня? Тогда ничего не создаём. Без
+    # этой проверки повторные прогоны на одном стенде плодят одинаковые массивы,
+    # пока на контроллере не кончатся свободные диски.
+    $wantLevel = 'RAID' + $p.Level.Substring(1)
+    $already   = $claimable | Where-Object { $_.Level -eq $wantLevel } | Select-Object -First 1
+    if ($already) {
+        Write-Log ("  Array {0} already exists (VD{1}, ~{2}GB) - creation skipped." -f $wantLevel, $already.Vd, $already.SizeGB) 'Yellow'
+        [void]$claimable.Remove($already)
+        continue
+    }
 
     # Кандидаты: свободные, нужного типа, ещё не зарезервированные.
     # Размер используем мягко: предпочитаем близкие к указанному (+-25%), но
