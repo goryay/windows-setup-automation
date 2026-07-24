@@ -1019,6 +1019,13 @@ if (Test-Path $script:Aida64FullPath) {
             $shot = Join-Path $script:TestLogDir ("aida_report_{0}_stuck.png" -f $Label)
             Write-Log ("  [{0}] no report after {1}s and AIDA still alive - capturing screen before kill." -f $Label, $TimeoutSec) 'Yellow'
             Save-DesktopScreenshot -Path $shot
+            # Скриншот 22.07 показал кнопку AIDA в панели задач без видимого окна.
+            # Логируем состояние процессов: Responding=False значит UI-поток
+            # действительно завис (стартовое сканирование), Responding=True -
+            # процесс чего-то ждёт; заголовок окна подскажет, чего именно.
+            foreach ($ap in @(Get-Process -Name 'AIDA64*' -ErrorAction SilentlyContinue)) {
+                Write-Log ("  [{0}]   process {1} PID={2} responding={3} window='{4}'" -f $Label, $ap.ProcessName, $ap.Id, $ap.Responding, $ap.MainWindowTitle) 'DarkGray'
+            }
         }
 
         if (-not $proc.HasExited) {
@@ -1051,10 +1058,23 @@ if (Test-Path $script:Aida64FullPath) {
     $actualReport = Invoke-AidaReport -Exe $script:Aida64FullPath -OutFile $reportPath `
         -PageArgs @('/ALL', '/SUM', '/HW', '/SW', '/AUDIT') -TimeoutSec 300 -Label 'full'
 
+    # Диагностика 22.07 (aida_report_*_stuck.png): на экране НЕТ ни модального
+    # окна, ни окна прогресса - только кнопка AIDA в панели задач. Значит AIDA
+    # висит ДО показа окна генерации, то есть на стартовом сканировании железа
+    # (PCI/SMBus/датчики/диски). Совпадает по времени с поломкой: отчёт работал
+    # 13.07 при одном VD на MegaRAID и перестал с 19.07, когда массивов стало 3.
+    # Поэтому повторные попытки идут с обрезанным сканированием:
+    #   /SAFE   - без низкоуровневого PCI/SMBus/sensor-скана
+    #   /SAFEST - вообще без загрузки kernel-драйверов (последний шанс)
     if (-not $actualReport) {
-        Write-Log "Full AIDA64 report did not complete - retrying with summary pages only." 'Yellow'
+        Write-Log "Full AIDA64 report did not complete - retrying summary in Safe Mode (/SAFE, no low-level scan)." 'Yellow'
         $actualReport = Invoke-AidaReport -Exe $script:Aida64FullPath -OutFile $reportPath `
-            -PageArgs @('/SUM') -TimeoutSec 120 -Label 'summary'
+            -PageArgs @('/SUM', '/SAFE') -TimeoutSec 120 -Label 'summary_safe'
+    }
+    if (-not $actualReport) {
+        Write-Log "Safe Mode also failed - last resort: /SAFEST (no kernel drivers at all)." 'Yellow'
+        $actualReport = Invoke-AidaReport -Exe $script:Aida64FullPath -OutFile $reportPath `
+            -PageArgs @('/SUM', '/SAFEST') -TimeoutSec 120 -Label 'summary_safest'
     }
 
     if ($actualReport) {

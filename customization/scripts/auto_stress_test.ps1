@@ -542,7 +542,7 @@ function Ensure-DataDiskHasDriveLetter {
 
             Initialize-Disk -Number $Disk.Number -PartitionStyle GPT -ErrorAction Stop
             $partition = New-Partition -DiskNumber $Disk.Number -UseMaximumSize -DriveLetter $letter -ErrorAction Stop
-            Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel 'IPDROM_RAID_TEST' -Confirm:$false -Force -ErrorAction Stop | Out-Null
+            Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel 'Archive' -Confirm:$false -Force -ErrorAction Stop | Out-Null
 
             Write-RaidLog "Disk $($Disk.Number) prepared as $letter`:"
             return @($letter)
@@ -587,7 +587,7 @@ function Ensure-DataDiskHasDriveLetter {
             Write-RaidLog "Disk $($Disk.Number) has $($Disk.PartitionStyle) with $($allPartitions.Count) non-data partition(s) - creating NTFS volume $letter`:"
 
             $partition = New-Partition -DiskNumber $Disk.Number -UseMaximumSize -DriveLetter $letter -ErrorAction Stop
-            Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel 'IPDROM_RAID_TEST' -Confirm:$false -Force -ErrorAction Stop | Out-Null
+            Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel 'Archive' -Confirm:$false -Force -ErrorAction Stop | Out-Null
 
             Write-RaidLog "Disk $($Disk.Number) prepared as $letter`:"
             return @($letter)
@@ -1309,6 +1309,29 @@ foreach ($tempPath in @(
 Write-ColorOutput "  Temp files cleaned." 'Gray'
 
 Write-ColorOutput "[6.5/7] Cleanup completed. OS is clean for FFU capture." 'Green'
+
+# ===================== FINALIZE VOLUME LABELS =====================
+# Метки томов для отгрузки заказчику:
+#   C: (системный)   -> SYSTEM
+#   data-массивы     -> Archive  (уже задано при форматировании выше в этом
+#                                 скрипте, метка 'Archive')
+# Флешки (IPDROM / IpdromREC / WINRE) НЕ трогаем: у них метки-маркеры, по
+# которым их находят другие скрипты (protect_ipdromrec, deploy_extras и т.д.).
+# Системный том переименовываем здесь, ДО FFU-захвата, чтобы метка 'SYSTEM'
+# попала в образ восстановления.
+try {
+    $sysLetter = ($env:SystemDrive).TrimEnd(':')
+    Set-Volume -DriveLetter $sysLetter -NewFileSystemLabel 'SYSTEM' -ErrorAction Stop
+    Write-ColorOutput "  System volume ${sysLetter}: relabeled to 'SYSTEM'." 'Gray'
+} catch {
+    # Fallback через label.exe, если Set-Volume недоступен.
+    try {
+        & label.exe "$env:SystemDrive" SYSTEM
+        Write-ColorOutput "  System volume relabeled to 'SYSTEM' (via label.exe)." 'Gray'
+    } catch {
+        Write-ColorOutput "  WARN: could not relabel system volume to 'SYSTEM': $_" 'Yellow'
+    }
+}
 
 # ===================== PIPELINE HEALTH GATE =====================
 # Не запускаем FFU-захват если что-то критичное завалилось.

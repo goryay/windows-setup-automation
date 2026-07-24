@@ -9,6 +9,30 @@ $logFile = Join-Path $logDir ("protect_ipdromrec_{0}.log" -f (Get-Date -Format '
 
 function W { param([string]$m) $line = '[{0}] {1}' -f (Get-Date -f 'yyyy-MM-dd HH:mm:ss'),$m; Add-Content -Path $logFile -Value $line -Encoding utf8; Write-Host $line }
 
+# Drop QuickEdit mode for THIS console immediately. Registry (set by
+# disable_autolock before FFU capture) already disables it for new consoles, but
+# this is belt-and-suspenders for the exact console that hung 12 hours on run
+# 005: with QuickEdit on, any click/selection in the window freezes the process
+# until a key is pressed. SetConsoleMode strips ENABLE_QUICK_EDIT_MODE (0x40)
+# while keeping ENABLE_EXTENDED_FLAGS (0x80) so the change takes effect. Wrapped
+# in try/catch: if launched without a real console, this simply no-ops.
+try {
+    if (-not ('IPDROM.Con' -as [type])) {
+        Add-Type -Namespace IPDROM -Name Con -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetStdHandle(int nStdHandle);
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern bool GetConsoleMode(System.IntPtr hConsoleHandle, out uint lpMode);
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern bool SetConsoleMode(System.IntPtr hConsoleHandle, uint dwMode);
+'@
+    }
+    $conIn = [IPDROM.Con]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+    $conMode = [uint32]0
+    if ([IPDROM.Con]::GetConsoleMode($conIn, [ref]$conMode)) {
+        $conMode = ($conMode -band (-bnot [uint32]0x40)) -bor [uint32]0x80
+        [void][IPDROM.Con]::SetConsoleMode($conIn, $conMode)
+        W "QuickEdit disabled for this console (SetConsoleMode) - no freeze-on-click."
+    }
+} catch { }
+
 $stateDir   = Join-Path $env:ProgramData 'IPDROM\State'
 $markerFlag = Join-Path $stateDir 'IpdromREC_Protected.flag'
 $taskName   = 'IPDROM_ProtectRec'

@@ -77,5 +77,17 @@ try {
     Write-Log "Password-on-wake tweak skipped: $_" 'Yellow'
 }
 
+# 8. Отключаем QuickEdit Mode консоли. С включённым QuickEdit любой клик или
+#    выделение мышью в окне консоли ПРИОСТАНАВЛИВАЕТ выполняющийся процесс до
+#    нажатия Enter/Esc (в заголовке окна появляется "Выделение"/"Выбрать").
+#    На прогоне 005 из-за этого protect_ipdromrec завис на 12 часов на самом
+#    последнем шаге - консоль замерла на Write-Host, пока утром не нажали клавишу.
+#    Настройка читается при СОЗДАНИИ консоли, поэтому ставим её здесь, в начале
+#    конвейера: все последующие консоли (стресс-тест, aida, protect) её
+#    унаследуют, и она же попадёт в FFU-образ заказчика.
+reg.exe add "HKCU\Console" /v QuickEdit /t REG_DWORD /d 0 /f | Out-Null
+reg.exe add "HKEY_USERS\.DEFAULT\Console" /v QuickEdit /t REG_DWORD /d 0 /f | Out-Null
+Write-Log "QuickEdit console mode disabled (HKCU + .DEFAULT) - consoles no longer freeze on click" 'Green'
+
 Write-Log "=== disable_autolock finished ===" 'Cyan'
 exit 0

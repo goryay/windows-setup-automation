@@ -426,25 +426,48 @@ if ($hasSystemRaid) {
             # Copy to IPDROM flash first (repair-master will have it even if install fails)
             Copy-ToFlash -Src $rst.FullName -DstDir $softwareDst -Reason "Intel RST installer (system RAID)"
 
-            # Silent install on live system. Intel setuprst.exe common flags:
-            #   -s = silent
-            #   -f = force (accept EULA/overwrite)
-            #   -a = accept all (some builds)
-            #   -r n = no restart
-            # Exit codes: 0 = OK, 3010 = OK but needs reboot, others = failure.
-            W "  Silent install: $($rst.FullName) -s -f -acceptall -r n"
-            try {
-                $proc = Start-Process -FilePath $rst.FullName `
-                    -ArgumentList '-s','-f','-acceptall','-r','n' `
-                    -Wait -PassThru -NoNewWindow -ErrorAction Stop
-                $rc = $proc.ExitCode
+            # Silent install on live system. The OLD flags '-s -f -acceptall -r n'
+            # were rejected with exit 1639 (invalid command line): 19.5 has no
+            # '-f', '-acceptall' is now '-accepteula', and '-r' takes a LOG PATH,
+            # not 'n'. Correct flags:
+            #   -silent      = no dialogs (-s is the short form)
+            #   -accepteula  = MANDATORY for silent (accepts EULA), per ReadMe
+            #   -norestart   = do NOT reboot. CRITICAL: this runs BEFORE the FFU
+            #                  capture; an installer reboot here would restart the
+            #                  launcher mid-pipeline and corrupt the flow.
+            # '-norestart' is community-documented and confirmed working, but our
+            # exact binary's ReadMe does not list it - and this binary rejects
+            # unknown flags with 1639. So we try WITH -norestart first and, only
+            # if that specific 1639 comes back, retry without it (the driver is
+            # already injected at the same version, so a reboot is unlikely even
+            # then). Installs the "Intel Rapid Storage Technology" management app
+            # + service, which is what lets the operator SEE the system RAID.
+            # Exit codes: 0 = OK, 3010 = OK but needs reboot, 1639 = bad flag.
+            $rstArgSets = @(
+                @('-silent','-accepteula','-norestart'),
+                @('-silent','-accepteula')
+            )
+            foreach ($argSet in $rstArgSets) {
+                W ("  Silent install: {0} {1}" -f $rst.FullName, ($argSet -join ' '))
+                $rc = $null
+                try {
+                    $proc = Start-Process -FilePath $rst.FullName -ArgumentList $argSet `
+                        -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                    $rc = $proc.ExitCode
+                } catch {
+                    W "  setuprst.exe launch FAILED: $($_.Exception.Message)"
+                    break
+                }
                 if ($rc -eq 0 -or $rc -eq 3010) {
                     W "  setuprst.exe OK (exit=$rc)"
-                } else {
-                    W "  setuprst.exe returned exit=$rc (non-zero; may indicate incompatible flags or install error)"
+                    break
                 }
-            } catch {
-                W "  setuprst.exe launch FAILED: $($_.Exception.Message)"
+                if ($rc -eq 1639) {
+                    W "  exit 1639 (a flag was rejected) - retrying with a reduced flag set..."
+                    continue
+                }
+                W "  setuprst.exe returned exit=$rc (non-zero; install error)"
+                break
             }
         }
     } else {
