@@ -943,6 +943,109 @@ function Wait-NvidiaGpusReady {
     return $lastLines
 }
 
+function Select-NvidiaDriverForModel {
+    # Picks the correct NVIDIA driver .exe for the declared GPU model - fully
+    # automatic from gpu_discrete_model, the operator never chooses. Different
+    # cards need different NVIDIA branches and one payload can hold several, so
+    # picking "the largest file" is wrong. Rules (confirmed with the lineup):
+    #   Quadro / NVS (pro)                 -> the quadro/rtx-enterprise driver
+    #   legacy Kepler (GT 730/710, GT 6xx) -> R470 branch (47x.xx) - last Kepler
+    #   anything else (modern GeForce)     -> newest desktop (non-quadro) driver
+    param([string]$DriversDir, [string]$GpuModel)
+
+    $exes = @(Get-ChildItem -LiteralPath $DriversDir -Filter '*.exe' -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '(?i)quadro|geforce|nvidia|desktop|-dch-|rtx|^\d+\.\d{2,}-' })
+    if ($exes.Count -eq 0) { return $null }
+    if ($exes.Count -eq 1) { return $exes[0] }
+
+    $m = "$GpuModel"
+
+    # Professional cards (Quadro / NVS) -> quadro/rtx-enterprise driver.
+    if ($m -match '(?i)\bquadro\b|\bnvs\b') {
+        $pick = $exes | Where-Object { $_.Name -match '(?i)quadro|rtx' } |
+                Sort-Object Length -Descending | Select-Object -First 1
+        if ($pick) { return $pick }
+    }
+    # Legacy low-end Kepler (GT 710/730, GT 6xx/7xx) -> R470 (47x.xx), the last
+    # branch that still supports Kepler. Newer drivers refuse these cards.
+    elseif ($m -match '(?i)\bGT\s*7\d0\b|\bGT\s*6\d0\b|\bGT\s*710\b') {
+        $pick = $exes | Where-Object { $_.Name -match '^47\d\.' } |
+                Sort-Object Length -Descending | Select-Object -First 1
+        if ($pick) { return $pick }
+    }
+    # Modern GeForce -> newest desktop (non-quadro) driver (biggest = newest set).
+    $pick = $exes | Where-Object { $_.Name -match '(?i)desktop' -and $_.Name -notmatch '(?i)quadro' } |
+            Sort-Object Length -Descending | Select-Object -First 1
+    if ($pick) { return $pick }
+
+    # Fallback: largest NVIDIA installer.
+    return ($exes | Sort-Object Length -Descending | Select-Object -First 1)
+}
+
+function Install-NvidiaDriverIfNeeded {
+    # Устанавливает драйвер NVIDIA ДО стресс-теста. Без него дискретные карты
+    # висят на "Базовом видеоадаптере (Майкрософт)", nvidia-smi молчит, а FurMark
+    # не может нагрузить GPU (нужен реальный OpenGL/Vulkan-драйвер). deploy_extras
+    # кладёт драйвер на флешку, но это ПОСЛЕ теста - поэтому ставим здесь.
+    # Пакет NVIDIA - самораспаковывающийся; '-s -noreboot' ставит молча без
+    # перезагрузки посреди конвейера (на машине без прежнего драйвера карта
+    # переключается с Basic на NVIDIA без ребута).
+    param([string]$UsbRoot)
+
+    if ((Get-NvidiaGpuLines).Count -gt 0) {
+        Write-ColorOutput '  NVIDIA driver already active - install skipped.' 'Gray'
+        return
+    }
+
+    # Read the declared GPU model from the SL config so the RIGHT driver branch
+    # is chosen automatically (no operator choice).
+    $gpuModel = ''
+    try {
+        $slName = (Get-ItemProperty -Path 'HKLM:\Software\IPDROM' -Name 'SL' -ErrorAction SilentlyContinue).SL
+        if ($slName) {
+            $cfg = Join-Path $UsbRoot "config\$slName.txt"
+            if (-not (Test-Path -LiteralPath $cfg)) { $cfg = "C:\IPDROM\config\$slName.txt" }
+            if (Test-Path -LiteralPath $cfg) {
+                $ln = Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue |
+                      Where-Object { $_ -match '^gpu_discrete_model\s*=' } | Select-Object -First 1
+                if ($ln) { $gpuModel = ($ln -replace '^gpu_discrete_model\s*=','').Trim() }
+            }
+        }
+    } catch {}
+    Write-ColorOutput "  GPU model from SL: '$gpuModel'" 'Gray'
+
+    $drvDirs = @(
+        (Join-Path $UsbRoot 'software\docs\drivers'),
+        'C:\IPDROM\software\docs\drivers'
+    )
+    $nvExe = $null
+    foreach ($d in $drvDirs) {
+        if (-not (Test-Path -LiteralPath $d)) { continue }
+        $nvExe = Select-NvidiaDriverForModel -DriversDir $d -GpuModel $gpuModel
+        if ($nvExe) { break }
+    }
+    if ($nvExe) { Write-ColorOutput "  Selected NVIDIA driver for '$gpuModel': $($nvExe.Name)" 'Gray' }
+    if (-not $nvExe) {
+        Write-ColorOutput '  NVIDIA installer not found in payload - GPU stress may run without driver.' 'Yellow'
+        Write-RaidLog 'NVIDIA installer .exe not found under software\docs\drivers.'
+        return
+    }
+
+    Write-ColorOutput "  Installing NVIDIA driver before stress test: $($nvExe.Name)" 'Yellow'
+    Write-ColorOutput '  (silent install, several minutes - required so FurMark can load the GPUs)...' 'Gray'
+    Write-RaidLog "Installing NVIDIA driver: $($nvExe.FullName) -s -noreboot -clean"
+    try {
+        $p = Start-Process -FilePath $nvExe.FullName -ArgumentList '-s','-noreboot','-clean' -Wait -PassThru -ErrorAction Stop
+        Write-ColorOutput "  NVIDIA installer finished (exit=$($p.ExitCode))." 'Gray'
+        Write-RaidLog "NVIDIA installer exit=$($p.ExitCode)"
+    } catch {
+        Write-ColorOutput "  NVIDIA driver install failed (non-fatal): $_" 'Yellow'
+        Write-RaidLog "NVIDIA driver install threw: $_"
+    }
+
+    Start-Sleep -Seconds 10   # дать драйверу подхватиться перед nvidia-smi ниже
+}
+
 Write-ColorOutput '[2/7] Detecting configuration...' 'Yellow'
 
 $allControllers = Get-CimInstance Win32_VideoController
@@ -965,6 +1068,9 @@ Write-ColorOutput "  PnP display vendors: NVIDIA=$($nvidiaPnp.Count), AMD=$($amd
 # 5 minutes on every iGPU-only machine.
 $gpuLines = @()
 if ($nvidiaPnp.Count -gt 0) {
+    # Вариант А: ставим драйвер NVIDIA ДО теста, чтобы FurMark реально нагрузил
+    # карты. Если драйвер уже активен - функция сама себя пропустит.
+    Install-NvidiaDriverIfNeeded -UsbRoot $usbRoot
     $gpuLines = @(Wait-NvidiaGpusReady -ExpectedCount $nvidiaPnp.Count -TimeoutSeconds 300)
 } else {
     Write-ColorOutput '  No NVIDIA on PCI bus - skipping nvidia-smi wait.' 'Gray'
@@ -994,9 +1100,24 @@ Write-ColorOutput "  Discrete GPUs: $discreteGpuCount" 'Gray'
 
 $systemDrive = $env:SystemDrive[0]
 
-$driveLetters = @(
-    Get-FioTargetDriveLetters -UsbRoot $usbRoot -SystemDriveLetter $systemDrive
-)
+# Детект хранилища НЕ должен ронять всю сборку. На машинах без контроллера
+# MegaRAID и без data-дисков (например, рабочая станция с одним NVMe) хелперы
+# подготовки хранилища могут словить некритичную ошибку, которая при
+# script-wide $ErrorActionPreference='Stop' становится фатальной и убивает весь
+# стресс-тест - а вместе с ним не выполняются deploy_extras (драйверы на флешку)
+# и FFU. Оборачиваем: сбой детекта = "нет дисков под FIO", GPU/CPU-стресс всё
+# равно идёт, и конвейер доходит до раскладки драйверов и FFU-захвата.
+$driveLetters = @()
+try {
+    $driveLetters = @(
+        Get-FioTargetDriveLetters -UsbRoot $usbRoot -SystemDriveLetter $systemDrive
+    )
+} catch {
+    Write-ColorOutput "  Storage detection for FIO failed (non-fatal): $_" 'Yellow'
+    Write-ColorOutput "  Continuing without FIO - GPU/CPU stress still run, pipeline not aborted." 'Yellow'
+    Write-RaidLog "Get-FioTargetDriveLetters threw: $_ - continuing with empty FIO drive list."
+    $driveLetters = @()
+}
 
 if ($driveLetters.Count -gt 0) {
     Write-ColorOutput "  FIO target drives: $($driveLetters -join ', ')" 'Green'
@@ -1331,6 +1452,19 @@ try {
     } catch {
         Write-ColorOutput "  WARN: could not relabel system volume to 'SYSTEM': $_" 'Yellow'
     }
+}
+
+# Встроенный Administrator: на Server autounattend его ВКЛЮЧАЕТ (задаёт пароль,
+# иначе OOBE останавливается на экране ввода пароля). В поставке он не нужен -
+# конвейер и готовая машина работают под IPDROM, поэтому отключаем встроенного
+# Administrator ДО FFU-захвата, чтобы в образе он не был активен. На IoT/Pro он
+# и так отключён по умолчанию - там команда просто ничего не меняет (no-op).
+# Отключаем именно ЗДЕСЬ (мы залогинены под IPDROM), текущую сессию это не рвёт.
+try {
+    & net.exe user Administrator /active:no 2>&1 | Out-Null
+    Write-ColorOutput "  Built-in Administrator account disabled (delivery hardening)." 'Gray'
+} catch {
+    Write-ColorOutput "  WARN: could not disable Administrator: $_" 'Yellow'
 }
 
 # ===================== PIPELINE HEALTH GATE =====================

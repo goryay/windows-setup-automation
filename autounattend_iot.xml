@@ -571,6 +571,23 @@ $scripts = @(
 			Write-Host "No SL preselection (value '$sl' did not match ^SL pattern)."
 		}
 	};
+
+	{
+		# === PXE: persist operator-chosen stress-test duration (minutes) ===
+		# install.bat patches __TEST_MINUTES__ with (hours*60) when the operator
+		# enters a value in WinPE. Left as the placeholder => nothing is written and
+		# setup_apps_and_theme uses its default duration (720). Mirrors the SL block.
+		$tm = "__TEST_MINUTES__"
+		if ($tm -match '^\d+$') {
+			if (-not (Test-Path 'HKLM:\Software\IPDROM')) {
+				New-Item -Path 'HKLM:\Software\IPDROM' -Force | Out-Null
+			}
+			Set-ItemProperty -Path 'HKLM:\Software\IPDROM' -Name 'TestMinutes' -Value $tm -Type String
+			Write-Host "Saved IPDROM TestMinutes: $tm"
+		} else {
+			Write-Host "No test-duration override (value '$tm' not numeric) - default used."
+		}
+	};
 	{
 		# === Trust the PXE/SMB server: prevents SmartScreen and PS signing prompts ===
 		$rangePath = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Internet Settings\ZoneMap\Ranges\IPDROM_PXE'

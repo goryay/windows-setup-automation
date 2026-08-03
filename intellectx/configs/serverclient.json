@@ -7,9 +7,5 @@
   "installType": "ServerClient",
   "removeGuardant": false,
   "cmdProps": "",
-  "addons": [
-    "acfa",
-    "face_recognition",
-    "report"
-  ]
+  "addons": []
 }

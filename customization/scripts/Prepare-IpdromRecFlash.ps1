@@ -492,16 +492,33 @@ try {
 # Windows, и следующий `convert gpt` в том же diskpart-сессии падает с
 # "Указано несуществующее устройство" (0x80070491). Разбиваем на две сессии
 # с `rescan` и паузой между ними — стандартный workaround.
+# 'attributes disk clear readonly' FIRST: a flash reused from a previous build
+# still carries the readonly attribute that protect_ipdromrec set at the end of
+# its cycle, and diskpart clean then fails with "media is write-protected"
+# (0x80070013). Clearing it is a harmless no-op on a normal flash.
 $dpClean = @"
 select disk $($disk.Number)
+attributes disk clear readonly
 clean
 rescan
 exit
 "@
 
-$rc = Invoke-Diskpart -Script $dpClean
+# "Device not ready" (0x80070015 / -2147024875) is a common transient on a USB
+# flash that sat idle for hours (e.g. through a 12h stress test) - the device
+# needs a moment to re-enumerate. Retry the clean a few times with a short wait
+# and a Get-Disk nudge before giving up, so one hiccup doesn't kill the whole
+# FFU capture (which is exactly what happened on the first production run).
+$rc = 1
+for ($attempt = 1; $attempt -le 4; $attempt++) {
+    Get-Disk -Number $disk.Number -ErrorAction SilentlyContinue | Out-Null
+    $rc = Invoke-Diskpart -Script $dpClean
+    if ($rc -eq 0) { break }
+    Write-Log "diskpart clean attempt $attempt/4 failed (exit $rc) - flash may be 'not ready' after idle; waiting 8s and retrying..." 'Yellow'
+    Start-Sleep -Seconds 8
+}
 if ($rc -ne 0) {
-    Write-Log "diskpart clean failed with exit code $rc. Aborting." 'Red'
+    Write-Log "diskpart clean failed after 4 attempts (exit $rc). Aborting." 'Red'
     exit 6
 }
 

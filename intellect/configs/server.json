@@ -21,10 +21,7 @@
     "installDir": "C:\\Program Files\\Intellect",
     "cmdProps": "CREATE_QUICKLAUNCH_SHORTCUT=\\\"1\\\" INSTALL_AS_SERVICE=\\\"1\\\""
   },
-  "addons": [
-    "acfa",
-    "web_report"
-  ],
+  "addons": [],
   "acfa": {
     "modules": ["base", "axacfa_ru", "aritech_ru"]
   }

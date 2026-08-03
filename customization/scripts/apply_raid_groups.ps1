@@ -331,6 +331,43 @@ function Get-ExistingVirtualDrives {
     return $vds
 }
 
+# ===================== JBOD -> UNCONFIGURED GOOD =====================
+# Часть контроллеров/операторов оставляет data-диски в состоянии JBOD: диск
+# виден в ОС напрямую, но storcli НЕ считает его свободным (UGood) и в новый VD
+# не берёт. Именно из-за этого RAID-6 на SL836125-001 не собрался - все 14
+# дисков были JBOD, freeDrives=0. Здесь переводим JBOD-диски в Unconfigured Good.
+# ВНИМАНИЕ: это стирает данные на этих дисках. В нашем пайплайне ОС всегда на
+# отдельном системном массиве (Intel VMD / системный VD), не на JBOD-диске
+# этого контроллера, поэтому конвертация data-JBOD безопасна.
+function Convert-JbodDrivesToGood {
+    param([string]$Cli, $Drives)
+    $jbod = @($Drives | Where-Object { $_.State -match '^(?i)JBOD' })
+    if ($jbod.Count -eq 0) { return $false }
+
+    Write-Log ("JBOD drives detected: {0}. Converting to Unconfigured Good so a VD can be built." -f $jbod.Count) 'Yellow'
+    Write-Log "  NOTE: this erases those JBOD disks (OS is on a separate system array - safe on a build stand)." 'DarkGray'
+
+    # 1) Снимаем JBOD-флаг с каждого диска -> Unconfigured Good.
+    foreach ($d in $jbod) {
+        $parts = $d.Slot -split ':'
+        if ($parts.Count -ne 2) { continue }
+        $eid = $parts[0]; $slt = $parts[1]
+        Write-Log ("  set good: /c0/e{0}/s{1}  (was JBOD, ~{2}GB {3})" -f $eid, $slt, $d.SizeGB, $d.Media) 'Gray'
+        $o = & $Cli "/c0/e$eid/s$slt" set good force 2>&1
+        foreach ($l in $o) { Write-Log "    | $l" 'DarkGray' }
+    }
+
+    # 2) Отключаем JBOD-персоналию контроллера (best-effort): теперь, когда
+    #    отдельных JBOD-дисков не осталось, прошивка обычно принимает команду,
+    #    и вновь появляющиеся диски снова JBOD не становятся.
+    Write-Log "  Disabling controller JBOD personality (set jbod=off)..." 'Gray'
+    $j = & $Cli /c0 set jbod=off 2>&1
+    foreach ($l in $j) { Write-Log "  | $l" 'DarkGray' }
+
+    Start-Sleep -Seconds 3
+    return $true
+}
+
 # Clear stale Foreign configuration if any. Drives that belonged to a previous
 # RAID group on this controller sit in 'UGood F' (Foreign) state and StorCLI
 # refuses to include them in a new VD with "resources already in use". On a
@@ -360,6 +397,23 @@ $allDrives = Get-PhysicalDrives -Cli $storcli
 Write-Log "Enumerated $($allDrives.Count) physical drive(s):" 'Gray'
 foreach ($d in $allDrives) {
     Write-Log ("  {0}  State={1}  {2}  ~{3}GB" -f $d.Slot, $d.State, $d.Media, $d.SizeGB) 'DarkGray'
+}
+
+# Если свободных (UGood) дисков не хватает под план, но на контроллере есть
+# JBOD-диски - переводим их в Good и перечитываем список. Только при -Execute,
+# и только когда UGood реально не хватает (не трогаем JBOD зря).
+$ugoodNow = @($allDrives | Where-Object { $_.State -match '^(?i)UGood' }).Count
+$needed   = [int](($plan | Measure-Object -Property Quantity -Sum).Sum)
+if ($Execute -and $needed -gt $ugoodNow) {
+    Write-Log ("Free UGood drives ({0}) < drives needed by plan ({1}) - checking for JBOD drives to convert..." -f $ugoodNow, $needed) 'Yellow'
+    $converted = Convert-JbodDrivesToGood -Cli $storcli -Drives $allDrives
+    if ($converted) {
+        Write-Log "Re-enumerating physical drives after JBOD->Good conversion..." 'Gray'
+        $allDrives = Get-PhysicalDrives -Cli $storcli
+        foreach ($d in $allDrives) {
+            Write-Log ("  {0}  State={1}  {2}  ~{3}GB" -f $d.Slot, $d.State, $d.Media, $d.SizeGB) 'DarkGray'
+        }
+    }
 }
 
 # ТОЛЬКО свободные диски (Unconfigured Good) можно брать в новый массив.
@@ -458,6 +512,9 @@ foreach ($p in $plan) {
     foreach ($l in $out) { Write-Log "    | $l" 'DarkGray' }
     if ($LASTEXITCODE -eq 0) {
         Write-Log "  Array created OK (group $($p.Group), $($p.Level))." 'Green'
+        # Дать контроллеру/ОС время увидеть новый VD (RAID-6 инициализируется
+        # в фоне, но диск должен появиться до rescan в вызывающем скрипте).
+        Start-Sleep -Seconds 8
     } else {
         Write-Log "  storcli add vd FAILED (exit $LASTEXITCODE). Group $($p.Group) skipped." 'Red'
     }

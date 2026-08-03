@@ -65,8 +65,9 @@ echo.
 echo *** ВНИМАНИЕ: диск %RECDISK% будет ОЧИЩЕН и помечен IpdromREC.
 echo *** ВСЕ данные на этом диске будут ПОТЕРЯНЫ.
 set "CONFIRM="
-set /p CONFIRM=Введите YES для подтверждения:
-if /i not "%CONFIRM%"=="YES" (
+set /p CONFIRM=Для подтверждения введите Y или YES:
+call :IS_CONFIRMED
+if not defined CONFIRM_OK (
   echo [rec ] отменено оператором.
   set "RECDISK=SKIP"
   goto DOCS_FMT
@@ -103,8 +104,9 @@ echo.
 echo *** ВНИМАНИЕ: диск %DOCSDISK% будет ОЧИЩЕН и помечен IPDROM.
 echo *** ВСЕ данные на этом диске будут ПОТЕРЯНЫ.
 set "CONFIRM="
-set /p CONFIRM=Введите YES для подтверждения:
-if /i not "%CONFIRM%"=="YES" (
+set /p CONFIRM=Для подтверждения введите Y или YES:
+call :IS_CONFIRMED
+if not defined CONFIRM_OK (
   echo [docs] отменено оператором.
   goto FLASH_DONE
 )
@@ -168,8 +170,9 @@ echo.
 echo *** ВНИМАНИЕ: диск %SYSDISK% будет ОЧИЩЕН на разделы EFI/MSR/Windows.
 echo *** ВСЕ данные на этом диске будут ПОТЕРЯНЫ.
 set "CONFIRM="
-set /p CONFIRM=Введите YES для подтверждения:
-if /i not "%CONFIRM%"=="YES" (
+set /p CONFIRM=Для подтверждения введите Y или YES:
+call :IS_CONFIRMED
+if not defined CONFIRM_OK (
   echo [sys ] отменено оператором.
   set "SYSDISK=SKIP"
   goto SYS_DONE
@@ -222,8 +225,9 @@ if /i "%CLEANDISKS%"=="SKIP" (
 echo.
 echo *** ВНИМАНИЕ: диски [ %CLEANDISKS% ] потеряют ВСЕ данные.
 set "CONFIRM="
-set /p CONFIRM=Введите YES для подтверждения:
-if /i not "%CONFIRM%"=="YES" (
+set /p CONFIRM=Для подтверждения введите Y или YES:
+call :IS_CONFIRMED
+if not defined CONFIRM_OK (
   echo [clean] отменено оператором.
   goto CLEAN_DONE
 )
@@ -252,6 +256,34 @@ for %%d in (%CLEANDISKS%) do (
 )
 
 :CLEAN_DONE
+echo.
+
+echo ===============================================================
+echo   ДЛИТЕЛЬНОСТЬ СТРЕСС-ТЕСТА
+echo ===============================================================
+echo Сколько ЧАСОВ гонять стресс-тест после установки?
+echo Enter = 12 часов (по умолчанию).
+set "TESTHOURS="
+set /p TESTHOURS=Часов:
+set "TESTMIN="
+if not defined TESTHOURS (
+  echo [test] Оставлено по умолчанию - 12 часов.
+  goto TESTDUR_DONE
+)
+set "TESTHOURS_BAD="
+for /f "delims=0123456789" %%A in ("%TESTHOURS%") do set "TESTHOURS_BAD=%%A"
+if defined TESTHOURS_BAD (
+  echo [test] "%TESTHOURS%" - не число, беру 12 часов по умолчанию.
+  goto TESTDUR_DONE
+)
+set /a TESTMIN=%TESTHOURS%*60
+if %TESTMIN% LEQ 0 (
+  echo [test] Значение недопустимо, беру 12 часов по умолчанию.
+  set "TESTMIN="
+  goto TESTDUR_DONE
+)
+echo [test] Тест будет идти %TESTHOURS% ч (%TESTMIN% мин).
+:TESTDUR_DONE
 echo.
 
 echo === Монтирование SMB-шары (10 попыток со сбросом состояния) ===
@@ -301,10 +333,10 @@ if exist "%STAGE%\autounattend.xml" (
 :: fires and Setup falls back to the FULL interactive wizard - which also throws
 :: away SetupUILanguage and every other unattend setting. So this patch matters.
 :: PowerShell is absent from PXE WinPE, hence the cscript fallback.
-if /i "%SYSDISK%"=="SKIP" goto SETUP_START
+if /i "%SYSDISK%"=="SKIP" goto SYSDISK_SKIP
 
 echo === Правка autounattend: DiskID -^> %SYSDISK% ===
-powershell.exe -NoProfile -Command "$f='%UAFILE%'; $c=[System.IO.File]::ReadAllText($f); $c=[regex]::Replace($c,'<DiskID>\d+</DiskID>','<DiskID>%SYSDISK%</DiskID>'); [System.IO.File]::WriteAllText($f,$c,[System.Text.UTF8Encoding]::new($false))" >nul 2>&1
+powershell.exe -NoProfile -Command "$f='%UAFILE%'; $c=[System.IO.File]::ReadAllText($f); $c=[regex]::Replace($c,'<DiskID>\d+</DiskID>','<DiskID>%SYSDISK%</DiskID>'); if('%TESTMIN%' -ne ''){$c=$c.Replace('__TEST_MINUTES__','%TESTMIN%')}; [System.IO.File]::WriteAllText($f,$c,[System.Text.UTF8Encoding]::new($false))" >nul 2>&1
 if not errorlevel 1 goto PATCH_OK
 
 echo     PowerShell недоступен, пробую VBScript...
@@ -312,7 +344,7 @@ if not exist "Y:\common\patch_diskid.vbs" (
   echo *** Не найден Y:\common\patch_diskid.vbs
   goto PATCH_FAIL
 )
-cscript.exe //nologo "Y:\common\patch_diskid.vbs" "%UAFILE%" %SYSDISK%
+cscript.exe //nologo "Y:\common\patch_diskid.vbs" "%UAFILE%" %SYSDISK% %TESTMIN%
 if not errorlevel 1 goto PATCH_OK
 
 :PATCH_FAIL
@@ -329,6 +361,16 @@ goto SETUP_START
 echo === Запуск установки Windows с %UAFILE% ===
 start /wait setup.exe /unattend:%UAFILE%
 goto :eof
+
+:SYSDISK_SKIP
+:: SYSDISK=SKIP: DiskID не трогаем (autounattend сам выберет цель), но
+:: длительность теста, если оператор её задал, всё равно применяем.
+if not defined TESTMIN goto SETUP_START
+echo === Правка autounattend: длительность теста -^> %TESTMIN% мин ===
+powershell.exe -NoProfile -Command "$f='%UAFILE%'; $c=[System.IO.File]::ReadAllText($f); $c=$c.Replace('__TEST_MINUTES__','%TESTMIN%'); [System.IO.File]::WriteAllText($f,$c,[System.Text.UTF8Encoding]::new($false))" >nul 2>&1
+if not errorlevel 1 goto SETUP_START
+if exist "Y:\common\patch_diskid.vbs" cscript.exe //nologo "Y:\common\patch_diskid.vbs" "%UAFILE%" SKIP %TESTMIN%
+goto SETUP_START
 
 :: ============================================================
 :: Подпрограммы: заново запрашивают и показывают диски, чтобы
@@ -351,4 +393,13 @@ echo.
 wmic diskdrive where "InterfaceType!='USB'" get Index,Model,Size /format:table
 echo Размеры в байтах; делите на 1000000000 чтобы получить ГБ.
 echo.
+exit /b
+
+:IS_CONFIRMED
+:: Подтверждение опасных операций (затирание дисков). Принимаем Y или YES,
+:: регистр не важен. Кириллицу (да/д) намеренно НЕ принимаем: в WinPE консоли
+:: (chcp 65001) многобайтный ввод через set /p ненадёжен, а YES и так латиница.
+set "CONFIRM_OK="
+if /i "%CONFIRM%"=="Y"   set "CONFIRM_OK=1"
+if /i "%CONFIRM%"=="YES" set "CONFIRM_OK=1"
 exit /b

@@ -236,8 +236,12 @@ foreach ($pat in $fixedPatterns) {
 # =============================================================================
 # 2) MegaRAID: software + driver, if any RAID controller declared in SL
 # =============================================================================
-$hasRaid = (($sl['raid1_model']) -and ($sl['raid1_model'] -ne 'None')) `
-        -or (($sl['raid2_model']) -and ($sl['raid2_model'] -ne 'None'))
+# MegaRAID software/driver only for a REAL LSI/Avago/MegaRAID controller.
+# raid1_model can be 'None', an integrated-Intel label, or a real LSI name -
+# only the last should pull the Avago software onto the customer flash. A plain
+# "not empty / not None" check wrongly copied Avago for integrated controllers.
+$raidModelRx = '(?i)avago|megaraid|lsi|broadcom'
+$hasRaid = (($sl['raid1_model']) -match $raidModelRx) -or (($sl['raid2_model']) -match $raidModelRx)
 if ($hasRaid) {
     W "--- RAID controller declared in SL -> copying MegaRAID software + driver ---"
     foreach ($f in (Find-BySrcRegex -Dir $softsSrc   -Pattern '(?i)(avago|megaraid|lsi).*\.(zip|exe|msi)$')) {
@@ -318,13 +322,38 @@ if ($hasGuardant) {
 # =============================================================================
 # 6) NVIDIA / discrete GPU driver (from drivers/ folder)
 # =============================================================================
+# Pick the ONE driver matching the declared GPU model (same rules as the stress
+# script) so ONLY the right driver hits the flash, not every NVIDIA .exe in the
+# folder. Fully automatic from gpu_discrete_model - no operator choice.
+function Select-NvidiaDriverForModel {
+    param([string]$DriversDir, [string]$GpuModel)
+    $exes = @(Get-ChildItem -LiteralPath $DriversDir -Filter '*.exe' -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '(?i)quadro|geforce|nvidia|desktop|-dch-|rtx|^\d+\.\d{2,}-' })
+    if ($exes.Count -eq 0) { return $null }
+    if ($exes.Count -eq 1) { return $exes[0] }
+    $m = "$GpuModel"
+    if ($m -match '(?i)\bquadro\b|\bnvs\b') {
+        $pick = $exes | Where-Object { $_.Name -match '(?i)quadro|rtx' } | Sort-Object Length -Descending | Select-Object -First 1
+        if ($pick) { return $pick }
+    } elseif ($m -match '(?i)\bGT\s*7\d0\b|\bGT\s*6\d0\b|\bGT\s*710\b') {
+        $pick = $exes | Where-Object { $_.Name -match '^47\d\.' } | Sort-Object Length -Descending | Select-Object -First 1
+        if ($pick) { return $pick }
+    }
+    $pick = $exes | Where-Object { $_.Name -match '(?i)desktop' -and $_.Name -notmatch '(?i)quadro' } | Sort-Object Length -Descending | Select-Object -First 1
+    if ($pick) { return $pick }
+    return ($exes | Sort-Object Length -Descending | Select-Object -First 1)
+}
+
 $gpuDisc = ($sl['gpu_discrete'] -eq 'TRUE') `
         -and ($sl['gpu_discrete_model']) `
         -and ($sl['gpu_discrete_model'] -ne 'None')
 if ($gpuDisc) {
-    W "--- Discrete GPU declared -> copying NVIDIA/Quadro driver ---"
-    foreach ($f in (Find-BySrcRegex -Dir $driversSrc -Pattern '(?i)(nvidia|quadro|geforce|whql).*\.exe$|^\d+\.\d{2,}-.*\.exe$')) {
-        Copy-ToFlash -Src $f.FullName -DstDir $driversDst -Reason "GPU driver"
+    $nvDrv = Select-NvidiaDriverForModel -DriversDir $driversSrc -GpuModel $sl['gpu_discrete_model']
+    if ($nvDrv) {
+        W "--- Discrete GPU '$($sl['gpu_discrete_model'])' -> copying matched driver: $($nvDrv.Name) ---"
+        Copy-ToFlash -Src $nvDrv.FullName -DstDir $driversDst -Reason "GPU driver (matched to model)"
+    } else {
+        W "Discrete GPU declared but no matching NVIDIA driver found in $driversSrc."
     }
 } else {
     W "No discrete GPU in SL -- NVIDIA driver skipped."
@@ -378,12 +407,68 @@ function Find-MbDriverAsset {
     return $best
 }
 
+# Fallback source for MB drivers: the per-board install sets under
+# drivers\platforms. Used when software\docs\drivers has no curated vendor pack
+# for this board. A driver pack on the customer flash is REQUIRED by the delivery
+# standard, so rather than ship nothing we copy the board's driver-store folders
+# (the same INFs Windows Setup installs from) onto the flash. Service scaffolding
+# (platform.bat, offline_root PDFs, empty offline_drivers_*) is skipped.
+function Copy-MbDriverFromPlatforms {
+    param(
+        [string]$MbModel,
+        [string]$PlatformsDir,
+        [string]$DstDir,
+        [string]$FlashLetter
+    )
+    if (-not (Test-Path -LiteralPath $PlatformsDir)) {
+        W "  platforms fallback: dir not found ($PlatformsDir) -- no MB driver shipped."
+        return
+    }
+    # Same strict token matcher as the curated packs (by mb_model only, so
+    # 'Z790 UD' requires BOTH Z790 and UD -> won't grab a neighbouring board).
+    $board = Find-MbDriverAsset -MbModel $MbModel -DriversDir $PlatformsDir
+    if (-not $board) {
+        W "  platforms fallback: no board folder matched mb_model='$MbModel' in $PlatformsDir."
+        return
+    }
+    W "  platforms fallback: matched board folder '$($board.Name)'."
+
+    # INF-bearing subfolders only (driver-store export). Skip empty/service dirs.
+    $drvFolders = @(Get-ChildItem -LiteralPath $board.FullName -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Get-ChildItem -LiteralPath $_.FullName -Recurse -Filter *.inf -ErrorAction SilentlyContinue | Select-Object -First 1 })
+    if ($drvFolders.Count -eq 0) {
+        W "  platforms fallback: no INF-bearing content under '$($board.Name)' -- nothing to ship."
+        return
+    }
+
+    # Space guard: total payload vs free space on the flash (keep 1 GB margin).
+    $needBytes = 0L
+    foreach ($f in $drvFolders) {
+        $needBytes += (Get-ChildItem -LiteralPath $f.FullName -Recurse -File -ErrorAction SilentlyContinue |
+            Measure-Object -Property Length -Sum).Sum
+    }
+    $freeBytes = (Get-PSDrive -Name $FlashLetter -ErrorAction SilentlyContinue).Free
+    if ($freeBytes -and (($needBytes + 1GB) -gt $freeBytes)) {
+        W ("  platforms fallback: not enough space (need {0:N1} GB + 1 GB margin, free {1:N1} GB) -- MB driver NOT shipped." -f ($needBytes/1GB), ($freeBytes/1GB))
+        return
+    }
+
+    $destBoard = Join-Path $DstDir $board.Name
+    W ("  platforms fallback: shipping {0:N1} GB of drivers -> $destBoard" -f ($needBytes/1GB))
+    foreach ($f in $drvFolders) {
+        Copy-ToFlash -Src $f.FullName -DstDir $destBoard -Reason "MB drivers from platforms ($($board.Name))"
+    }
+}
+
 W "--- Motherboard driver auto-match ---"
 $mbAsset = Find-MbDriverAsset -MbModel $sl['mb_model'] -DriversDir $driversSrc
 if ($mbAsset) {
     Copy-ToFlash -Src $mbAsset.FullName -DstDir $driversDst -Reason "MB drivers ($($sl['mb_model']))"
 } else {
-    W "  No mb driver matched for mb_model='$($sl['mb_model'])'."
+    W "  No curated mb pack matched for mb_model='$($sl['mb_model'])' in $driversSrc."
+    # A driver pack on the flash is required by the delivery standard. With no
+    # curated vendor pack, fall back to the board's install set in drivers\platforms.
+    Copy-MbDriverFromPlatforms -MbModel $sl['mb_model'] -PlatformsDir (Join-Path $UsbRoot 'drivers\platforms') -DstDir $driversDst -FlashLetter $flashLetter
 }
 
 # =============================================================================

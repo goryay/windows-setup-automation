@@ -523,8 +523,8 @@ function Resolve-InstallPlan {
 
     $plan = @()
 
-    if ([string]::IsNullOrWhiteSpace($Software)) {
-        return $plan   # axxonsoft не задан - ничего не ставим
+    if ([string]::IsNullOrWhiteSpace($Software) -or $Software -eq 'none') {
+        return $plan   # axxonsoft не задан или None - ПО не заказано, чисто пропускаем
     }
 
     if ($Software -eq 'a') {

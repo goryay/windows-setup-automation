@@ -905,8 +905,16 @@ if (Test-Path $script:Aida64FullPath) {
     try {
         Get-Process -Name 'AIDA64Port','aida64' -ErrorAction SilentlyContinue |
             Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
+        # Wait until AIDA is really gone before clearing its state - a still-dying
+        # instance would re-write the crash marker right after we delete it.
+        Start-Sleep -Seconds 8
         $aidaHome    = Split-Path -Parent $script:Aida64FullPath
+        # The "did not close properly" modal (confirmed via diagnostic screenshot
+        # on the first production run) is AIDA's crash recovery. The old narrow
+        # *.tmp/*.pid/*.lock masks did NOT catch its marker, so clear AIDA state
+        # broadly: whole FinalWire caches (not just those masks) and the HKCU
+        # registry branch. AIDA regenerates what it needs; the report uses CLI
+        # switches and the business-portable license lives in the exe, not here.
         $stalePaths  = @(
             (Join-Path $aidaHome '*.tmp'),
             (Join-Path $aidaHome '*.pid'),
@@ -916,18 +924,15 @@ if (Test-Path $script:Aida64FullPath) {
             (Join-Path $aidaHome 'Data\*.pid'),
             (Join-Path $aidaHome 'Data\*.lock'),
             (Join-Path $aidaHome 'Data\_running*'),
-            "$env:LOCALAPPDATA\FinalWire\AIDA64\*.tmp",
-            "$env:LOCALAPPDATA\FinalWire\AIDA64\*.pid",
-            "$env:LOCALAPPDATA\FinalWire\AIDA64\*.lock",
-            "$env:APPDATA\FinalWire\AIDA64\*.tmp",
-            "$env:APPDATA\FinalWire\AIDA64\*.pid",
-            "$env:APPDATA\FinalWire\AIDA64\*.lock",
+            "$env:LOCALAPPDATA\FinalWire\AIDA64",
+            "$env:APPDATA\FinalWire\AIDA64",
             "$env:TEMP\aida64*"
         )
         foreach ($p in $stalePaths) {
             Remove-Item -Path $p -Force -Recurse -ErrorAction SilentlyContinue
         }
-        Write-Log "AIDA64 state cleared for clean report launch." 'Gray'
+        Remove-Item -Path 'HKCU:\Software\FinalWire\AIDA64' -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "AIDA64 state cleared for clean report launch (folders + registry)." 'Gray'
     } catch {
         Write-Log "AIDA64 pre-launch cleanup partially failed: $_" 'Yellow'
     }
@@ -1026,6 +1031,23 @@ if (Test-Path $script:Aida64FullPath) {
             foreach ($ap in @(Get-Process -Name 'AIDA64*' -ErrorAction SilentlyContinue)) {
                 Write-Log ("  [{0}]   process {1} PID={2} responding={3} window='{4}'" -f $Label, $ap.ProcessName, $ap.Id, $ap.Responding, $ap.MainWindowTitle) 'DarkGray'
             }
+            # Confirmed cause (production run): the modal "AIDA64 Portable did not
+            # close properly last time... will now clean up. Start again manually".
+            # It blocks the report and waits for OK. Send Enter to click OK: AIDA
+            # then self-cleans and EXITS, which clears the crash marker - so the
+            # NEXT attempt (safe/safest) launches clean and can produce the report.
+            try {
+                Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+                $ws = New-Object -ComObject WScript.Shell
+                for ($k = 0; $k -lt 3; $k++) {
+                    [void]$ws.AppActivate('AIDA64 Portable')
+                    Start-Sleep -Milliseconds 400
+                    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+                    Start-Sleep -Milliseconds 700
+                }
+                Write-Log ("  [{0}] sent Enter to dismiss the 'did not close properly' modal - waiting for AIDA to self-clean and exit." -f $Label) 'Yellow'
+                $proc | Wait-Process -Timeout 25 -ErrorAction SilentlyContinue
+            } catch {}
         }
 
         if (-not $proc.HasExited) {
