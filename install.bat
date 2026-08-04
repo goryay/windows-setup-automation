@@ -34,6 +34,40 @@ set "SL=UNKNOWN"
 if exist "%STAGE%\slid.txt" set /p SL=<"%STAGE%\slid.txt"
 echo === Конфигурация SL: %SL% ===
 
+echo === Монтирование SMB-шары (10 попыток со сбросом состояния) ===
+set RETRIES=0
+:MOUNT_RETRY
+:: Drop any cached state from previous attempt - WinPE sometimes caches a failure
+net use * /delete /y >nul 2>&1
+:: First touch IPC$ to establish a session, then map the share
+net use \\10.0.6.42\IPC$ /user:pxe pxe >nul 2>&1
+net use Y: \\10.0.6.42\winpxe /user:pxe pxe /persistent:no
+if not errorlevel 1 goto MOUNT_OK
+set /a RETRIES+=1
+if %RETRIES% lss 10 (
+  echo Попытка %RETRIES%/10 не удалась, повтор через 10 сек...
+  ping -n 11 127.0.0.1 >nul
+  goto MOUNT_RETRY
+)
+echo *** SMB не смонтирован после 10 попыток ***
+echo --- ipconfig /all ---
+ipconfig /all
+echo --- Пробую прямой доступ к каталогу (другой код ошибки) ---
+dir \\10.0.6.42\winpxe\ 2>&1
+cmd
+goto :eof
+
+:MOUNT_OK
+echo === SMB-шара смонтирована с попытки %RETRIES% ===
+Y:
+cd \%WINVER%
+if not exist setup.exe (
+  echo *** Нет setup.exe в папке версии %WINVER% - переход в консоль ***
+  dir Y:\
+  cmd
+  goto :eof
+)
+
 echo.
 echo ===============================================================
 echo   НАСТРОЙКА USB-ФЛЕШЕК
@@ -157,8 +191,39 @@ echo.
 echo Для IoT ОБЯЗАТЕЛЬНО выбрать индекс (иначе установка упадёт).
 echo Для Pro введите SKIP чтобы autounattend выбрал цель сам.
 
+:: ===== Авто-детект дисков по конфигу SL (система + защита данных/архива) =====
+:: SMB уже смонтирован в начале (сразу после определения SL) - берём конфиг с Y:.
+set "SYSAUTO="
+set "PROTECTLIST="
+if not exist "Y:\common\detect_sysdisk.vbs" goto SYSAUTO_DONE
+if not exist "Y:\common\config\%SL%.txt" goto SYSAUTO_DONE
+cscript //nologo "Y:\common\detect_sysdisk.vbs" "Y:\common\config\%SL%.txt" > X:\detect.txt 2>&1
+type X:\detect.txt
+for /f "usebackq tokens=1,* delims==" %%a in ("X:\detect.txt") do (
+  if /i "%%a"=="RESULT" set "SYSAUTO=%%b"
+  if /i "%%a"=="PROTECT" set "PROTECTLIST=%%b"
+)
+if not defined SYSAUTO goto SYSAUTO_DONE
+:: RESULT валиден только если это число (иначе NONE/AMBIGUOUS/ERROR)
+set "SYSBAD="
+for /f "delims=0123456789" %%A in ("%SYSAUTO%") do set "SYSBAD=%%A"
+if defined SYSBAD set "SYSAUTO="
+:SYSAUTO_DONE
+
+echo.
+if defined SYSAUTO goto SYSAUTO_SHOW
+echo [auto] Автоопределение не дало однозначного диска - выберите индекс вручную.
+goto SYSAUTO_ASK
+:SYSAUTO_SHOW
+echo [auto] Обнаружен системный диск: %SYSAUTO%  - по конфигу SL=%SL%
+echo        Enter или Y = принять диск %SYSAUTO%; либо введите другой индекс; либо SKIP.
+:SYSAUTO_ASK
+
 set "SYSDISK="
 set /p SYSDISK=Индекс SYSDISK:
+if defined SYSAUTO if /i "%SYSDISK%"=="" set "SYSDISK=%SYSAUTO%"
+if defined SYSAUTO if /i "%SYSDISK%"=="Y" set "SYSDISK=%SYSAUTO%"
+if defined SYSAUTO if /i "%SYSDISK%"=="YES" set "SYSDISK=%SYSAUTO%"
 if /i "%SYSDISK%"=="" set "SYSDISK=SKIP"
 
 if /i "%SYSDISK%"=="SKIP" (
@@ -209,10 +274,10 @@ echo ===============================================================
 echo Стирает таблицы разделов чтобы BIOS не грузил СТАРУЮ ОС.
 call :SHOW_FIXED
 echo Уже выбрано:  REC=%RECDISK%  DOCS=%DOCSDISK%  SYS=%SYSDISK%
+echo Авто-защита от очистки (система/данные/архив по конфигу): %PROTECTLIST%
 echo.
 echo Индексы через запятую, напр. 2 или 0,2 - Enter/SKIP чтобы пропустить.
-echo Пропустите Диск 0 если это ваш RAID с данными.
-echo SYSDISK/RECDISK/DOCSDISK игнорируются автоматически.
+echo Защищённые диски и флешки (SYS/REC/DOCS) пропускаются автоматически.
 
 set "CLEANDISKS="
 set /p CLEANDISKS=Диски для очистки:
@@ -232,28 +297,7 @@ if not defined CONFIRM_OK (
   goto CLEAN_DONE
 )
 
-for %%d in (%CLEANDISKS%) do (
-  if "%%d"=="%SYSDISK%" (
-    echo [clean] диск %%d = SYSDISK - пропуск.
-  ) else if "%%d"=="%RECDISK%" (
-    echo [clean] диск %%d = RECDISK - пропуск.
-  ) else if "%%d"=="%DOCSDISK%" (
-    echo [clean] диск %%d = DOCSDISK - пропуск.
-  ) else (
-    echo === Очистка диска %%d ===
-    (
-      echo select disk %%d
-      echo clean
-      echo exit
-    ) > X:\clean_%%d.txt
-    diskpart /s X:\clean_%%d.txt
-    if errorlevel 1 (
-      echo *** очистка диска %%d НЕ УДАЛАСЬ
-    ) else (
-      echo [clean] диск %%d очищен.
-    )
-  )
-)
+for %%d in (%CLEANDISKS%) do call :CLEAN_ONE %%d
 
 :CLEAN_DONE
 echo.
@@ -286,91 +330,101 @@ echo [test] Тест будет идти %TESTHOURS% ч (%TESTMIN% мин).
 :TESTDUR_DONE
 echo.
 
-echo === Монтирование SMB-шары (10 попыток со сбросом состояния) ===
-set RETRIES=0
-:MOUNT_RETRY
-:: Drop any cached state from previous attempt - WinPE sometimes caches a failure
-net use * /delete /y >nul 2>&1
-:: First touch IPC$ to establish a session, then map the share
-net use \\10.0.6.42\IPC$ /user:pxe pxe >nul 2>&1
-net use Y: \\10.0.6.42\winpxe /user:pxe pxe /persistent:no
-if not errorlevel 1 goto MOUNT_OK
-set /a RETRIES+=1
-if %RETRIES% lss 10 (
-  echo Попытка %RETRIES%/10 не удалась, повтор через 10 сек...
-  ping -n 11 127.0.0.1 >nul
-  goto MOUNT_RETRY
-)
-echo *** SMB не смонтирован после 10 попыток ***
-echo --- ipconfig /all ---
-ipconfig /all
-echo --- Пробую прямой доступ к каталогу (другой код ошибки) ---
-dir \\10.0.6.42\winpxe\ 2>&1
-cmd
-goto :eof
+:: === Ключ продукта: только win11/Pro. IoT и Server ставятся по GVLK,
+:: их autounattend плейсхолдера __PRODUCT_KEY__ не содержит - блок пропускается.
+set "PRODKEY="
+if /i not "%WINVER%"=="win11" goto PRODKEY_DONE
+echo ===============================================================
+echo   КЛЮЧ ПРОДУКТА WINDOWS 11 PRO
+echo ===============================================================
+echo Формат: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX (25 символов).
+echo Enter = пропустить: поставится Pro без активации, ключ введёте позже.
+set /p PRODKEY=Ключ:
+if not defined PRODKEY goto PRODKEY_SKIP
+echo [key] Ключ принят: %PRODKEY%
+goto PRODKEY_DONE
+:PRODKEY_SKIP
+echo [key] Ключ не введён - Pro без активации (generic key).
+set "PRODKEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T"
+:PRODKEY_DONE
+echo.
 
-:MOUNT_OK
-echo === SMB-шара смонтирована с попытки %RETRIES% ===
-Y:
-cd \%WINVER%
-if not exist setup.exe (
-  echo *** Нет setup.exe в папке версии %WINVER% - переход в консоль ***
-  dir Y:\
-  cmd
-  goto :eof
-)
+:: SMB смонтирован в начале (сразу после определения SL); Y: уже доступен,
+:: setup.exe проверен, CWD = Y:\%WINVER%. Продолжаем к правке autounattend.
 
 if exist "%STAGE%\autounattend.xml" (
-  set "UAFILE=%STAGE%\autounattend.xml"
+  set "UASRC=%STAGE%\autounattend.xml"
   echo === Использую autounattend с сервера, SL=%SL% ===
 ) else (
-  set "UAFILE=Y:\%WINVER%\autounattend.xml"
-  echo === Готовый autounattend отсутствует - беру исходный ***
+  set "UASRC=Y:\%WINVER%\autounattend.xml"
+  echo === Готовый autounattend отсутствует - беру исходный ===
 )
 
-:: Autounattend carries a hardcoded <DiskID>. If it does not match the SYSDISK
-:: the operator picked, Setup cannot find the target partition, WillShowUI=OnError
-:: fires and Setup falls back to the FULL interactive wizard - which also throws
-:: away SetupUILanguage and every other unattend setting. So this patch matters.
-:: PowerShell is absent from PXE WinPE, hence the cscript fallback.
-if /i "%SYSDISK%"=="SKIP" goto SYSDISK_SKIP
+:: Patch a WRITABLE local copy on X: (ramdisk). The source can sit on the
+:: read-only SMB share (Y:) or a staged path where the write-back fails
+:: SILENTLY - that is exactly how an operator-entered test duration got lost:
+:: __TEST_MINUTES__ was never replaced, Specialize wrote no TestMinutes, and the
+:: test ran with the 720-min default. Copying to X: guarantees the patch lands
+:: AND that Setup reads exactly the file we patched.
+set "UAFILE=X:\autounattend_patched.xml"
+copy /y "%UASRC%" "%UAFILE%" >nul
+if exist "%UAFILE%" (
+  echo === autounattend скопирован на X: для правки ===
+) else (
+  echo *** Копирование не удалось - патчу источник напрямую.
+  set "UAFILE=%UASRC%"
+)
 
-echo === Правка autounattend: DiskID -^> %SYSDISK% ===
-powershell.exe -NoProfile -Command "$f='%UAFILE%'; $c=[System.IO.File]::ReadAllText($f); $c=[regex]::Replace($c,'<DiskID>\d+</DiskID>','<DiskID>%SYSDISK%</DiskID>'); if('%TESTMIN%' -ne ''){$c=$c.Replace('__TEST_MINUTES__','%TESTMIN%')}; [System.IO.File]::WriteAllText($f,$c,[System.Text.UTF8Encoding]::new($false))" >nul 2>&1
-if not errorlevel 1 goto PATCH_OK
+:: Autounattend carries a hardcoded <DiskID> plus a __TEST_MINUTES__ placeholder.
+:: If DiskID disagrees with SYSDISK, Setup drops into the full interactive wizard
+:: (losing SetupUILanguage etc.), so the patch must succeed. PowerShell is usually
+:: absent in PXE WinPE -> cscript fallback. DISKARG=SKIP leaves DiskID untouched
+:: (autounattend picks the disk). NO ">nul 2>&1" here: we WANT errors visible.
+set "DISKARG=%SYSDISK%"
+if /i "%SYSDISK%"=="SKIP" set "DISKARG=SKIP"
+echo === Правка autounattend: DiskID=%DISKARG%, TestMin=%TESTMIN% ===
 
-echo     PowerShell недоступен, пробую VBScript...
+powershell.exe -NoProfile -Command "$f='%UAFILE%'; $c=[System.IO.File]::ReadAllText($f); if('%DISKARG%' -ne 'SKIP'){$c=[regex]::Replace($c,'<DiskID>\s*\d+\s*</DiskID>','<DiskID>%DISKARG%</DiskID>')}; if('%TESTMIN%' -ne ''){$c=$c.Replace('__TEST_MINUTES__','%TESTMIN%')}; if('%PRODKEY%' -ne ''){$c=$c.Replace('__PRODUCT_KEY__','%PRODKEY%')}; [System.IO.File]::WriteAllText($f,$c,[System.Text.UTF8Encoding]::new($false))"
+if not errorlevel 1 goto PATCH_VERIFY
+
+echo     PowerShell недоступен/ошибка, пробую VBScript...
 if not exist "Y:\common\patch_diskid.vbs" (
   echo *** Не найден Y:\common\patch_diskid.vbs
   goto PATCH_FAIL
 )
-cscript.exe //nologo "Y:\common\patch_diskid.vbs" "%UAFILE%" %SYSDISK% %TESTMIN%
-if not errorlevel 1 goto PATCH_OK
+cscript.exe //nologo "Y:\common\patch_diskid.vbs" "%UAFILE%" %DISKARG% "%TESTMIN%" "%PRODKEY%"
+if not errorlevel 1 goto PATCH_VERIFY
 
 :PATCH_FAIL
-echo *** Правка DiskID НЕ УДАЛАСЬ - Setup возьмёт жёстко заданный DiskID.
-echo *** Setup покажет экраны выбора языка и раздела - выберите вручную:
-echo *** язык Русский, затем раздел Windows на диске %SYSDISK%.
+echo *** Правка autounattend НЕ УДАЛАСЬ.
+if /i not "%SYSDISK%"=="SKIP" echo *** Setup покажет выбор языка/раздела - выберите вручную: Русский, раздел Windows на диске %SYSDISK%.
 goto SETUP_START
 
-:PATCH_OK
-:: Не используем findstr для проверки - его нет в PXE WinPE.
-:: patch_diskid.vbs сам печатает "patch_diskid: DiskID set to N".
+:PATCH_VERIFY
+:: Best-effort visibility: confirm placeholders are gone.
+:: find.exe returns errorlevel 1 when the string is NOT found (= replaced OK).
+:: 1) Product key (win11/Pro only; PRODKEY is defined only for win11).
+if not defined PRODKEY goto PV_TESTMIN
+find "__PRODUCT_KEY__" "%UAFILE%" >nul 2>&1
+if errorlevel 1 goto PV_KEY_OK
+echo *** ВНИМАНИЕ: __PRODUCT_KEY__ остался - Setup спросит ключ вручную.
+goto PV_TESTMIN
+:PV_KEY_OK
+echo     [patch] Ключ продукта применён.
+:PV_TESTMIN
+:: 2) Test duration.
+if not defined TESTMIN goto SETUP_START
+find "__TEST_MINUTES__" "%UAFILE%" >nul 2>&1
+if errorlevel 1 goto TESTMIN_APPLIED
+echo *** ВНИМАНИЕ: __TEST_MINUTES__ остался в файле - длительность теста НЕ применилась (пойдёт дефолт)!
+goto SETUP_START
+:TESTMIN_APPLIED
+echo     [patch] Длительность теста применена: %TESTMIN% мин.
 
 :SETUP_START
 echo === Запуск установки Windows с %UAFILE% ===
 start /wait setup.exe /unattend:%UAFILE%
 goto :eof
-
-:SYSDISK_SKIP
-:: SYSDISK=SKIP: DiskID не трогаем (autounattend сам выберет цель), но
-:: длительность теста, если оператор её задал, всё равно применяем.
-if not defined TESTMIN goto SETUP_START
-echo === Правка autounattend: длительность теста -^> %TESTMIN% мин ===
-powershell.exe -NoProfile -Command "$f='%UAFILE%'; $c=[System.IO.File]::ReadAllText($f); $c=$c.Replace('__TEST_MINUTES__','%TESTMIN%'); [System.IO.File]::WriteAllText($f,$c,[System.Text.UTF8Encoding]::new($false))" >nul 2>&1
-if not errorlevel 1 goto SETUP_START
-if exist "Y:\common\patch_diskid.vbs" cscript.exe //nologo "Y:\common\patch_diskid.vbs" "%UAFILE%" SKIP %TESTMIN%
-goto SETUP_START
 
 :: ============================================================
 :: Подпрограммы: заново запрашивают и показывают диски, чтобы
@@ -402,4 +456,26 @@ exit /b
 set "CONFIRM_OK="
 if /i "%CONFIRM%"=="Y"   set "CONFIRM_OK=1"
 if /i "%CONFIRM%"=="YES" set "CONFIRM_OK=1"
+exit /b
+
+:CLEAN_ONE
+:: Очистка одного диска из списка. Авто-пропуск SYS/REC/DOCS и защищённых
+:: (данные/архив из PROTECTLIST). Вызов: call :CLEAN_ONE <index>.
+set "CLD=%~1"
+if "%CLD%"=="%SYSDISK%"  ( echo [clean] диск %CLD% = SYSDISK - пропуск.  & exit /b )
+if "%CLD%"=="%RECDISK%"  ( echo [clean] диск %CLD% = RECDISK - пропуск.  & exit /b )
+if "%CLD%"=="%DOCSDISK%" ( echo [clean] диск %CLD% = DOCSDISK - пропуск. & exit /b )
+for %%p in (%PROTECTLIST%) do if "%%p"=="%CLD%" ( echo [clean] диск %CLD% = данные/архив - ЗАЩИЩЁН, пропуск. & exit /b )
+echo === Очистка диска %CLD% ===
+(
+  echo select disk %CLD%
+  echo clean
+  echo exit
+) > X:\clean_%CLD%.txt
+diskpart /s X:\clean_%CLD%.txt
+if errorlevel 1 (
+  echo *** очистка диска %CLD% НЕ УДАЛАСЬ
+) else (
+  echo [clean] диск %CLD% очищен.
+)
 exit /b
