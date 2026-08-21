@@ -19,6 +19,34 @@ $script:StressLogDir  = Join-Path $env:ProgramData 'IPDROM\Logs'
 $script:StressLogFile = Join-Path $script:StressLogDir ("auto_stress_test_{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Force -Path $script:StressLogDir | Out-Null
 
+# ============ pwsh 7 / Intel CET crash guard (probe-then-fix, non-invasive) ============
+# On CPUs with Intel CET user-mode shadow stacks (e.g. Xeon Silver 4510 / Sapphire
+# Rapids), PowerShell 7 (.NET 9 coreclr) fail-fasts at process init with exit code
+# -1073740286 (0xC0000602 STATUS_FAIL_FAST_EXCEPTION) and the assert
+# "!AreShadowStacksEnabled() || UseSpecialUserModeApc()", when the OS lacks Special
+# User Mode APC support (un-updated Server 2022 20348). Every pwsh child (Axxon
+# installer + the stress test, both launched via pwsh) then dies instantly.
+# We PROBE pwsh first and disable its user shadow stack ONLY if it actually crashes,
+# so machines where pwsh already works (Pro/IoT / updated OS) are left fully untouched.
+# (DOTNET_CETCompat=0 does NOT help - the OS creates the shadow stack at process
+# launch, before the runtime reads the var.) Confirmed on SL111111-008.
+try {
+    $pwshExe = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
+    if ($pwshExe) {
+        $probe = Start-Process -FilePath $pwshExe -ArgumentList '-NoProfile','-NoLogo','-Command','exit 0' -PassThru -WindowStyle Hidden -ErrorAction Stop
+        if ($probe.WaitForExit(20000)) { $probeCode = $probe.ExitCode } else { try { $probe.Kill() } catch {}; $probeCode = 'timeout' }
+        if ($probeCode -eq -1073740286) {
+            Write-Host 'pwsh 7 crashes at init (Intel CET) - disabling its user shadow stack...' -ForegroundColor Yellow
+            Set-ProcessMitigation -Name 'pwsh.exe' -Disable UserShadowStack -ErrorAction Stop
+            Add-Content -Path $script:StressLogFile -Value ("[{0}] pwsh CET crash detected (0xC0000602) -> UserShadowStack disabled for pwsh.exe." -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) -Encoding UTF8 -ErrorAction SilentlyContinue
+        } else {
+            Add-Content -Path $script:StressLogFile -Value ("[{0}] pwsh probe exit={1} - no CET mitigation needed (system untouched)." -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $probeCode) -Encoding UTF8 -ErrorAction SilentlyContinue
+        }
+    }
+} catch {
+    Add-Content -Path $script:StressLogFile -Value ("[{0}] WARNING: pwsh CET check failed: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $_.Exception.Message) -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
 function Write-ColorOutput {
     param([string]$Message, [string]$Color = 'White')
     $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
