@@ -960,8 +960,11 @@ function Select-NvidiaDriverForModel {
 
     $m = "$GpuModel"
 
-    # Professional cards (Quadro / NVS) -> quadro/rtx-enterprise driver.
-    if ($m -match '(?i)\bquadro\b|\bnvs\b') {
+    # Professional cards -> quadro/rtx-enterprise driver. NVIDIA dropped the
+    # "Quadro" name: modern pro cards are "RTX A<nnn>" (Ampere: A400/A2000/A4000..),
+    # "RTX <nnnn> Ada Generation" (Ada), and "T<nnn>" (Turing). Match all of them,
+    # not just legacy Quadro/NVS, or an RTX A400 falls through to the GeForce driver.
+    if ($m -match '(?i)\bquadro\b|\bnvs\b|\bRTX\s*A\d|\bT\d{3,4}\b|Ada\s+Generation') {
         $pick = $exes | Where-Object { $_.Name -match '(?i)quadro|rtx' } |
                 Sort-Object Length -Descending | Select-Object -First 1
         if ($pick) { return $pick }

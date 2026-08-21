@@ -242,6 +242,19 @@ try {
 
     Write-LauncherLog "auto_stress_test.ps1 finished with exit code $exitCode"
     if ($exitCode -eq 0) {
+        # Test passed -> delivery-ready. Disarm the perpetual auto-logon armed by
+        # register_auto_stress_after_reboot.ps1 so the delivered machine boots to a
+        # normal sign-in screen (no blank-password auto-logon left enabled). On
+        # failure we deliberately leave it on so the operator keeps a desktop across
+        # reboots while investigating.
+        try {
+            $winlogon = 'Registry::HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+            Set-ItemProperty    -LiteralPath $winlogon -Name 'AutoAdminLogon'  -Value '0' -Type String -Force -ErrorAction SilentlyContinue
+            Remove-ItemProperty -LiteralPath $winlogon -Name 'DefaultPassword' -Force -ErrorAction SilentlyContinue
+            Write-LauncherLog 'Perpetual auto-logon disarmed (delivery-ready).'
+        } catch {
+            Write-LauncherLog "WARNING: failed to disarm auto-logon: $($_.Exception.Message)"
+        }
         (Get-Date).ToString('o') | Out-File -FilePath $finishedFile -Encoding ascii -Force
         Exit-Cleanly 0
     }

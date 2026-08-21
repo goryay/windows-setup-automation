@@ -13,6 +13,7 @@
       16  Label C: = "System Disk"
       19  Klassicheskiy PKM v Win11        (HKCU\Software\Classes\CLSID...)
       22  UseDefaultTile=1                 (zapret menyat' avatar)
+      22b user.png -> User Account Pictures (brendirovanniy avatar-tile)
       26  lfsvc / DPS / diagnosticshub     (otklyuchaem sluzhby)
       27  DisableNotificationCenter=1      (centr uvedomleniy)
       28  ToastEnabled=0                   (toast-uvedomleniya)
@@ -138,6 +139,49 @@ if ($defLoaded) {
 # ===================== 22. UseDefaultTile=1 (zapret menyat' avatar) =====================
 Write-Log "[22] UseDefaultTile=1 (lock user picture)" 'Cyan'
 reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" /v UseDefaultTile /t REG_DWORD /d 1 /f | Out-Null
+
+# ===================== 22b. Branded default account picture (user.png) =====================
+# UseDefaultTile=1 (above) forces every account to the DEFAULT tile located in
+# C:\ProgramData\Microsoft\User Account Pictures\. Nothing ever replaced that default
+# with our branded image, so Windows kept showing the stock silhouette. Copy
+# customization\avatars\user.png over the default tiles. They are TrustedInstaller-owned,
+# so take ownership + grant Administrators (SID S-1-5-32-544, locale-safe) before overwrite.
+Write-Log "[22b] Brand default account tiles with user.png" 'Cyan'
+$avatarSrc   = $null
+$avatarRoots = @()
+$irFile = 'C:\ProgramData\IPDROM\State\InstallRoot.txt'
+if (Test-Path $irFile) { $avatarRoots += ((Get-Content $irFile -Raw -ErrorAction SilentlyContinue).Trim()) }
+$avatarRoots += 'C:\IPDROM'
+foreach ($d in [System.IO.DriveInfo]::GetDrives()) { $avatarRoots += $d.RootDirectory.FullName }
+foreach ($r in $avatarRoots) {
+    if ([string]::IsNullOrWhiteSpace($r)) { continue }
+    $cand = Join-Path $r 'customization\avatars\user.png'
+    if (Test-Path $cand) { $avatarSrc = $cand; break }
+}
+if ($avatarSrc) {
+    Write-Log "  source: $avatarSrc" 'Gray'
+    $picDir = Join-Path $env:ProgramData 'Microsoft\User Account Pictures'
+    if (-not (Test-Path $picDir)) { New-Item -ItemType Directory -Force -Path $picDir | Out-Null }
+    # Folder ownership first so missing size-variants can be (re)created.
+    & takeown.exe /f "$picDir" 2>&1 | Out-Null
+    & icacls.exe  "$picDir" /grant "*S-1-5-32-544:(OI)(CI)F" 2>&1 | Out-Null
+    # user.png = legacy fallback; user-<size>.png = the tiles actually rendered in the UI.
+    foreach ($name in @('user.png','user-32.png','user-40.png','user-48.png','user-192.png')) {
+        $dst = Join-Path $picDir $name
+        if (Test-Path $dst) {
+            & takeown.exe /f "$dst" 2>&1 | Out-Null
+            & icacls.exe  "$dst" /grant "*S-1-5-32-544:F" 2>&1 | Out-Null
+        }
+        try {
+            Copy-Item -LiteralPath $avatarSrc -Destination $dst -Force -ErrorAction Stop
+            Write-Log "  -> $name replaced" 'Green'
+        } catch {
+            Write-Log "  !! $name : $($_.Exception.Message)" 'Yellow'
+        }
+    }
+} else {
+    Write-Log "  user.png source NOT found (customization\avatars\user.png) - avatar not branded" 'Yellow'
+}
 
 # ===================== 26. Sluzhby: lfsvc, DPS, diagnosticshub =====================
 Write-Log "[26] Disable services: lfsvc, DPS, diagnosticshub.standardcollector.service" 'Cyan'

@@ -72,6 +72,27 @@ Register-ScheduledTask `
     -RunLevel Highest `
     -Force | Out-Null
 
+# Persist auto-logon across ALL pipeline reboots. The continuation task above is
+# AtLogon and needs an interactive desktop, but the unattend arms auto-logon only
+# once (LogonCount=1) and FirstLogon sets AutoLogonCount=0 - so every reboot after
+# the first stopped at the sign-in screen and the operator had to log in by hand.
+# Arm a perpetual auto-logon for the local IPDROM account (blank password; console
+# logon is permitted even under the Server blank-password policy). This runs after
+# FirstLogon's AutoLogonCount=0, so it wins. launch_auto_stress_after_reboot.ps1
+# disarms it on stress-test success, so the delivered machine still boots to a
+# normal sign-in screen.
+try {
+    $winlogon = 'Registry::HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    Set-ItemProperty -LiteralPath $winlogon -Name 'AutoAdminLogon'    -Value '1'               -Type String -Force
+    Set-ItemProperty -LiteralPath $winlogon -Name 'DefaultUserName'   -Value 'IPDROM'          -Type String -Force
+    Set-ItemProperty -LiteralPath $winlogon -Name 'DefaultDomainName' -Value $env:COMPUTERNAME -Type String -Force
+    Set-ItemProperty -LiteralPath $winlogon -Name 'DefaultPassword'   -Value ''                -Type String -Force
+    Remove-ItemProperty -LiteralPath $winlogon -Name 'AutoLogonCount' -Force -ErrorAction SilentlyContinue
+    Write-Host "Perpetual auto-logon armed for IPDROM (disarmed on stress-test success)."
+} catch {
+    Write-Host "WARNING: failed to arm perpetual auto-logon: $($_.Exception.Message)"
+}
+
 Write-Host "Scheduled Task: $taskName"
 Write-Host "Local launcher: $localLauncher"
 Write-Host "Install root saved as: $installRootNormalized"

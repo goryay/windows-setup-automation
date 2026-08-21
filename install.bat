@@ -33,6 +33,7 @@ echo === Версия: %WINVER% ===
 set "SL=UNKNOWN"
 if exist "%STAGE%\slid.txt" set /p SL=<"%STAGE%\slid.txt"
 echo === Конфигурация SL: %SL% ===
+echo === [BUILD 2026-08-19-c revert-testtime] ===
 
 echo === Монтирование SMB-шары (10 попыток со сбросом состояния) ===
 set RETRIES=0
@@ -68,7 +69,129 @@ if not exist setup.exe (
   goto :eof
 )
 
+:: === Автосборка RAID-массивов по конфигу SL (Intel VMD/NVMe + LSI/avago SAS/SATA) ===
+:: Инертна, если в конфиге нет RAID-групп (build_rst/build_avago CHECK -> NONE) либо
+:: на шаре нет нужных .vbs/утилит. На Pro/IoT/Server без RAID ничего не меняется.
+:: Порядок по ТЗ: предупредить -> подтвердить -> очистить avago (иначе его массив
+:: СКРЫВАЕТ NVMe от rstcli и RST-план пуст) -> показать ТОЧНЫЙ план -> подтвердить -> собрать.
+if not exist "Y:\common\config\%SL%.txt" goto RAID_DONE
+set "RSTNEED="
+set "AVGNEED="
+:: --- CHECK: нужны ли NVMe (RST) массивы? ---
+if exist "Y:\common\build_rst.vbs" if exist "Y:\common\software\rstcli64.exe" (
+  cscript //nologo "Y:\common\build_rst.vbs" "Y:\common\config\%SL%.txt" CHECK > X:\rstchk.txt 2>&1
+  type X:\rstchk.txt
+  find "RESULT=NEEDED" X:\rstchk.txt >nul
+  if not errorlevel 1 set "RSTNEED=1"
+)
+:: --- CHECK: нужны ли avago (SAS/SATA) массивы? ---
+if exist "Y:\common\build_avago.vbs" if exist "Y:\common\SoftForTest\StorCLI\storcli64.exe" (
+  cscript //nologo "Y:\common\build_avago.vbs" "Y:\common\config\%SL%.txt" CHECK > X:\avgchk.txt 2>&1
+  type X:\avgchk.txt
+  find "RESULT=NEEDED" X:\avgchk.txt >nul
+  if not errorlevel 1 set "AVGNEED=1"
+)
+if not defined RSTNEED if not defined AVGNEED goto RAID_DONE
 echo.
+cls
+echo ===============================================================
+echo   АВТОСБОРКА RAID-МАССИВОВ  (по конфигу SL=%SL%)
+echo ===============================================================
+echo Конфиг требует сборку RAID. Чтобы RST-план был точным, сначала
+echo очищается конфигурация avago ^(его массив скрывает NVMe от rstcli^).
+echo.
+echo *** ВНИМАНИЕ: очистка УДАЛИТ массивы на контроллерах avago + RST.
+echo *** ВСЕ данные на дисках этих контроллеров будут ПОТЕРЯНЫ.
+set "CONFIRM="
+set /p CONFIRM=Очистить контроллеры и показать план сборки? Y или YES:
+call :IS_CONFIRMED
+if not defined CONFIRM_OK (
+  echo [raid] отменено оператором - контроллеры и диски НЕ тронуты.
+  goto RAID_DONE
+)
+echo.
+echo === Очистка конфигурации avago ^(storcli^) ===
+if not exist "Y:\common\SoftForTest\StorCLI\storcli64.exe" goto AVAGO_CLR_DONE
+set "STOR=Y:\common\SoftForTest\StorCLI\storcli64.exe"
+%STOR% /c0/vall del force >nul 2>&1
+%STOR% /c0/fall del >nul 2>&1
+:: Сброс preserved/pinned cache: после удаления VD с write-back кэшем контроллер
+:: держит его "pinned" и ОТКАЗЫВАЕТСЯ создавать новые VD (Failure, exit=84), пока
+:: кэш не сброшен. Чистим и общий, и по каждому ID удалённого VD (0..15).
+echo [raid] сброс preserved cache avago...
+%STOR% /c0/vall delete preservedcache force >nul 2>&1
+for /L %%i in (0,1,15) do %STOR% /c0/v%%i delete preservedcache force >nul 2>&1
+%STOR% /c0 show preservedcache
+echo [raid] avago очищен ^(VD + foreign + preserved cache^) - rstcli видит NVMe.
+:AVAGO_CLR_DONE
+echo.
+echo === План сборки ^(после очистки avago - точный^) ===
+echo.
+set "RAIDSKIP="
+if defined RSTNEED (
+  cscript //nologo "Y:\common\build_rst.vbs" "Y:\common\config\%SL%.txt" DRYRUN > X:\rstplan.txt 2>&1
+  type X:\rstplan.txt
+  find "- SKIP." X:\rstplan.txt >nul
+  if not errorlevel 1 set "RAIDSKIP=1"
+)
+if defined AVGNEED (
+  cscript //nologo "Y:\common\build_avago.vbs" "Y:\common\config\%SL%.txt" DRYRUN > X:\avgplan.txt 2>&1
+  type X:\avgplan.txt
+  find "- SKIP." X:\avgplan.txt >nul
+  if not errorlevel 1 set "RAIDSKIP=1"
+)
+echo.
+:: ТЗ стр.53: если группу(ы) не удалось сопоставить с дисками (кол-во/тип не совпали
+:: даже по Pass-2 -> "- SKIP." в плане) - предупредить и предложить выключение.
+if not defined RAIDSKIP goto RAID_NOSKIP
+echo *** ВНИМАНИЕ: часть групп из конфига НЕ сопоставлена с дисками ^(строки "- SKIP." выше^).
+echo *** Реальные диски не совпадают с конфигурацией по кол-ву/типу.
+set "CONFIRM="
+set /p CONFIRM=ВЫКЛЮЧИТЬ машину для проверки? Y = выключить, иначе = продолжить всё равно:
+call :IS_CONFIRMED
+if defined CONFIRM_OK (
+  echo [raid] выключение по требованию оператора ^(несопоставленные диски^).
+  wpeutil shutdown
+  goto :eof
+)
+:RAID_NOSKIP
+set "CONFIRM="
+set /p CONFIRM=Собрать RAID-массивы по плану выше? Y или YES:
+call :IS_CONFIRMED
+if not defined CONFIRM_OK (
+  echo [raid] сборка отменена ^(avago уже очищен, массивы НЕ собраны^).
+  goto RAID_DONE
+)
+echo.
+echo === Сборка RAID ===
+:: Собрать RST (NVMe): очищает свои метаданные + создаёт + init (кроме RAID-0)
+if defined RSTNEED (
+  echo [raid] --- RST ^(Intel VMD / NVMe^) ---
+  cscript //nologo "Y:\common\build_rst.vbs" "Y:\common\config\%SL%.txt" EXECUTE
+  if errorlevel 1 (
+    echo *** [raid] RST-сборка НЕ удалась - см. вывод выше. Enter = продолжить всё равно.
+    pause
+  )
+)
+:: Собрать avago-массивы (SAS/SATA) через storcli (avago уже очищен выше)
+if defined AVGNEED (
+  echo [raid] --- avago ^(LSI MegaRAID SAS/SATA^) ---
+  cscript //nologo "Y:\common\build_avago.vbs" "Y:\common\config\%SL%.txt" EXECUTE
+  if errorlevel 1 (
+    echo *** [raid] avago-сборка НЕ удалась - см. вывод выше. Enter = продолжить всё равно.
+    pause
+  )
+)
+:: Дать контроллерам показать новые массивы + обновить список дисков WinPE
+echo [raid] пауза ~15 сек, затем diskpart rescan...
+ping -n 16 127.0.0.1 >nul
+(echo rescan)> X:\raid_rescan.txt
+diskpart /s X:\raid_rescan.txt >nul
+:RAID_DONE
+
+:SELECT_START
+echo.
+cls
 echo ===============================================================
 echo   НАСТРОЙКА USB-ФЛЕШЕК
 echo ===============================================================
@@ -76,14 +199,20 @@ echo Для каждой роли введите ИНДЕКС диска или 
 call :SHOW_USB
 
 echo IpdromREC = флешка восстановления (restore.ffu).
+echo (R = обновить список дисков, если только что вставили флешку)
+:REC_ASK
 set "RECDISK="
 set /p RECDISK=Индекс RECDISK:
+if /i "%RECDISK%"=="R" ( call :SHOW_USB & goto REC_ASK )
 if /i "%RECDISK%"=="" set "RECDISK=SKIP"
 
 echo.
 echo IPDROM = флешка с документацией, драйверами и ПО.
+echo (R = обновить список дисков)
+:DOCS_ASK
 set "DOCSDISK="
 set /p DOCSDISK=Индекс DOCSDISK:
+if /i "%DOCSDISK%"=="R" ( call :SHOW_USB & goto DOCS_ASK )
 if /i "%DOCSDISK%"=="" set "DOCSDISK=SKIP"
 
 if /i "%RECDISK%"=="SKIP" (
@@ -182,6 +311,7 @@ echo [docs] OK - раздел IPDROM готов на Q:.
 echo === Флешки настроены. Продолжаю установку Windows. ===
 echo.
 
+cls
 echo ===============================================================
 echo   ДИСК ДЛЯ УСТАНОВКИ WINDOWS (SYSDISK)
 echo ===============================================================
@@ -268,6 +398,7 @@ if errorlevel 1 (
 :SYS_DONE
 echo.
 
+cls
 echo ===============================================================
 echo   ОЧИСТКА ЛИШНИХ ДИСКОВ
 echo ===============================================================
@@ -302,6 +433,7 @@ for %%d in (%CLEANDISKS%) do call :CLEAN_ONE %%d
 :CLEAN_DONE
 echo.
 
+cls
 echo ===============================================================
 echo   ДЛИТЕЛЬНОСТЬ СТРЕСС-ТЕСТА
 echo ===============================================================
@@ -328,25 +460,104 @@ if %TESTMIN% LEQ 0 (
 )
 echo [test] Тест будет идти %TESTHOURS% ч (%TESTMIN% мин).
 :TESTDUR_DONE
-echo.
 
-:: === Ключ продукта: только win11/Pro. IoT и Server ставятся по GVLK,
-:: их autounattend плейсхолдера __PRODUCT_KEY__ не содержит - блок пропускается.
+:: === Ключ продукта: win11/Pro и Server 2019/2022. IoT ставится по GVLK
+:: (в его autounattend нет плейсхолдера __PRODUCT_KEY__) - для IoT блок пропускается.
+:: Enter = GVLK по умолчанию для данной ОС (ставится, ключ активации введёте позже).
 set "PRODKEY="
-if /i not "%WINVER%"=="win11" goto PRODKEY_DONE
+set "PRODKEY_DEFAULT="
+set "KEYOSNAME="
+if /i "%WINVER%"=="win11"      set "PRODKEY_DEFAULT=VK7JG-NPHTM-C97JM-9MPGT-3V66T"
+if /i "%WINVER%"=="win11"      set "KEYOSNAME=WINDOWS 11 PRO"
+if /i "%WINVER%"=="server2019" set "PRODKEY_DEFAULT=N69G4-B89J2-4G8F4-WWYCC-J464C"
+if /i "%WINVER%"=="server2019" set "KEYOSNAME=WINDOWS SERVER 2019 STANDARD"
+if /i "%WINVER%"=="server2022" set "PRODKEY_DEFAULT=VDYBN-27WPP-V4HQT-9VMD4-VMK7H"
+if /i "%WINVER%"=="server2022" set "KEYOSNAME=WINDOWS SERVER 2022 STANDARD"
+if not defined PRODKEY_DEFAULT goto PRODKEY_DONE
 echo ===============================================================
-echo   КЛЮЧ ПРОДУКТА WINDOWS 11 PRO
+echo   КЛЮЧ ПРОДУКТА %KEYOSNAME%
 echo ===============================================================
 echo Формат: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX (25 символов).
-echo Enter = пропустить: поставится Pro без активации, ключ введёте позже.
+echo Enter = пропустить: поставится по GVLK, ключ активации введёте позже.
 set /p PRODKEY=Ключ:
 if not defined PRODKEY goto PRODKEY_SKIP
 echo [key] Ключ принят: %PRODKEY%
 goto PRODKEY_DONE
 :PRODKEY_SKIP
-echo [key] Ключ не введён - Pro без активации (generic key).
-set "PRODKEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T"
+echo [key] Ключ не введён - GVLK по умолчанию (без активации).
+set "PRODKEY=%PRODKEY_DEFAULT%"
 :PRODKEY_DONE
+echo.
+
+:: ===============================================================
+:: ФАЗА 3: единая сводка + финальное подтверждение перед установкой.
+:: Пошаговые подтверждения деструктивных операций выше сохранены; это
+:: холистическая проверка ПЕРЕД самой установкой ОС и стресс-тестом.
+:: Отклонение (не Y) = сброс выбора и повтор с начала блока выбора.
+:: ===============================================================
+set "OSNAME=Windows"
+if /i "%WINVER%"=="win11"      set "OSNAME=Windows 11 Pro"
+if /i "%WINVER%"=="iot"        set "OSNAME=Windows IoT Enterprise LTSC"
+if /i "%WINVER%"=="server2019" set "OSNAME=Windows Server 2019 Standard"
+if /i "%WINVER%"=="server2022" set "OSNAME=Windows Server 2022 Standard"
+
+set "KEYINFO=по GVLK (ключ не требуется)"
+if defined PRODKEY_DEFAULT if /i "%PRODKEY%"=="%PRODKEY_DEFAULT%" set "KEYINFO=GVLK по умолчанию - без активации"
+if defined PRODKEY_DEFAULT if not "%PRODKEY%"=="%PRODKEY_DEFAULT%" set "KEYINFO=%PRODKEY%"
+
+set "TESTINFO=720 мин (12ч по умолчанию)"
+if defined TESTMIN set "TESTINFO=%TESTMIN% мин"
+
+set "SYSINFO=%SYSDISK%"
+if /i "%SYSDISK%"=="SKIP" set "SYSINFO=SKIP - autounattend выберет сам"
+set "RECINFO=%RECDISK%"
+if /i "%RECDISK%"=="SKIP" set "RECINFO=НЕТ"
+set "DOCSINFO=%DOCSDISK%"
+if /i "%DOCSDISK%"=="SKIP" set "DOCSINFO=НЕТ"
+set "CLEANINFO=%CLEANDISKS%"
+if /i "%CLEANDISKS%"=="SKIP" set "CLEANINFO=нет"
+set "PROTINFO=%PROTECTLIST%"
+if not defined PROTINFO set "PROTINFO=нет"
+
+cls
+echo ###############################################################
+echo #   ИТОГОВАЯ КОНФИГУРАЦИЯ - ПРОВЕРЬТЕ ПЕРЕД УСТАНОВКОЙ
+echo ###############################################################
+echo.
+echo   Серийный номер : %SL%
+echo   ОС             : %WINVER%  ^| %OSNAME%
+echo   Ключ           : %KEYINFO%
+echo   Время теста    : %TESTINFO%
+echo.
+echo   --- Об устройстве (модель / материнская плата) ---
+wmic computersystem get Manufacturer,Model /format:table
+wmic baseboard get Manufacturer,Product /format:table
+echo.
+echo   --- Диски (внутренние) ---
+call :SHOW_FIXED
+echo   Системный диск           : %SYSINFO%
+echo   Защищено (данные/архив)  : %PROTINFO%
+echo   Очистка лишних дисков    : %CLEANINFO%
+echo.
+echo   --- Флешки (USB) ---
+call :SHOW_USB
+echo   Флешка восстановления    : %RECINFO%
+echo   Флешка документации      : %DOCSINFO%
+echo.
+echo ###############################################################
+set "CONFIRM="
+set /p CONFIRM=Всё верно? Y или YES = установка, иначе = сброс и заново:
+call :IS_CONFIRMED
+if defined CONFIRM_OK goto SUMMARY_OK
+echo.
+echo [summary] Отклонено - сбрасываю выбор, повтор с начала блока выбора.
+echo.
+set "RECDISK=" & set "DOCSDISK=" & set "SYSDISK=" & set "SYSAUTO=" & set "PROTECTLIST="
+set "CLEANDISKS=" & set "TESTHOURS=" & set "TESTMIN=" & set "PRODKEY="
+set "CONFIRM=" & set "CONFIRM_OK="
+goto SELECT_START
+:SUMMARY_OK
+echo === Подтверждено. Готовлю и запускаю установку Windows. ===
 echo.
 
 :: SMB смонтирован в начале (сразу после определения SL); Y: уже доступен,

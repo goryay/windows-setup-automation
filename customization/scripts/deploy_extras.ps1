@@ -461,14 +461,20 @@ function Copy-MbDriverFromPlatforms {
 }
 
 W "--- Motherboard driver auto-match ---"
-$mbAsset = Find-MbDriverAsset -MbModel $sl['mb_model'] -DriversDir $driversSrc
+# Match on vendor+model together: platform folders are named <Vendor>_<Model>
+# ('SuperMicro_X13SAE-F', 'MSI_Z390-A-PRO', 'FLAB.687265.004'). Some models alone
+# tokenize to <2 tokens (e.g. 'X13SAE-F' -> just 'X13SAE'), so mb_model-only never
+# reaches the >=2-token match. Prefixing mb_vendor supplies the 2nd token.
+$mbSearch = (('{0} {1}' -f $sl['mb_vendor'], $sl['mb_model']).Trim())
+W "  mb search string: '$mbSearch'"
+$mbAsset = Find-MbDriverAsset -MbModel $mbSearch -DriversDir $driversSrc
 if ($mbAsset) {
-    Copy-ToFlash -Src $mbAsset.FullName -DstDir $driversDst -Reason "MB drivers ($($sl['mb_model']))"
+    Copy-ToFlash -Src $mbAsset.FullName -DstDir $driversDst -Reason "MB drivers ($mbSearch)"
 } else {
-    W "  No curated mb pack matched for mb_model='$($sl['mb_model'])' in $driversSrc."
+    W "  No curated mb pack matched for '$mbSearch' in $driversSrc."
     # A driver pack on the flash is required by the delivery standard. With no
     # curated vendor pack, fall back to the board's install set in drivers\platforms.
-    Copy-MbDriverFromPlatforms -MbModel $sl['mb_model'] -PlatformsDir (Join-Path $UsbRoot 'drivers\platforms') -DstDir $driversDst -FlashLetter $flashLetter
+    Copy-MbDriverFromPlatforms -MbModel $mbSearch -PlatformsDir (Join-Path $UsbRoot 'drivers\platforms') -DstDir $driversDst -FlashLetter $flashLetter
 }
 
 # =============================================================================

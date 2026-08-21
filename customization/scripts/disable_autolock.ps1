@@ -30,6 +30,33 @@ function Write-Log {
 
 Write-Log "=== disable_autolock started ===" 'Cyan'
 
+# 0. САМОЕ ПЕРВОЕ: отключить QuickEdit на ТЕКУЩЕЙ консоли через API.
+#    Реестровая правка (шаг 8 ниже) действует только на консоли, созданные ПОЗЖЕ.
+#    Но консоль, в которой идёт FirstLogon -> setup_apps_and_theme, создана РАНЬШЕ и
+#    осталась с QuickEdit ВКЛ -> клик мышью в ней морозит весь конвейер (именно это
+#    повесило Pro-прогон на 14 часов, как и protect_ipdromrec на 005). SetConsoleMode
+#    чинит именно эту, живую консоль - сразу, не дожидаясь пересоздания.
+try {
+    $qeSig = @'
+[DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+'@
+    $qe = Add-Type -MemberDefinition $qeSig -Name 'QuickEditOff' -Namespace 'IpdromConsole' -PassThru
+    $h = $qe::GetStdHandle(-10)   # STD_INPUT_HANDLE
+    $mode = [uint32]0
+    if ($qe::GetConsoleMode($h, [ref]$mode)) {
+        # +ENABLE_EXTENDED_FLAGS(0x80), -ENABLE_QUICK_EDIT_MODE(0x40), -ENABLE_MOUSE_INPUT(0x10)
+        $new = [uint32]((($mode -bor 0x80) -band (-bnot 0x40)) -band (-bnot 0x10))
+        [void]$qe::SetConsoleMode($h, $new)
+        Write-Log ("QuickEdit OFF on CURRENT console via API (0x{0:X}->0x{1:X})" -f $mode, $new) 'Green'
+    } else {
+        Write-Log "GetConsoleMode failed (redirected / no console) - current console unchanged" 'Yellow'
+    }
+} catch {
+    Write-Log "QuickEdit API toggle skipped: $_" 'Yellow'
+}
+
 # 1. Машинный лимит бездействия = 0 (никогда не блокировать сессию по простою).
 #    Это главная причина авто-выхода на lock screen.
 reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v InactivityTimeoutSecs /t REG_DWORD /d 0 /f | Out-Null
