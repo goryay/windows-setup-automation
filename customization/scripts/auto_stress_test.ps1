@@ -1170,6 +1170,71 @@ $testArgs += "$DurationMinutes"
 Write-ColorOutput "  Arguments: $($testArgs -join ' ')" 'Green'
 Write-ColorOutput "  Full aida_fio_furmark call: $testScript $($testArgs -join ' ')" 'DarkGray'
 
+# ===================== [2.35/7] MOTHERBOARD/PLATFORM DRIVERS INTO OS =====================
+# Install the matched platform driver-store pack (chipset, LAN, Management Engine, VROC,
+# Guardant, ...) into the running OS BEFORE the stress test, so (a) the test exercises the
+# machine in its final driver configuration, (b) all NICs are up during the run, and (c) the
+# captured FFU has a clean Device Manager. GATED on unknown-device presence: fully-covered
+# machines (Pro/IoT on inbox drivers) have no yellow-bang devices -> no-op there, nothing
+# changes and the driver store isn't bloated. pnputil /install only binds drivers that match
+# present hardware. The compact matcher mirrors deploy_extras' Find-MbDriverAsset (vendor+model
+# tokens, >=2 must hit the <Vendor>_<Model> folder). deploy_extras still SHIPS the pack to the
+# delivery flash later. Whole block is try/catch'd (non-fatal) so it can never kill the pipeline.
+Write-ColorOutput '[2.35/7] Installing motherboard/platform drivers into OS...' 'Yellow'
+try {
+    $problemDevs = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+                     Where-Object { $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 })
+    if ($problemDevs.Count -eq 0) {
+        Write-ColorOutput '  No devices with a missing driver - skipping (system already covered).' 'Gray'
+    } else {
+        $mbSearch = ''
+        $slName = (Get-ItemProperty -Path 'HKLM:\Software\IPDROM' -Name 'SL' -ErrorAction SilentlyContinue).SL
+        if ($slName) {
+            $cfg = Join-Path $usbRoot "config\$slName.txt"
+            if (-not (Test-Path -LiteralPath $cfg)) { $cfg = "C:\IPDROM\config\$slName.txt" }
+            if (Test-Path -LiteralPath $cfg) {
+                $lines = Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue
+                $mv = (($lines | Where-Object { $_ -match '^mb_vendor\s*=' } | Select-Object -First 1) -replace '^mb_vendor\s*=','').Trim()
+                $mm = (($lines | Where-Object { $_ -match '^mb_model\s*='  } | Select-Object -First 1) -replace '^mb_model\s*=','').Trim()
+                $mbSearch = ("$mv $mm").Trim()
+            }
+        }
+        if (-not $mbSearch) {
+            Write-ColorOutput '  Could not read mb_vendor/mb_model from SL config - skipping platform driver install.' 'Yellow'
+        } else {
+            Write-ColorOutput "  mb search string: '$mbSearch' ; $($problemDevs.Count) device(s) without a driver." 'Gray'
+            $toTokens = { param($t) @((($t -replace '[^A-Za-z0-9]+',' ').ToUpper() -split '\s+') | Where-Object { $_ -and $_.Length -ge 2 }) }
+            $wantTokens = & $toTokens $mbSearch
+            $platformsDir = $null
+            foreach ($pd in @((Join-Path $usbRoot 'drivers\platforms'), 'C:\IPDROM\drivers\platforms')) {
+                if (Test-Path -LiteralPath $pd) { $platformsDir = $pd; break }
+            }
+            $bestDir = $null; $bestScore = 0
+            if ($platformsDir) {
+                foreach ($folder in (Get-ChildItem -LiteralPath $platformsDir -Directory -ErrorAction SilentlyContinue)) {
+                    $ft = & $toTokens $folder.Name
+                    $matched = @($wantTokens | Where-Object { $ft -contains $_ }).Count
+                    if ($matched -ge 2 -and $matched -gt $bestScore) { $bestScore = $matched; $bestDir = $folder.FullName }
+                }
+            }
+            if (-not $bestDir) {
+                Write-ColorOutput "  No platform pack matched '$mbSearch' in $platformsDir - skipping." 'Gray'
+            } else {
+                Write-ColorOutput "  Installing platform pack: $(Split-Path $bestDir -Leaf)" 'Yellow'
+                $infArg = Join-Path $bestDir '*.inf'
+                $out = & pnputil.exe /add-driver "$infArg" /subdirs /install 2>&1
+                Write-ColorOutput "  pnputil /add-driver exit=$LASTEXITCODE ($(@($out).Count) line(s) of output)." 'Gray'
+                & pnputil.exe /scan-devices 2>&1 | Out-Null
+                $afterDevs = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+                               Where-Object { $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 })
+                Write-ColorOutput "  Device Manager: $($afterDevs.Count) device(s) still without a driver (was $($problemDevs.Count)); some finalize on next boot." 'Green'
+            }
+        }
+    }
+} catch {
+    Write-ColorOutput "  Platform driver install failed (non-fatal): $($_.Exception.Message)" 'Yellow'
+}
+
 # ===================== [2.4/7] .NET FRAMEWORK 3.5 =====================
 # Intellect Classic MSI custom actions reference .NET 3.5. Without it,
 # WSInstaller shows a modal "Download .NET 3.5?" dialog that blocks the

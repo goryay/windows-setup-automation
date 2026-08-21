@@ -460,40 +460,6 @@ function Copy-MbDriverFromPlatforms {
     }
 }
 
-function Install-PlatformPackToOS {
-    # Install the matched platform driver-store pack INTO the running OS (chipset, LAN,
-    # Management Engine, VROC, Guardant, ...) so the delivered image has a clean Device
-    # Manager. deploy_extras otherwise only SHIPS packs to the flash; servers (e.g. the
-    # dual-Xeon on C741/Emmitsburg) have many devices with no inbox driver that the
-    # customer expects bound. Gated on unknown-device presence so fully-covered machines
-    # (Pro/IoT on inbox drivers) are left untouched - no driver-store bloat there.
-    # pnputil /install only binds drivers matching present hardware; the rest just stage.
-    # Confirmed on SL111111-008 (103/110 packages added, chipset/LAN/SPR bound). Runs at
-    # [6.6/7] right before FFU capture, so the clean state is baked into the image.
-    param([string]$PackDir)
-    if (-not $PackDir -or -not (Test-Path -LiteralPath $PackDir)) { return }
-
-    $problem = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
-                 Where-Object { $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 })
-    if ($problem.Count -eq 0) {
-        W "  OS driver-install skipped: no devices with a missing driver (system already covered)."
-        return
-    }
-
-    W ("  {0} device(s) without a driver -> installing platform pack into the OS: {1}" -f $problem.Count, (Split-Path $PackDir -Leaf))
-    $infArg = Join-Path $PackDir '*.inf'
-    try {
-        $out = & pnputil.exe /add-driver "$infArg" /subdirs /install 2>&1
-        W ("  pnputil /add-driver exit={0} ({1} line(s) of output)." -f $LASTEXITCODE, (@($out).Count))
-        & pnputil.exe /scan-devices 2>&1 | Out-Null
-        $after = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
-                   Where-Object { $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 })
-        W ("  Device Manager: {0} device(s) still without a driver (was {1}); some finalize on next boot." -f $after.Count, $problem.Count)
-    } catch {
-        W ("  WARNING: platform pack OS-install failed: {0}" -f $_.Exception.Message)
-    }
-}
-
 W "--- Motherboard driver auto-match ---"
 # Match on vendor+model together: platform folders are named <Vendor>_<Model>
 # ('SuperMicro_X13SAE-F', 'MSI_Z390-A-PRO', 'FLAB.687265.004'). Some models alone
@@ -501,17 +467,8 @@ W "--- Motherboard driver auto-match ---"
 # reaches the >=2-token match. Prefixing mb_vendor supplies the 2nd token.
 $mbSearch = (('{0} {1}' -f $sl['mb_vendor'], $sl['mb_model']).Trim())
 W "  mb search string: '$mbSearch'"
-
-# Install the matched platform driver-store pack into the OS (clean Device Manager in
-# the delivered image). Targets drivers\platforms and is independent of the curated
-# flash-shipping below. Gated inside Install-PlatformPackToOS on unknown-device count.
-$platformBoard = Find-MbDriverAsset -MbModel $mbSearch -DriversDir (Join-Path $UsbRoot 'drivers\platforms')
-if ($platformBoard) {
-    Install-PlatformPackToOS -PackDir $platformBoard.FullName
-} else {
-    W "  No platform pack matched for '$mbSearch' - OS driver-install skipped."
-}
-
+# NOTE: installing the platform pack INTO the OS (clean Device Manager) is done earlier,
+# before the stress test, in auto_stress_test.ps1 [2.35/7]. Here we only SHIP to the flash.
 $mbAsset = Find-MbDriverAsset -MbModel $mbSearch -DriversDir $driversSrc
 if ($mbAsset) {
     Copy-ToFlash -Src $mbAsset.FullName -DstDir $driversDst -Reason "MB drivers ($mbSearch)"
