@@ -222,7 +222,7 @@ function New-MegaRaidVirtualDriveFromConfig {
     $strip  = if ($RaidConfig.raid.strip_size_kb) { [int]$RaidConfig.raid.strip_size_kb } else { 256 }
 
     if ($drives -ieq 'all') {
-        $pdQuery = Invoke-StorCliCommand -StorCliPath $StorCliPath -Arguments @("/c$ctrl/eall/sall", 'show') -TimeoutSeconds 30
+        $pdQuery = Invoke-StorCliSafe -StorCliPath $StorCliPath -Arguments @("/c$ctrl/eall/sall", 'show') -TimeoutSeconds 30
         if (-not $pdQuery.Success) {
             Write-ColorOutput '  Cannot enumerate physical drives for RAID creation. Skipping.' 'Yellow'
             return $false
@@ -243,7 +243,7 @@ function New-MegaRaidVirtualDriveFromConfig {
     Write-ColorOutput "  Creating MegaRAID VD: level=$level drives=$drivesArg strip=$strip..." 'Yellow'
     Write-RaidLog "Creating MegaRAID VD: /c$ctrl add vd type=$level drives=$drivesArg strip=$strip"
 
-    $result = Invoke-StorCliCommand -StorCliPath $StorCliPath -Arguments @("/c$ctrl", 'add', 'vd', "type=$level", "drives=$drivesArg", "strip=$strip") -TimeoutSeconds 90
+    $result = Invoke-StorCliSafe -StorCliPath $StorCliPath -Arguments @("/c$ctrl", 'add', 'vd', "type=$level", "drives=$drivesArg", "strip=$strip") -TimeoutSeconds 90
     if ($result.Success -and ($result.Output -match 'Success|Operation\s+\:\s*Success')) {
         Write-ColorOutput '  MegaRAID VD created.' 'Green'
         Write-RaidLog 'MegaRAID VD created successfully.'
@@ -999,7 +999,7 @@ function Select-NvidiaDriverForModel {
     }
     # Legacy low-end Kepler (GT 710/730, GT 6xx/7xx) -> R470 (47x.xx), the last
     # branch that still supports Kepler. Newer drivers refuse these cards.
-    elseif ($m -match '(?i)\bGT\s*7\d0\b|\bGT\s*6\d0\b|\bGT\s*710\b') {
+    elseif ($m -match '(?i)\bGT[-\s]*7\d0\b|\bGT[-\s]*6\d0\b|\bGT[-\s]*710\b') {
         $pick = $exes | Where-Object { $_.Name -match '^47\d\.' } |
                 Sort-Object Length -Descending | Select-Object -First 1
         if ($pick) { return $pick }
@@ -1023,9 +1023,29 @@ function Install-NvidiaDriverIfNeeded {
     # переключается с Basic на NVIDIA без ребута).
     param([string]$UsbRoot)
 
-    if ((Get-NvidiaGpuLines).Count -gt 0) {
-        Write-ColorOutput '  NVIDIA driver already active - install skipped.' 'Gray'
+    # Приёмка 28.08.2026: в системе должна быть не только рабочая карта, но и
+    # Панель управления NVIDIA, причём нашей версии. Голый INF (из образа или из
+    # Windows Update) даёт драйвер БЕЗ панели и обычно старее нашего пакета -
+    # поэтому "драйвер уже активен" больше не повод пропускать установку.
+    # Признак того, что отработал именно НАШ полный инсталлятор - наличие панели:
+    # MSIX-приложение для DCH-драйверов либо классический nvcplui.exe.
+    $panelPresent = $false
+    try {
+        if (Get-AppxPackage -AllUsers -Name 'NVIDIACorp.NVIDIAControlPanel' -ErrorAction SilentlyContinue) { $panelPresent = $true }
+    } catch {}
+    if (-not $panelPresent) {
+        $nvcplui = Join-Path $env:ProgramFiles 'NVIDIA Corporation\Control Panel Client\nvcplui.exe'
+        if (Test-Path -LiteralPath $nvcplui) { $panelPresent = $true }
+    }
+
+    $driverActive = ((Get-NvidiaGpuLines).Count -gt 0)
+    if ($driverActive -and $panelPresent) {
+        Write-ColorOutput '  NVIDIA driver + Control Panel already present - install skipped.' 'Gray'
         return
+    }
+    if ($driverActive) {
+        Write-ColorOutput '  NVIDIA driver active but Control Panel missing (INF-only driver) - installing full package.' 'Yellow'
+        Write-RaidLog 'NVIDIA: driver present without Control Panel - forcing full package install.'
     }
 
     # Read the declared GPU model from the SL config so the RIGHT driver branch
@@ -1072,6 +1092,58 @@ function Install-NvidiaDriverIfNeeded {
     } catch {
         Write-ColorOutput "  NVIDIA driver install failed (non-fatal): $_" 'Yellow'
         Write-RaidLog "NVIDIA driver install threw: $_"
+    }
+
+    # Панель управления NVIDIA для DCH-драйверов - ОТДЕЛЬНОЕ MSIX-приложение, а не
+    # часть драйвера. Установщик с -s регистрирует его не всегда, а Microsoft Store
+    # на изолированной сети 10.0.6.x недоступен - отсюда тост "Не найдена Панель
+    # управления NVIDIA" при exit=0 у драйвера (приёмка 30.08.2026).
+    # Комплект для ОФЛАЙН-развёртывания лежит ВНУТРИ пакета, в Display.Driver\NVCPL:
+    # <hash>.appx + <hash>_License1.xml. Берём его оттуда, куда распаковался
+    # установщик (C:\NVIDIA), а если он прибрался - из заранее извлечённой копии
+    # рядом с драйвером (software\docs\drivers\NVCPL).
+    if (-not (Get-AppxPackage -AllUsers -Name 'NVIDIACorp.NVIDIAControlPanel' -ErrorAction SilentlyContinue)) {
+        $nvcplAppx = $null
+        if (Test-Path -LiteralPath 'C:\NVIDIA') {
+            $nvcplAppx = Get-ChildItem -LiteralPath 'C:\NVIDIA' -Recurse -Filter '*.appx' -ErrorAction SilentlyContinue |
+                         Where-Object { $_.DirectoryName -match '(?i)NVCPL' } | Select-Object -First 1
+        }
+        if (-not $nvcplAppx) {
+            $preExtracted = Join-Path (Split-Path $nvExe.FullName -Parent) 'NVCPL'
+            if (Test-Path -LiteralPath $preExtracted) {
+                $nvcplAppx = Get-ChildItem -LiteralPath $preExtracted -Filter '*.appx' -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
+        }
+
+        if ($nvcplAppx) {
+            $nvcplLic = Get-ChildItem -LiteralPath $nvcplAppx.DirectoryName -Filter '*_License*.xml' -ErrorAction SilentlyContinue | Select-Object -First 1
+            Write-ColorOutput "  Registering NVIDIA Control Panel offline: $($nvcplAppx.Name)" 'Yellow'
+            Write-RaidLog ("NVCPL appx: {0} ; license: {1}" -f $nvcplAppx.FullName, $(if ($nvcplLic) { $nvcplLic.Name } else { '<none>' }))
+            try {
+                if ($nvcplLic) {
+                    Add-AppxProvisionedPackage -Online -PackagePath $nvcplAppx.FullName -LicensePath $nvcplLic.FullName -ErrorAction Stop | Out-Null
+                } else {
+                    Add-AppxProvisionedPackage -Online -PackagePath $nvcplAppx.FullName -SkipLicense -ErrorAction Stop | Out-Null
+                }
+                Write-ColorOutput '  NVIDIA Control Panel provisioned (all users).' 'Green'
+                Write-RaidLog 'NVCPL provisioned OK.'
+            } catch {
+                Write-ColorOutput "  NVCPL provisioning failed (non-fatal): $_" 'Yellow'
+                Write-RaidLog "NVCPL provisioning failed: $_"
+            }
+            # Provisioning действует на профили, создаваемые ПОСЛЕ него, а профиль
+            # текущего пользователя уже существует - регистрируем и в нём.
+            try {
+                Add-AppxPackage -Path $nvcplAppx.FullName -ErrorAction Stop
+                Write-ColorOutput '  NVIDIA Control Panel registered for current user.' 'Green'
+                Write-RaidLog 'NVCPL registered for current user.'
+            } catch {
+                Write-RaidLog "NVCPL per-user register failed (provisioning still applies): $_"
+            }
+        } else {
+            Write-ColorOutput '  NVCPL appx not found - Control Panel will stay missing.' 'Yellow'
+            Write-RaidLog 'NVCPL appx not found under C:\NVIDIA nor next to the installer.'
+        }
     }
 
     Start-Sleep -Seconds 10   # дать драйверу подхватиться перед nvidia-smi ниже
@@ -1204,7 +1276,10 @@ try {
         } else {
             Write-ColorOutput "  mb search string: '$mbSearch' ; $($problemDevs.Count) device(s) without a driver." 'Gray'
             $toTokens = { param($t) @((($t -replace '[^A-Za-z0-9]+',' ').ToUpper() -split '\s+') | Where-Object { $_ -and $_.Length -ge 2 }) }
-            $wantTokens = & $toTokens $mbSearch
+            # Dedupe: several configs repeat the vendor inside mb_model ('ASUS' + 'Asus PRIME
+            # Z790-P'), and a duplicated token would otherwise satisfy the >=2 rule on the
+            # vendor name alone.
+            $wantTokens = @((& $toTokens $mbSearch) | Select-Object -Unique)
             $platformsDir = $null
             foreach ($pd in @((Join-Path $usbRoot 'drivers\platforms'), 'C:\IPDROM\drivers\platforms')) {
                 if (Test-Path -LiteralPath $pd) { $platformsDir = $pd; break }
@@ -1213,14 +1288,44 @@ try {
             if ($platformsDir) {
                 foreach ($folder in (Get-ChildItem -LiteralPath $platformsDir -Directory -ErrorAction SilentlyContinue)) {
                     $ft = & $toTokens $folder.Name
-                    $matched = @($wantTokens | Where-Object { $ft -contains $_ }).Count
-                    if ($matched -ge 2 -and $matched -gt $bestScore) { $bestScore = $matched; $bestDir = $folder.FullName }
+                    $hit = @($wantTokens | Where-Object { $ft -contains $_ })
+                    # At least one matched token must carry a digit (i.e. a model number), not
+                    # just vendor/family words. Without this an unknown board like
+                    # 'ASUS PRIME Z890-QWE' matches ASUS_PRIME_Z690M-PLUS_D4 on ASUS+PRIME
+                    # alone - harmless when packs were only copied to the flash, but this step
+                    # INSTALLS them into the OS, so a wrong-generation chipset pack must not win.
+                    $hasNum = @($hit | Where-Object { $_ -match '\d' }).Count
+                    if ($hit.Count -ge 2 -and $hasNum -ge 1 -and $hit.Count -gt $bestScore) { $bestScore = $hit.Count; $bestDir = $folder.FullName }
                 }
             }
             if (-not $bestDir) {
                 Write-ColorOutput "  No platform pack matched '$mbSearch' in $platformsDir - skipping." 'Gray'
             } else {
                 Write-ColorOutput "  Installing platform pack: $(Split-Path $bestDir -Leaf)" 'Yellow'
+                # Pre-trust the pack's driver signers. pnputil raises a modal "Would you like to
+                # install this device software?" for any publisher missing from Trusted Publishers,
+                # and that modal HALTS the unattended run - it did exactly that on SL111111-012,
+                # whose pack (SuperMicro_X13SAE-F) is a stub holding one C-MEDIA/ASUS sound driver.
+                # Importing the .cat signers first makes every pack install non-interactively.
+                # NOTE: do NOT gate on pack layout/size - SL111111-001 proved the legacy ASUS pack
+                # is genuinely useful (44 INFs, cleaned 6 unknown devices), so packs must not be
+                # skipped just for looking different.
+                try {
+                    $seenThumb = @{}
+                    $tpStore = New-Object System.Security.Cryptography.X509Certificates.X509Store 'TrustedPublisher','LocalMachine'
+                    $tpStore.Open('ReadWrite')
+                    foreach ($cat in (Get-ChildItem -LiteralPath $bestDir -Recurse -Filter *.cat -ErrorAction SilentlyContinue)) {
+                        $signer = (Get-AuthenticodeSignature -LiteralPath $cat.FullName -ErrorAction SilentlyContinue).SignerCertificate
+                        if ($signer -and -not $seenThumb.ContainsKey($signer.Thumbprint)) {
+                            $seenThumb[$signer.Thumbprint] = $true
+                            try { $tpStore.Add($signer) } catch {}
+                        }
+                    }
+                    $tpStore.Close()
+                    Write-ColorOutput "  Pre-trusted $($seenThumb.Count) driver signer(s) - pnputil will not prompt." 'Gray'
+                } catch {
+                    Write-ColorOutput "  WARNING: could not pre-trust driver signers: $($_.Exception.Message)" 'Yellow'
+                }
                 $infArg = Join-Path $bestDir '*.inf'
                 $out = & pnputil.exe /add-driver "$infArg" /subdirs /install 2>&1
                 Write-ColorOutput "  pnputil /add-driver exit=$LASTEXITCODE ($(@($out).Count) line(s) of output)." 'Gray'

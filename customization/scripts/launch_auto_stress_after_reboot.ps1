@@ -60,6 +60,25 @@ function Exit-Cleanly {
     exit $Code
 }
 
+# Снимает вечный автовход, взведённый register_auto_stress_after_reboot.ps1, чтобы
+# машина уезжала к заказчику на обычный экран входа, а не логинилась сама
+# беспарольным администратором.
+# Идемпотентна и вызывается из ДВУХ мест - это принципиально: auto_stress_test.ps1
+# в конце сам инициирует перезагрузку через 10 с, и вызов после его возврата
+# выигрывает гонку не всегда (SL111111-010, 30.08.2026: ребут успел первым, автовход
+# остался взведён). Второй вызов - на раннем выходе по флагу завершения - закрывает
+# этот случай на следующей загрузке.
+function Disable-PerpetualAutoLogon {
+    try {
+        $winlogon = 'Registry::HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+        Set-ItemProperty    -LiteralPath $winlogon -Name 'AutoAdminLogon'  -Value '0' -Type String -Force -ErrorAction SilentlyContinue
+        Remove-ItemProperty -LiteralPath $winlogon -Name 'DefaultPassword' -Force -ErrorAction SilentlyContinue
+        Write-LauncherLog 'Perpetual auto-logon disarmed (delivery-ready).'
+    } catch {
+        Write-LauncherLog "WARNING: failed to disarm auto-logon: $($_.Exception.Message)"
+    }
+}
+
 # Recreate F: alias if InstallRoot is local (subst is per-session and can be lost on reboot)
 function Ensure-SubstF {
     param([string]$Target)
@@ -172,6 +191,10 @@ if ((Test-Path -LiteralPath $finishedFile -ErrorAction SilentlyContinue) -or
     (Test-Path -LiteralPath $oldDoneFlag  -ErrorAction SilentlyContinue)) {
     Write-LauncherLog 'Stress test already completed. Unregistering task and exiting.'
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    # Оба флага ставятся только при успешно завершённом конвейере (флаг пишет
+    # ffu_trigger уже после 'Pipeline healthy'), поэтому машина здесь заведомо
+    # delivery-ready и автовход обязан быть снят.
+    Disable-PerpetualAutoLogon
     Exit-Cleanly 0
 }
 
@@ -247,14 +270,7 @@ try {
         # normal sign-in screen (no blank-password auto-logon left enabled). On
         # failure we deliberately leave it on so the operator keeps a desktop across
         # reboots while investigating.
-        try {
-            $winlogon = 'Registry::HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
-            Set-ItemProperty    -LiteralPath $winlogon -Name 'AutoAdminLogon'  -Value '0' -Type String -Force -ErrorAction SilentlyContinue
-            Remove-ItemProperty -LiteralPath $winlogon -Name 'DefaultPassword' -Force -ErrorAction SilentlyContinue
-            Write-LauncherLog 'Perpetual auto-logon disarmed (delivery-ready).'
-        } catch {
-            Write-LauncherLog "WARNING: failed to disarm auto-logon: $($_.Exception.Message)"
-        }
+        Disable-PerpetualAutoLogon
         (Get-Date).ToString('o') | Out-File -FilePath $finishedFile -Encoding ascii -Force
         Exit-Cleanly 0
     }

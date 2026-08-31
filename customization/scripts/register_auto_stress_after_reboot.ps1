@@ -84,7 +84,7 @@ Register-ScheduledTask `
 try {
     $winlogon = 'Registry::HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
     Set-ItemProperty -LiteralPath $winlogon -Name 'AutoAdminLogon'    -Value '1'               -Type String -Force
-    Set-ItemProperty -LiteralPath $winlogon -Name 'DefaultUserName'   -Value 'IPDROM'          -Type String -Force
+    Set-ItemProperty -LiteralPath $winlogon -Name 'DefaultUserName'   -Value 'Admin'           -Type String -Force
     Set-ItemProperty -LiteralPath $winlogon -Name 'DefaultDomainName' -Value $env:COMPUTERNAME -Type String -Force
     Set-ItemProperty -LiteralPath $winlogon -Name 'DefaultPassword'   -Value ''                -Type String -Force
     Remove-ItemProperty -LiteralPath $winlogon -Name 'AutoLogonCount' -Force -ErrorAction SilentlyContinue

@@ -146,8 +146,8 @@
 			<UserAccounts>
 				<LocalAccounts>
 					<LocalAccount wcm:action="add">
-						<Name>IPDROM</Name>
-						<DisplayName></DisplayName>
+						<Name>Admin</Name>
+						<DisplayName>IPDROM</DisplayName>
 						<Group>Administrators</Group>
 						<Password>
 							<Value></Value>
@@ -157,7 +157,7 @@
 				</LocalAccounts>
 			</UserAccounts>
 			<AutoLogon>
-				<Username>IPDROM</Username>
+				<Username>Admin</Username>
 				<Enabled>true</Enabled>
 				<LogonCount>1</LogonCount>
 				<Password>
@@ -414,23 +414,29 @@ function Mount-PxeIfNeeded {
         if (Test-Connection 10.0.6.42 -Count 1 -Quiet -ErrorAction SilentlyContinue) { break }
         Start-Sleep -Seconds 2
     }
-    # If F: is currently taken by a USB volume (typically IPDROM auto-mounted
-    # after WinPE format), move it to a high letter so F: is free for SMB mount.
+    # F: must be free: the SMB mount below AND the later 'subst F:' both need it.
+    # This used to move a volume off F: ONLY when that volume sat on a USB disk,
+    # so any other holder (internal partition, stale mapping) left F: busy and
+    # net use died with "System error 85 - local device name already in use",
+    # aborting the whole customization (SL111111-009, 2026-08-24: "FATAL: no
+    # customization script found anywhere" -> no drivers, no tests, nothing).
+    # Now: drop a stale mapping first, then move whatever partition holds F:,
+    # and log the holder if F: somehow stays busy.
     try {
+        &amp; net use F: /delete /y 2&gt;&amp;1 | Out-Null
         $part = Get-Partition -DriveLetter F -ErrorAction SilentlyContinue
         if ($part) {
-            $disk = Get-Disk -Number $part.DiskNumber -ErrorAction SilentlyContinue
-            if ($disk -and $disk.BusType -eq 'USB') {
-                foreach ($newLtr in 'XWQPONMKJIH'.ToCharArray()) {
-                    if (-not (Get-Volume -DriveLetter $newLtr -ErrorAction SilentlyContinue)) {
-                        Set-Partition -DiskNumber $part.DiskNumber -PartitionNumber $part.PartitionNumber -NewDriveLetter $newLtr -ErrorAction SilentlyContinue
-                        W "Moved USB volume from F: to ${newLtr}: to free F: for SMB mount."
-                        break
-                    }
+            foreach ($newLtr in 'XWQPONMKJIH'.ToCharArray()) {
+                if (-not (Get-Volume -DriveLetter $newLtr -ErrorAction SilentlyContinue)) {
+                    Set-Partition -DiskNumber $part.DiskNumber -PartitionNumber $part.PartitionNumber -NewDriveLetter $newLtr -ErrorAction SilentlyContinue
+                    W "Moved volume from F: to ${newLtr}: to free F: for SMB mount."
+                    break
                 }
             }
         }
-    } catch { W "Failed to check/move F: - $($_.Exception.Message)" }
+        $stillF = Get-Volume -DriveLetter F -ErrorAction SilentlyContinue
+        if ($stillF) { W "WARN: F: still occupied (label='$($stillF.FileSystemLabel)' type='$($stillF.DriveType)') - SMB mount may fail." }
+    } catch { W "Failed to free F: - $($_.Exception.Message)" }
     &amp; net use F: \\10.0.6.42\winpxe\common /user:pxe pxe /persistent:no 2&gt;&amp;1 | Out-String | ForEach-Object { W $_ }
 }
 

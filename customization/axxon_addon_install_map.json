@@ -23,6 +23,7 @@
     "Агент контроля":                    ["_TODO_no_monitoring_addon"],
     "Пакет аналитики VI":                ["_TODO_no_addon_on_server"],
     "Пакет аналитики VI / Базовый пакет DetectorPack": ["detector"],
+    "Пакет аналитики VI vi_face_recongnition": ["_TODO_no_addon_on_server"],
     "-":                                 [],
 
     "_acfa_features_note": "Module Win (Title из ACFA MSI) -> acfa_feature:<feature_id>. Резолвится роутером в base.acfa.modules (ADDLOCAL для ACFA MSI). Извлечено из ACFA Intellect 7.7 (только _ru локализация + категории-контейнеры). Чтобы добавить - смотри 'msiexec /a Product.msi /qb' или скрипт из C:\\Temp\\acfa_features.txt.",
@@ -163,7 +164,9 @@
     "Интеллект ACFA":                                  ["acfa"],
 
     "Face-ИнтеллектХ face_recognition":                ["face_recognition"],
-    "Face-ИнтеллектХ face_recognition/ Детектор Пак":  ["face_recognition", "vl_face_recognition"],
+    "Face-ИнтеллектХ face_recognition/ Детектор Пак":  ["face_recognition"],
+    "_DISABLED_2026-08-26__Face-ИнтеллектХ face_recognition/ Детектор Пак": ["face_recognition", "vl_face_recognition"],
+    "_DISABLED_2026-08-26__why": "vl_face_recognition (DetectorPack-Addon-VL-Face-Recognition) and face_recognition (DetectorPack-Addon-Face-Recognition-Pack) are MUTUALLY EXCLUSIVE face engines. Installing both made the VL installer raise a modal 'DetectorPack Addon Face Recognition Pack is already installed' that hung the unattended run for 77 min on SL111111-013 (first IntellectX config with face recognition). Kept face_recognition per Ilya 2026-08-26. Original value preserved above - restore it if the licence line ever needs the VL engine instead.",
 
     "Детектор Пак - Пакет аналитики распознавания номеров RR rr_lpr/ Детектор Пак": ["rr_lpr"],
     "Детектор Пак - Пакет аналитики распознавания номеров VT vt_lpr/ Детектор Пак": ["vt_lpr"],
@@ -171,6 +174,12 @@
     "Детектор подсчета толпы TV":                      ["tva_crowd"],
     "Нейропак vl_analytics/ Детектор Пак":             ["vl_analytics"],
     "Пакет нейроаналитики/ Детектор Пак":              ["neuro_pack"],
+
+    "Пакет аналитики VI":                              ["vi"],
+    "Пакет аналитики VI / Базовый пакет DetectorPack":  ["vi"],
+    "Пакет аналитики VI vi_face_recongnition":         ["vi_face_recongnition"],
+    "_vi_note": "Имя аддона на сервере действительно 'vi_face_recongnition' (опечатка в исходном каталоге AxxonSoft) - менять нельзя, это имя подпапки в addons/. 'vi' = базовый пакет аналитики Видеоинтеллект, 'vi_face_recongnition' = его модуль распознавания лиц; это разные аддоны одного пакета, а не взаимоисключающие движки (в отличие от face_recognition / vl_face_recognition, см. _DISABLED_2026-08-26__why выше).",
+
     "Мониторинг":                                      ["_TODO_no_monitoring_addon"]
   },
 

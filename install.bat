@@ -33,7 +33,7 @@ echo === Версия: %WINVER% ===
 set "SL=UNKNOWN"
 if exist "%STAGE%\slid.txt" set /p SL=<"%STAGE%\slid.txt"
 echo === Конфигурация SL: %SL% ===
-echo === [BUILD 2026-08-19-c revert-testtime] ===
+echo === [BUILD 2026-08-24-a flashfix-v2] ===
 
 echo === Монтирование SMB-шары (10 попыток со сбросом состояния) ===
 set RETRIES=0
@@ -240,7 +240,8 @@ echo === Форматирование диска %RECDISK% [WINRE + IpdromREC] =
 (
   echo select disk %RECDISK%
   echo clean
-  echo convert gpt
+  echo rescan
+  echo select disk %RECDISK%
   echo create partition primary size=1536
   echo format fs=fat32 label="WINRE" quick
   echo assign
@@ -283,8 +284,10 @@ echo === Форматирование диска %DOCSDISK% как IPDROM ===
 (
   echo select disk %DOCSDISK%
   echo clean
+  echo rescan
+  echo select disk %DOCSDISK%
   echo create partition primary
-  echo format fs=ntfs quick
+  echo format fs=ntfs quick label="IPDROM"
   echo assign letter=Q
   echo exit
 ) > X:\docs_format.txt
@@ -293,12 +296,9 @@ if errorlevel 1 (
   echo *** diskpart DOCS failed with errorlevel %errorlevel% ***
   goto DOCS_END
 )
-:: Verify Q: actually got assigned before touching format.com
-if not exist Q:\ (
-  echo *** Q: не назначен diskpart, форматирование прервано ***
-  goto DOCS_END
-)
-echo [docs] diskpart OK. Применяю метку IPDROM через format.com...
+:: НЕ прерываемся, если Q:\ ещё RAW - diskpart quick-format иногда оставляет
+:: том RAW; format.com ниже штатно форматирует его и ставит метку IPDROM.
+echo [docs] Применяю формат+метку IPDROM через format.com...
 format Q: /q /fs:ntfs /v:IPDROM /y
 if errorlevel 1 (
   echo *** format.com не сработал, пробую команду label ***

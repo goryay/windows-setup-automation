@@ -1088,8 +1088,16 @@ if (Test-Path $script:Aida64FullPath) {
     # Поэтому повторные попытки идут с обрезанным сканированием:
     #   /SAFE   - без низкоуровневого PCI/SMBus/sensor-скана
     #   /SAFEST - вообще без загрузки kernel-драйверов (последний шанс)
+    # /SAFE отключает только низкоуровневый скан, но НЕ урезает набор страниц.
+    # Поэтому первая же повторная попытка идёт полным набором страниц с /SAFE:
+    # получаем полноценный отчёт (без показаний датчиков) вместо сводки на 11 КБ.
     if (-not $actualReport) {
-        Write-Log "Full AIDA64 report did not complete - retrying summary in Safe Mode (/SAFE, no low-level scan)." 'Yellow'
+        Write-Log "Full AIDA64 report did not complete - retrying FULL page set in Safe Mode (/SAFE, no low-level scan)." 'Yellow'
+        $actualReport = Invoke-AidaReport -Exe $script:Aida64FullPath -OutFile $reportPath `
+            -PageArgs @('/ALL', '/SUM', '/HW', '/SW', '/AUDIT', '/SAFE') -TimeoutSec 240 -Label 'full_safe'
+    }
+    if (-not $actualReport) {
+        Write-Log "Full page set in Safe Mode failed too - falling back to summary only (/SUM /SAFE)." 'Yellow'
         $actualReport = Invoke-AidaReport -Exe $script:Aida64FullPath -OutFile $reportPath `
             -PageArgs @('/SUM', '/SAFE') -TimeoutSec 120 -Label 'summary_safe'
     }

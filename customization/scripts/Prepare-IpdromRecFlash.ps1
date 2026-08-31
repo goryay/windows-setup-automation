@@ -267,6 +267,32 @@ if ($rdoOrig) {
 # Wipe staging dir from system disk so it isn't in the captured FFU
 Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
 L "Removed staging dir: $stageDir"
+
+# Shrink the system disk before DISM /Capture-Ffu. FFU images every allocated cluster,
+# so leftovers land in restore.ffu and can overflow the IpdromREC partition: on
+# SL111111-009 the capture died with "Error 112 - not enough disk space" (56.2 GB
+# partition) because C: held 95.5 GB, of which Windows.old 40.9 GB + pagefile.sys 16 GB
+# + fio_tests 1 GB were pure waste. WinPE can delete all of it - Windows is offline here,
+# so no ACL/in-use blocks - and Windows recreates pagefile.sys on the next boot from its
+# own registry setting. NOTE: Windows.old only exists when the system partition was not
+# wiped during install; this is a safety net, not a substitute for a clean install.
+$freedGb = 0
+foreach ($junk in @('Windows.old','pagefile.sys','hiberfil.sys','swapfile.sys','fio_tests')) {
+    $p = Join-Path $SysDrive $junk
+    if (-not (Test-Path -LiteralPath $p)) { continue }
+    $sz = 0
+    try { $sz = (Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum } catch {}
+    if (-not $sz) { try { $sz = (Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue).Length } catch {} }
+    Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $p) {
+        L ("  WARN: could not remove {0}" -f $p)
+    } else {
+        $g = [math]::Round($sz/1GB,2)
+        $freedGb += $g
+        L ("  Removed {0} ({1} GB)" -f $p, $g)
+    }
+}
+L ("Pre-capture cleanup freed ~{0} GB." -f [math]::Round($freedGb,2))
 L "Cleanup-CaptureStaging completed."
 exit 0
 '@

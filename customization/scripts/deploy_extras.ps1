@@ -18,14 +18,19 @@ W ("SLConfigPath: " + $(if ($SLConfigPath) { $SLConfigPath } else { '<none>' }))
 
 # =============================================================================
 # Find the DOCS flash. Two paths:
-#   (1) Existing IPDROM-labeled volume  -> just use it (operator prepared it).
-#   (2) No IPDROM volume  -> autoformat: pick a small USB flash (8..32 GB) that
-#       is unlabeled / RAW / empty and format it as IPDROM NTFS. This lets the
-#       operator skip WinPE prompts entirely, or recover from a failed WinPE
-#       diskpart. Refuses if 0 or >1 candidates - safer than guessing.
+#   (1) Existing IPDROM-labeled volume  -> just use it. THIS is the primary path
+#       and honors the operator's WinPE choice: install.bat labels the chosen DOCS
+#       flash 'IPDROM' (and the REC flash 'IpdromREC'), so ANY size works here.
+#   (2) No IPDROM volume  -> autoformat fallback: pick a USB flash (8..64 GB) that
+#       is unlabeled / RAW / empty and format it as IPDROM NTFS. This recovers from
+#       a skipped/failed WinPE DOCS step. It stays safe despite the size overlap
+#       with REC because: it only takes UNLABELED flashes (a labeled IpdromREC is
+#       skipped), it REFUSES on >1 candidate, and deploy_extras runs BEFORE
+#       Prepare-IpdromRecFlash - so a blank flash claimed here as IPDROM is no
+#       longer a REC candidate, leaving the IpdromREC flash for the FFU step.
 # =============================================================================
 $DOCS_MIN_GB = 8
-$DOCS_MAX_GB = 32     # anything >=32 GB is a REC candidate, not DOCS
+$DOCS_MAX_GB = 64     # DOCS flashes are up to 64 GB (nominal); a "64 GB" stick reports ~58-60 GB actual
 
 function Find-IpdromDocsVolume {
     # Volume + not-subst filter: subst F: -> C:\IPDROM doesn't register as a
@@ -74,8 +79,23 @@ if (-not $vol) {
         exit 0
     }
     if ($candidates.Count -gt 1) {
-        W "Multiple ($($candidates.Count)) candidates - refuse to guess. Unplug extras and rerun."
-        exit 0
+        # Two (or more) BLANK flashes is the normal production case when the WinPE
+        # formatting step failed and wiped both. Refusing here used to deadlock the whole
+        # delivery: deploy_extras made no DOCS flash, and Prepare-IpdromRecFlash then saw
+        # the same indistinguishable blanks and refused as well -> no FFU either.
+        # Pick deterministically instead: SMALLEST flash first (tie -> lowest disk number).
+        # Smallest-first matters when the flashes differ in size: the REC step needs >=32 GB,
+        # so taking the small one for DOCS always leaves a REC-capable flash behind (taking
+        # the big one could strand a <32 GB flash that REC would then reject -> no FFU).
+        # Safe: every candidate already passed the "blank/unlabeled/RAW" filter, so a flash
+        # carrying data is never touched. And since deploy_extras runs BEFORE
+        # Prepare-IpdromRecFlash ([6.6] vs [6.7]), labelling this one IPDROM leaves exactly
+        # one candidate for the REC step, which then proceeds normally.
+        $chosen = ($candidates | Sort-Object Size, Number)[0]
+        $others = @($candidates | Where-Object { $_.Number -ne $chosen.Number } | ForEach-Object { "Disk $($_.Number)" })
+        W ("Multiple ({0}) blank candidates - picking smallest: Disk {1} ({2} GB). Left for the REC step: {3}." -f `
+            $candidates.Count, $chosen.Number, [math]::Round($chosen.Size/1GB,1), ($others -join ', '))
+        $candidates = @($chosen)
     }
 
     $docs = $candidates[0]
@@ -332,10 +352,15 @@ function Select-NvidiaDriverForModel {
     if ($exes.Count -eq 0) { return $null }
     if ($exes.Count -eq 1) { return $exes[0] }
     $m = "$GpuModel"
-    if ($m -match '(?i)\bquadro\b|\bnvs\b') {
+    # ДЕРЖАТЬ СИНХРОННЫМ с Select-NvidiaDriverForModel в auto_stress_test.ps1.
+    # NVIDIA отказалась от имени "Quadro": современные проф-карты называются
+    # "RTX A<nnn>" (Ampere: A400/A2000/A4000), "RTX <nnnn> Ada Generation" и
+    # "T<nnn>" (Turing). Без этих шаблонов RTX A400 проваливалась в ветку GeForce
+    # и на флешку уезжал 475.14-desktop вместо 596.59-quadro (приёмка 28.08.2026).
+    if ($m -match '(?i)\bquadro\b|\bnvs\b|\bRTX\s*A\d|\bT\d{3,4}\b|Ada\s+Generation') {
         $pick = $exes | Where-Object { $_.Name -match '(?i)quadro|rtx' } | Sort-Object Length -Descending | Select-Object -First 1
         if ($pick) { return $pick }
-    } elseif ($m -match '(?i)\bGT\s*7\d0\b|\bGT\s*6\d0\b|\bGT\s*710\b') {
+    } elseif ($m -match '(?i)\bGT[-\s]*7\d0\b|\bGT[-\s]*6\d0\b|\bGT[-\s]*710\b') {
         $pick = $exes | Where-Object { $_.Name -match '^47\d\.' } | Sort-Object Length -Descending | Select-Object -First 1
         if ($pick) { return $pick }
     }
