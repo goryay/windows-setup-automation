@@ -45,7 +45,13 @@ $bootFile      = Join-Path $stateDir 'RegisteredBootTime.txt'
 $lockFile      = Join-Path $stateDir 'StressStarted.lock'
 $failedFile    = Join-Path $stateDir 'StressFailed.txt'
 $finishedFile  = Join-Path $stateDir 'StressFinished.txt'
+$attemptsFile  = Join-Path $stateDir 'StressAttempts.txt'
 $oldDoneFlag   = Join-Path $env:ProgramData 'IPDROM_StressTest_Completed.flag'
+
+# Сколько раз подряд поднимаем тест заново, если машина перезагрузилась ПОСРЕДИ
+# прогона. Больше трёх попыток смысла не имеет: если машина валится каждый раз,
+# это дефект стенда, а не случайный сбой, и её надо смотреть руками.
+$maxResumeAttempts = 3
 
 function Write-LauncherLog {
     param([string]$Message)
@@ -58,6 +64,17 @@ function Exit-Cleanly {
     param([int]$Code = 0)
     Write-LauncherLog "Launcher exit code: $Code"
     exit $Code
+}
+
+# Закрывает цепочку автоподъёма: снимает задачу и маркеры незавершённой работы.
+# Вызывается на любом исходе, когда auto_stress_test.ps1 ВЕРНУЛ код - хоть ноль,
+# хоть ошибку. Вернул код - значит отработал, а не оборвался, и поднимать его
+# заново нельзя: упавший тест упадёт снова, а успешный уже всё сделал.
+function Close-ResumeChain {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $pendingFile  -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $attemptsFile -Force -ErrorAction SilentlyContinue
+    Write-LauncherLog 'Resume chain closed (task unregistered, pending/attempt markers removed).'
 }
 
 # Снимает вечный автовход, взведённый register_auto_stress_after_reboot.ps1, чтобы
@@ -214,17 +231,67 @@ if (Test-Path -LiteralPath $bootFile -ErrorAction SilentlyContinue) {
     }
 }
 
+# === ВОЗОБНОВЛЕНИЕ ПОСЛЕ ОБРЫВА (01.10.2026, претензия производства) ===
+# Раньше замок проверялся ТОЛЬКО по возрасту: моложе 36 часов - выходим. Из-за
+# этого перезагрузка посреди прогона убивала тест насовсем: задача к тому моменту
+# уже снята с расписания (см. ниже), PendingAfterReboot.txt удалён, а замок ещё
+# свежий. Машина поднималась, автоматически входила и просто стояла.
+#
+# Теперь в замок пишется ВРЕМЯ ЗАГРУЗКИ, в которой он поставлен:
+#   та же загрузка  -> рядом действительно работает тест, уходим молча;
+#   прошлая загрузка -> прогон оборвался вместе с машиной (BSOD, сторож, сброс
+#                       по питанию, ручная перезагрузка) - блок finally в том
+#                       процессе не отработал, поэтому замок и остался.
+# Во втором случае поднимаем тест заново, считая попытки.
+#
+# ВАЖНО и честно: AIDA64/FurMark/FIO не умеют продолжаться с середины. "Возобновление"
+# здесь означает ПОЛНЫЙ ПЕРЕЗАПУСК теста, а не досчёт остатка.
+$currentBootIso = ((Get-CimInstance Win32_OperatingSystem).LastBootUpTime).ToString('o')
+
 if (Test-Path -LiteralPath $lockFile -ErrorAction SilentlyContinue) {
-    $ageHours = ((Get-Date) - (Get-Item -LiteralPath $lockFile).LastWriteTime).TotalHours
-    if ($ageHours -lt 36) {
-        Write-LauncherLog "StressStarted.lock exists and is not stale ($([math]::Round($ageHours, 2)) h). Exiting."
+    $lockLines = @(Get-Content -LiteralPath $lockFile -ErrorAction SilentlyContinue)
+    $lockBoot  = if ($lockLines.Count -ge 2) { "$($lockLines[1])".Trim() } else { '' }
+
+    if ($lockBoot -and $lockBoot -eq $currentBootIso) {
+        Write-LauncherLog 'StressStarted.lock belongs to the CURRENT boot session - test is already running. Exiting.'
         Exit-Cleanly 0
     }
-    Write-LauncherLog 'Removing stale StressStarted.lock.'
+
+    # Замок без строки с временем загрузки - это замок, оставленный прежней
+    # версией лончера. Возраст - единственное, чем его можно оценить.
+    if (-not $lockBoot) {
+        $ageHours = ((Get-Date) - (Get-Item -LiteralPath $lockFile).LastWriteTime).TotalHours
+        if ($ageHours -lt 36) {
+            Write-LauncherLog "Legacy StressStarted.lock without boot stamp, age $([math]::Round($ageHours, 2)) h - treating as running. Exiting."
+            Exit-Cleanly 0
+        }
+        Write-LauncherLog 'Legacy StressStarted.lock is stale (>36 h) - treating the run as interrupted.'
+    }
+
+    $attempts = 0
+    if (Test-Path -LiteralPath $attemptsFile -ErrorAction SilentlyContinue) {
+        $raw = (Get-Content -LiteralPath $attemptsFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        [void][int]::TryParse("$raw".Trim(), [ref]$attempts)
+    }
+    $attempts++
+
+    if ($attempts -gt $maxResumeAttempts) {
+        Write-LauncherLog "Stress test was interrupted $($attempts - 1) time(s); resume limit $maxResumeAttempts reached. NOT restarting."
+        "Stress test interrupted $($attempts - 1) time(s), resume limit $maxResumeAttempts reached - giving up at $(Get-Date -Format 's')" |
+            Out-File -FilePath $failedFile -Encoding utf8 -Force
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $pendingFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $lockFile    -Force -ErrorAction SilentlyContinue
+        Exit-Cleanly 1
+    }
+
+    "$attempts" | Out-File -FilePath $attemptsFile -Encoding ascii -Force
+    Write-LauncherLog "Stress test was INTERRUPTED by a restart (lock stamped with boot '$lockBoot', current boot '$currentBootIso')."
+    Write-LauncherLog "Restarting the stress test from the beginning - attempt $attempts of $maxResumeAttempts (AIDA64/FurMark/FIO cannot continue mid-run)."
     Remove-Item -LiteralPath $lockFile -Force -ErrorAction SilentlyContinue
 }
 
-(Get-Date).ToString('o') | Out-File -FilePath $lockFile -Encoding ascii -Force
+@((Get-Date).ToString('o'), $currentBootIso) | Out-File -FilePath $lockFile -Encoding ascii -Force
 
 try {
     Write-LauncherLog 'Waiting for shell readiness...'
@@ -247,8 +314,17 @@ try {
     Write-LauncherLog "Install root: $installRoot"
     Write-LauncherLog "Running: $autoTestScript -DurationMinutes $DurationMinutes (IPDROM_FORCE_SL=$env:IPDROM_FORCE_SL)"
 
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $pendingFile -Force -ErrorAction SilentlyContinue
+    # ЗАДАЧУ И PendingAfterReboot.txt ЗДЕСЬ БОЛЬШЕ НЕ СНИМАЕМ (01.10.2026).
+    # Именно эти две строки и лишали нас возобновления: к моменту старта теста
+    # обоих маркеров уже не было, и обрыв посреди прогона было нечем подхватить.
+    # Теперь они живут до самого конца и снимаются по факту исхода:
+    #   успех   - флаг IPDROM_StressTest_Completed.flag (его пишет ffu_trigger
+    #             ПЕРЕД перезагрузкой в WinPE, и лежит он вне State\, поэтому
+    #             переживает его очистку) -> ранний выход в начале этого скрипта;
+    #   отказ   - ветки ниже по $exitCode и catch;
+    #   обрыв   - блок возобновления выше.
+    # Зацикливания не будет: все три терминальных пути auto_stress_test.ps1
+    # (провал health-gate, ffu_trigger, откат без перезагрузки) ставят этот флаг.
 
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $childArgs = @(
@@ -272,16 +348,19 @@ try {
         # reboots while investigating.
         Disable-PerpetualAutoLogon
         (Get-Date).ToString('o') | Out-File -FilePath $finishedFile -Encoding ascii -Force
+        Close-ResumeChain
         Exit-Cleanly 0
     }
     "Stress test failed with exit code $exitCode at $(Get-Date -Format 's')" | Out-File -FilePath $failedFile -Encoding utf8 -Force
     Write-LauncherLog "ERROR: Stress test failed with exit code $exitCode"
+    Close-ResumeChain
     Exit-Cleanly $exitCode
 }
 catch {
     Write-LauncherLog "FATAL ERROR: $($_.Exception.Message)"
     Write-LauncherLog "$($_.ScriptStackTrace)"
     "Launcher fatal error at $(Get-Date -Format 's'): $($_.Exception.Message)" | Out-File -FilePath $failedFile -Encoding utf8 -Force
+    Close-ResumeChain
     Exit-Cleanly 1
 }
 finally {

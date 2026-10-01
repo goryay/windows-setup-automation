@@ -151,7 +151,19 @@
     "ACFA: Все прикладное ПО":                         ["acfa", "acfa_feature:application_software"],
     "ACFA: Все алкотестеры":                           ["acfa", "acfa_feature:alcodetectors"],
     "ACFA: Все геотрекинг":                            ["acfa", "acfa_feature:geotracking"],
-    "ACFA: Все прочие детекторы":                      ["acfa", "acfa_feature:other_detectors"]
+    "ACFA: Все прочие детекторы":                      ["acfa", "acfa_feature:other_detectors"],
+
+    "_notes_packages": "Пакеты интеграции СПО/СКУД/ОПС N - это НЕ количество лицензий, а номер пакета. Состав получен от AxxonSoft 07.09.2026 (прайс win1.xlsx, лист 2026). Одна лицензионная строка -> одно имя пакета -> список фич ACFA; Install-AxxonByBuildSpec собирает их в base.acfa.modules, установщик ставит одним проходом (ADDLOCAL). ДОПУЩЕНИЯ, требующие подтверждения у AxxonSoft: 'Тополь' в составе СПО 1 сопоставлен с topol3_ru (в карте только эта версия); 'Suprema' в СКУД 1 - с suprema_cr_ru (BioMini), отдельной фичи для базовой Suprema нет; 'Elsys' в СКУД 3 - с elsys_ru, не elsys2_ru; 'Gate' в СКУД 1 - с gateip_ru (Gate-IP). Лишняя установленная фича безопасна: без лицензии модуль не активируется, а Install-AcfaWithFallback переживает несуществующие фичи - ставит ядро и добирает остальные по частям.",
+    "Пакет СПО 1":  ["acfa", "acfa_feature:umirs_ru", "acfa_feature:topol3_ru", "acfa_feature:peridect_ru"],
+    "Пакет СПО 2":  ["acfa", "acfa_feature:forteza_ru", "acfa_feature:start7_ru", "acfa_feature:sintegral_ru", "acfa_feature:groza_ru", "acfa_feature:fibersensys_ru"],
+    "Пакет СПО 3":  ["acfa", "acfa_feature:intrepid3_ru", "acfa_feature:optex_ru", "acfa_feature:ufdvolna_ru"],
+    "Пакет СКУД 1": ["acfa", "acfa_feature:suprema2_ru", "acfa_feature:hid_ru", "acfa_feature:suprema_cr_ru", "acfa_feature:gateip_ru", "acfa_feature:pnet3_ru", "acfa_feature:bsveins_ru", "acfa_feature:zk_ru", "acfa_feature:forsec_ru", "acfa_feature:artonit_ru"],
+    "Пакет СКУД 2": ["acfa", "acfa_feature:mion_ru", "acfa_feature:abc_2_ru", "acfa_feature:percos20_ru", "acfa_feature:hikvision_ru", "acfa_feature:dingo_ru", "acfa_feature:sphinx_oko_ru", "acfa_feature:alcoframe_ru", "acfa_feature:pautina_ru", "acfa_feature:uprox_ru", "acfa_feature:proxway_ru"],
+    "Пакет СКУД 3": ["acfa", "acfa_feature:tss2_ru", "acfa_feature:elsys_ru", "acfa_feature:lockerbox_ru", "acfa_feature:rusguard_2_ru", "acfa_feature:sigur_ru", "acfa_feature:schindler_ru"],
+    "Пакет СКУД 4": ["acfa", "acfa_feature:apda_ru", "acfa_feature:salto_ru", "acfa_feature:lyrix_ru", "acfa_feature:alcobarrier_ru", "acfa_feature:intelliko_ru", "acfa_feature:keyguard_ru", "acfa_feature:bosch_bis_ru", "acfa_feature:dahua_ru", "acfa_feature:bas_ip_ru"],
+    "Пакет ОПС 1":  ["acfa", "acfa_feature:sintegral_ru", "acfa_feature:ratek_ru", "acfa_feature:glx2_ru", "acfa_feature:orlan_ru"],
+    "Пакет ОПС 2":  ["acfa", "acfa_feature:aritech_ru", "acfa_feature:cerberus_ru", "acfa_feature:rifstring_ru", "_TODO_PRM_peshehodnyj_radiacionnyj_monitor_net_feature_v_ACFA"],
+    "Пакет ОПС 3":  ["acfa", "acfa_feature:satel2_ru", "_TODO_Schrack_Seconet_net_feature_v_ACFA"]
   },
 
   "intellectx": {

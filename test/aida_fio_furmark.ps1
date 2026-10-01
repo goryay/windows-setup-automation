@@ -259,7 +259,10 @@ pause > nul
     Write-Log "Starting FIO drive $DriveLetter (duration=${totalSeconds}s from now)..." 'Yellow'
     $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/k', "`"$batFile`"") -WindowStyle Normal -PassThru
     Write-Log "FIO $DriveLetter started (cmd PID: $($proc.Id))" 'Green'
-    return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; Drive = $DriveLetter; JobFile = $jobFile; BatFile = $batFile }
+    # TestDir возвращаем, чтобы было ЧТО убирать после теста. Приёмка 29.09.2026:
+    # файл на 1 ГБ оставался на массиве данных и уезжал заказчику. Существующая
+    # очистка его не видела: она чистит TEMP и C:\fio_tests, а fio пишет на D:.
+    return [pscustomobject]@{ Process = $proc; TitleToken = $baseTitle; Drive = $DriveLetter; JobFile = $jobFile; BatFile = $batFile; TestDir = $testDir; TestFile = $testFile }
 }
 
 function Bring-AidaToFront {
@@ -850,6 +853,29 @@ foreach ($launch in $fioStarted) {
     }
     Remove-Item -LiteralPath $launch.JobFile -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $launch.BatFile -Force -ErrorAction SilentlyContinue
+
+    # Тестовый файл fio на ЦЕЛЕВОМ диске (D: - массив данных, не системный).
+    # Удаляем только своё: сначала файл, потом каталог fio_tests - и только если он
+    # пуст. Если кто-то положил туда постороннее, каталог останется нетронутым.
+    if ($launch.TestFile -and (Test-Path -LiteralPath $launch.TestFile)) {
+        $sz = 0
+        try { $sz = (Get-Item -LiteralPath $launch.TestFile -ErrorAction Stop).Length } catch {}
+        Remove-Item -LiteralPath $launch.TestFile -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $launch.TestFile) {
+            Write-Log ("  WARN: could not remove fio test file {0} (still in use?)" -f $launch.TestFile) 'Yellow'
+        } else {
+            Write-Log ("  Removed fio test file: {0} ({1:N1} MB)" -f $launch.TestFile, ($sz / 1MB)) 'Gray'
+        }
+    }
+    if ($launch.TestDir -and (Test-Path -LiteralPath $launch.TestDir)) {
+        $left = @(Get-ChildItem -LiteralPath $launch.TestDir -Force -ErrorAction SilentlyContinue)
+        if ($left.Count -eq 0) {
+            Remove-Item -LiteralPath $launch.TestDir -Force -ErrorAction SilentlyContinue
+            Write-Log ("  Removed empty fio test dir: {0}" -f $launch.TestDir) 'Gray'
+        } else {
+            Write-Log ("  fio test dir {0} kept: {1} foreign item(s) inside." -f $launch.TestDir, $left.Count) 'Yellow'
+        }
+    }
 }
 
 Write-Log "Closing AIDA64..." 'Yellow'
@@ -945,6 +971,31 @@ if (Test-Path $script:Aida64FullPath) {
     #   * once the file stops growing, take it and kill the stuck process
     #   * capture stdout/stderr so a future failure leaves evidence behind
     #   * fall back to a summary-only report so the uploaded archive always has one
+    # Гасит модальное окно AIDA "did not close properly last time it was run".
+    # ПРИЧИНА (подтверждено на SL111111-008, 11.09.2026): после стресс-теста AIDA не
+    # закрывается мягким CloseMainWindow (идёт System Stability Test), её убивают через
+    # Stop-Process -Force, и она оставляет маркер аварийного завершения. Очистка выше
+    # его не находит - значит он лежит не в тех путях, что мы чистим. Найти его точное
+    # место пока не удалось, поэтому лечим следствие: гасим окно, как только оно мешает.
+    # После OK AIDA сама подчищает маркер и ВЫХОДИТ - следующий запуск стартует чисто.
+    function Dismiss-AidaModal {
+        param([string]$Label = '')
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+            $ws = New-Object -ComObject WScript.Shell
+            for ($k = 0; $k -lt 3; $k++) {
+                [void]$ws.AppActivate('AIDA64 Portable')
+                Start-Sleep -Milliseconds 400
+                [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+                Start-Sleep -Milliseconds 700
+            }
+            return $true
+        } catch {
+            Write-Log ("  [{0}] modal dismiss attempt failed: {1}" -f $Label, $_.Exception.Message) 'DarkGray'
+            return $false
+        }
+    }
+
     function Invoke-AidaReport {
         param(
             [Parameter(Mandatory)][string]$Exe,
@@ -986,9 +1037,11 @@ if (Test-Path $script:Aida64FullPath) {
         }
 
         $deadline  = (Get-Date).AddSeconds($TimeoutSec)
+        $startedAt = Get-Date
         $lastSize  = -1
         $stableFor = 0
         $found     = $null
+        $dismissed = 0
 
         while ((Get-Date) -lt $deadline) {
             if ($proc.HasExited) {
@@ -1013,6 +1066,19 @@ if (Test-Path $script:Aida64FullPath) {
                     $lastSize  = $f.Length
                 }
             }
+
+            # РАННЕЕ ГАШЕНИЕ МОДАЛКИ (11.09.2026).
+            # Если через 45 с файла отчёта нет ВООБЩЕ - почти наверняка висит модалка:
+            # при нормальной работе AIDA начинает писать файл заметно раньше. Ждать
+            # полного таймаута бессмысленно, на SL111111-008 это стоило 15 минут.
+            # После гашения AIDA выходит сама, цикл увидит HasExited и прервётся.
+            if (-not $f -and $dismissed -lt 3 -and ((Get-Date) - $startedAt).TotalSeconds -ge 45) {
+                $dismissed++
+                Write-Log ("  [{0}] no output after {1}s - dismissing possible modal (attempt {2}/3)." -f `
+                    $Label, [int]((Get-Date) - $startedAt).TotalSeconds, $dismissed) 'Yellow'
+                [void](Dismiss-AidaModal -Label $Label)
+            }
+
             Start-Sleep -Seconds 5
         }
 
@@ -1031,23 +1097,18 @@ if (Test-Path $script:Aida64FullPath) {
             foreach ($ap in @(Get-Process -Name 'AIDA64*' -ErrorAction SilentlyContinue)) {
                 Write-Log ("  [{0}]   process {1} PID={2} responding={3} window='{4}'" -f $Label, $ap.ProcessName, $ap.Id, $ap.Responding, $ap.MainWindowTitle) 'DarkGray'
             }
-            # Confirmed cause (production run): the modal "AIDA64 Portable did not
-            # close properly last time... will now clean up. Start again manually".
-            # It blocks the report and waits for OK. Send Enter to click OK: AIDA
-            # then self-cleans and EXITS, which clears the crash marker - so the
-            # NEXT attempt (safe/safest) launches clean and can produce the report.
-            try {
-                Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-                $ws = New-Object -ComObject WScript.Shell
-                for ($k = 0; $k -lt 3; $k++) {
-                    [void]$ws.AppActivate('AIDA64 Portable')
-                    Start-Sleep -Milliseconds 400
-                    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-                    Start-Sleep -Milliseconds 700
-                }
-                Write-Log ("  [{0}] sent Enter to dismiss the 'did not close properly' modal - waiting for AIDA to self-clean and exit." -f $Label) 'Yellow'
-                $proc | Wait-Process -Timeout 25 -ErrorAction SilentlyContinue
-            } catch {}
+            # ИСТОРИЯ ВОПРОСА, чтобы больше не ходить по кругу.
+            # Модалка "did not close properly" была подтверждена скриншотом на первом
+            # же боевом прогоне. 09-10.09.2026 я ошибочно объявил эту версию
+            # опровергнутой - на диагностических снимках 009/010/011 стол был чист - и
+            # поднял таймаут, решив, что дело в медленном сканировании. 11.09.2026 на
+            # SL111111-008 модалка снова снята на фото: версия верна, вывод был неверен.
+            # Три чистых снимка не отменяют прямого подтверждения.
+            # Гашение теперь происходит РАНЬШЕ, прямо в цикле ожидания; здесь оставлен
+            # финальный удар на случай, если модалка появилась позже 45-й секунды.
+            [void](Dismiss-AidaModal -Label $Label)
+            Write-Log ("  [{0}] final Enter sent - waiting for AIDA to self-clean and exit." -f $Label) 'Yellow'
+            try { $proc | Wait-Process -Timeout 25 -ErrorAction SilentlyContinue } catch {}
         }
 
         if (-not $proc.HasExited) {
@@ -1077,20 +1138,41 @@ if (Test-Path $script:Aida64FullPath) {
         return $found
     }
 
+    # ТАЙМАУТ ПОЛНОГО ОТЧЁТА: 300 с -> 900 с (10.09.2026).
+    # На 009 и 010 полный отчёт упирался ровно в 300 с и уходил в /SAFE, а тот
+    # же набор страниц с /SAFE отрабатывал за ~20 с. Разрыв в полтора порядка
+    # означает не зависание, а медленный низкоуровневый скан (MegaRAID + 4x12TB
+    # SMART/SPD). Ждём столько, сколько ему реально нужно: 15 минут дешевле, чем
+    # отгружать заказчику отчёт без показаний датчиков. Общий бюджет этапа при
+    # этом не растёт - как только отчёт перестаёт расти, файл забирается сразу
+    # (см. $stableFor выше), так что на здоровой машине выход прежний.
     $actualReport = Invoke-AidaReport -Exe $script:Aida64FullPath -OutFile $reportPath `
-        -PageArgs @('/ALL', '/SUM', '/HW', '/SW', '/AUDIT') -TimeoutSec 300 -Label 'full'
+        -PageArgs @('/ALL', '/SUM', '/HW', '/SW', '/AUDIT') -TimeoutSec 900 -Label 'full'
 
-    # Диагностика 22.07 (aida_report_*_stuck.png): на экране НЕТ ни модального
-    # окна, ни окна прогресса - только кнопка AIDA в панели задач. Значит AIDA
-    # висит ДО показа окна генерации, то есть на стартовом сканировании железа
-    # (PCI/SMBus/датчики/диски). Совпадает по времени с поломкой: отчёт работал
-    # 13.07 при одном VD на MegaRAID и перестал с 19.07, когда массивов стало 3.
+    # Диагностика 22.07 и повторно 09-10.09 (aida_report_*_stuck.png): на экране
+    # НЕТ ни модального окна, ни окна прогресса. Значит AIDA висит ДО показа окна
+    # генерации, то есть на стартовом сканировании железа (PCI/SMBus/датчики/
+    # диски). Совпадает по времени с поломкой: отчёт работал 13.07 при одном VD
+    # на MegaRAID и перестал с 19.07, когда массивов стало 3.
     # Поэтому повторные попытки идут с обрезанным сканированием:
     #   /SAFE   - без низкоуровневого PCI/SMBus/sensor-скана
     #   /SAFEST - вообще без загрузки kernel-драйверов (последний шанс)
     # /SAFE отключает только низкоуровневый скан, но НЕ урезает набор страниц.
     # Поэтому первая же повторная попытка идёт полным набором страниц с /SAFE:
     # получаем полноценный отчёт (без показаний датчиков) вместо сводки на 11 КБ.
+    # ПОВТОР ПОЛНОГО ОТЧЁТА перед уходом в /SAFE (11.09.2026).
+    # Первая попытка гибнет от модалки, но, погасив её, AIDA подчищает свой маркер и
+    # выходит - то есть следующий запуск стартует чисто. Раньше этим "чистым вторым
+    # запуском" был /SAFE, и мы решили, что помогает именно безопасный режим. Скорее
+    # всего помогал сам факт второго запуска: на 009, 010 и 011 /SAFE отрабатывал за
+    # ~20 секунд. Если так - здесь впервые соберётся ПОЛНЫЙ отчёт, с показаниями
+    # датчиков, а /SAFE останется настоящим запасным вариантом.
+    if (-not $actualReport) {
+        Write-Log "Full report failed on first launch - AIDA state should be clean now. Retrying FULL page set once before Safe Mode." 'Yellow'
+        $actualReport = Invoke-AidaReport -Exe $script:Aida64FullPath -OutFile $reportPath `
+            -PageArgs @('/ALL', '/SUM', '/HW', '/SW', '/AUDIT') -TimeoutSec 600 -Label 'full_retry'
+    }
+
     if (-not $actualReport) {
         Write-Log "Full AIDA64 report did not complete - retrying FULL page set in Safe Mode (/SAFE, no low-level scan)." 'Yellow'
         $actualReport = Invoke-AidaReport -Exe $script:Aida64FullPath -OutFile $reportPath `

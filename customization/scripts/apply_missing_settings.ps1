@@ -130,10 +130,19 @@ try {
 # Eto HKCU-tvik, primenyaetsya k tekushchemu pol'zovatelyu + default user.
 Write-Log "[19] Classic context menu (Win11)" 'Cyan'
 $classicCLSID = 'Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32'
-# /ve = (Default) value, pustaya stroka
-reg.exe add "HKCU\$classicCLSID" /f /ve /d "" | Out-Null
+# /ve = (Default) value. BEZ /d "" !
+# Windows PowerShell 5.1 VYBRASYVAET pustye argumenty pri vyzove nativnyh programm,
+# poetomu reg.exe videl '/d' bez znacheniya i otvechal "Invalid syntax" (exit=1).
+# Etot shag ne rabotal NIKOGDA: sobstvennyy log pishet "[19] Classic context menu"
+# do vyzova, a stderr reg.exe v nego ne popadaet - oshibku uvideli tol'ko 11.09.2026,
+# kogda poyavilsya polnyy transkript etapa. PowerShell 7 peredaet "" korrektno,
+# poetomu na pwsh problema ne vosproizvoditsya - proveryat' nuzhno imenno na 5.1.
+# Bez /d reg.exe sozdaet (Default) kak pustuyu REG_SZ - rovno to, chto trebuetsya.
+reg.exe add "HKCU\$classicCLSID" /f /ve | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Log "  WARN: reg add HKCU classic menu exit=$LASTEXITCODE" 'Yellow' }
 if ($defLoaded) {
-    reg.exe add "HKU\$defKey\$classicCLSID" /f /ve /d "" | Out-Null
+    reg.exe add "HKU\$defKey\$classicCLSID" /f /ve | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Log "  WARN: reg add default-user classic menu exit=$LASTEXITCODE" 'Yellow' }
 }
 
 # ===================== 22. UseDefaultTile=1 (zapret menyat' avatar) =====================

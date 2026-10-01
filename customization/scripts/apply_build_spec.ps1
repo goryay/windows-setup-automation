@@ -231,5 +231,25 @@ foreach ($k in @('sn','model')) {
     }
 }
 
+# --- Модель в "Параметры -> Система -> О системе" (строка под именем ПК) ---
+# Заказчик должен видеть модель из конфига сборки целиком, как она задана в SL,
+# например "Системный блок IPDROM WS ol17112025_1.2sw", а не зашитую строку.
+# setup_apps_and_theme.ps1 пишет в это же поле запасное значение ДО вызова этого
+# скрипта, поэтому здесь оно штатно перезаписывается точным значением из конфига.
+if ($spec.ContainsKey('model') -and -not [string]::IsNullOrWhiteSpace($spec['model'])) {
+    $oemModel = $spec['model'].Trim()
+    try {
+        $oemPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation'
+        if (-not (Test-Path $oemPath)) { New-Item -Path $oemPath -Force | Out-Null }
+        Set-ItemProperty -Path $oemPath -Name 'Model' -Value $oemModel -Type String -ErrorAction Stop
+        Write-Log "OEM Model set from config: '$oemModel'" 'Green'
+    } catch {
+        Write-Log "Could not set OEM Model: $_" 'Yellow'
+        Write-Log "Fallback value from setup_apps_and_theme stays in place." 'Gray'
+    }
+} else {
+    Write-Log "No 'model' key in config - OEM Model left as set by setup_apps_and_theme." 'Yellow'
+}
+
 Write-Log "=== apply_build_spec finished ===" 'Cyan'
 exit 0

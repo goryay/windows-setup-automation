@@ -144,6 +144,7 @@
 			<UserLocale>ru-RU</UserLocale>
 		</component>
 		<component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+			<TimeZone>Russian Standard Time</TimeZone>
 			<UserAccounts>
 				<LocalAccounts>
 					<LocalAccount wcm:action="add">

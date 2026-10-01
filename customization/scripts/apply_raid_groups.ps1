@@ -210,6 +210,9 @@ Write-Log "Found $($groups.Count) RAID group(s) in config." 'Green'
 
 # Разбираем каждую группу, строим план для DATA-массивов.
 $plan = New-Object System.Collections.ArrayList
+# Горячий резерв идёт отдельным списком: это не массив, а роль диска, и
+# назначается он другой командой storcli уже ПОСЛЕ создания основных массивов.
+$spares = New-Object System.Collections.ArrayList
 foreach ($n in ($groups.Keys | Sort-Object)) {
     $g = $groups[$n]
 
@@ -225,6 +228,25 @@ foreach ($n in ($groups.Keys | Sort-Object)) {
 
     if ($isSystem) {
         Write-Log "  -> SYSTEM array: created manually in RAID BIOS. SKIP (not touched)." 'Yellow'
+        continue
+    }
+    # HotSpare - не уровень RAID, а роль: диск стоит свободным и контроллер сам
+    # вводит его в деградировавший массив. Convert-RaidType такого не знает и
+    # вернёт $null, поэтому проверка идёт ДО отбраковки по неизвестному типу
+    # (SL840458-001, 09.09.2026: группа 3 = 1x18TB под резерв пропускалась молча).
+    if (($g['Type'] -replace '[\s\-_]','') -match '^(?i)hotspare$') {
+        if ($qty -lt 1) {
+            Write-Log "  -> HotSpare: disk_quantity invalid ($($g['disk_quantity'])). SKIP." 'Red'
+            continue
+        }
+        [void]$spares.Add([pscustomobject]@{
+            Group      = $n
+            Quantity   = $qty
+            DiskType   = $dtype
+            DiskSizeGB = $sizeGB
+        })
+        Write-Log ("  -> HOT SPARE planned: {0}x {1} (~{2}GB) via storcli /c0/eX/sY add hotsparedrive" -f `
+            $qty, $dtype, ($(if($sizeGB){$sizeGB}else{'?'}))) 'Green'
         continue
     }
     if (-not $level) {
@@ -249,13 +271,18 @@ foreach ($n in ($groups.Keys | Sort-Object)) {
 }
 
 Write-Log "" 'White'
-Write-Log "=== PLAN SUMMARY: $($plan.Count) data array(s) to create ===" 'Cyan'
+Write-Log "=== PLAN SUMMARY: $($plan.Count) data array(s) to create, $($spares.Count) hot spare group(s) ===" 'Cyan'
 foreach ($p in $plan) {
     Write-Log ("  group {0}: {1} from {2}x {3} (~{4} GB)" -f $p.Group, $p.Level, $p.Quantity, $p.DiskType, $p.DiskSizeGB) 'White'
 }
+foreach ($s in $spares) {
+    Write-Log ("  group {0}: hot spare, {1}x {2} (~{3} GB)" -f $s.Group, $s.Quantity, $s.DiskType, $s.DiskSizeGB) 'White'
+}
 
-if ($plan.Count -eq 0) {
-    Write-Log "No data arrays to create. Done." 'Green'
+# Выходим только если делать нечего СОВСЕМ. Конфиг может состоять из системного
+# массива (не трогаем) и одного горячего резерва - тогда $plan пуст, но работа есть.
+if ($plan.Count -eq 0 -and $spares.Count -eq 0) {
+    Write-Log "No data arrays and no hot spares to create. Done." 'Green'
     exit 0
 }
 
@@ -403,7 +430,8 @@ foreach ($d in $allDrives) {
 # JBOD-диски - переводим их в Good и перечитываем список. Только при -Execute,
 # и только когда UGood реально не хватает (не трогаем JBOD зря).
 $ugoodNow = @($allDrives | Where-Object { $_.State -match '^(?i)UGood' }).Count
-$needed   = [int](($plan | Measure-Object -Property Quantity -Sum).Sum)
+$needed   = [int](($plan | Measure-Object -Property Quantity -Sum).Sum) + `
+            [int](($spares | Measure-Object -Property Quantity -Sum).Sum)
 if ($Execute -and $needed -gt $ugoodNow) {
     Write-Log ("Free UGood drives ({0}) < drives needed by plan ({1}) - checking for JBOD drives to convert..." -f $ugoodNow, $needed) 'Yellow'
     $converted = Convert-JbodDrivesToGood -Cli $storcli -Drives $allDrives
@@ -517,6 +545,82 @@ foreach ($p in $plan) {
         Start-Sleep -Seconds 8
     } else {
         Write-Log "  storcli add vd FAILED (exit $LASTEXITCODE). Group $($p.Group) skipped." 'Red'
+    }
+}
+
+# ===================== ГОРЯЧИЙ РЕЗЕРВ =====================
+# Строго ПОСЛЕ создания массивов: пока VD нет, резерву не к чему подключаться.
+# Назначаем глобальный (GHS) - контроллер подставит диск в любой деградировавший
+# массив. Выделенный (dgs=N) не используем: в конфиге нет привязки резерва к
+# конкретной группе, а на этих сборках data-массив всё равно один.
+if ($spares.Count -gt 0) {
+    Write-Log "" 'White'
+    Write-Log "=== Hot spare assignment ===" 'Cyan'
+
+    # После add vd состояния поменялись (UGood -> Onln) - перечитываем.
+    if ($Execute) { $allDrives = Get-PhysicalDrives -Cli $storcli }
+
+    # GHS - глобальный резерв, DHS - выделенный. Нужно для идемпотентности:
+    # повторный прогон на той же машине не должен назначать резерв заново.
+    $alreadySpare = @($allDrives | Where-Object { $_.State -match '^(?i)(GHS|DHS)' })
+    if ($alreadySpare.Count -gt 0) {
+        Write-Log ("  Already assigned: {0}" -f (($alreadySpare | ForEach-Object { "$($_.Slot) [$($_.State)]" }) -join ', ')) 'Yellow'
+    }
+
+    foreach ($s in $spares) {
+        Write-Log "" 'White'
+        Write-Log ("--- Group {0}: hot spare {1}x {2} (~{3}GB) ---" -f $s.Group, $s.Quantity, $s.DiskType, $s.DiskSizeGB) 'Cyan'
+
+        $haveSameType = @($alreadySpare | Where-Object { $_.Media -ieq $s.DiskType }).Count
+        $need = $s.Quantity - $haveSameType
+        if ($need -le 0) {
+            Write-Log "  Hot spare of type $($s.DiskType) already assigned ($haveSameType) - nothing to do." 'Yellow'
+            continue
+        }
+
+        $cands = @($allDrives | Where-Object {
+            $_.State -match '^(?i)UGood' -and
+            -not $used.ContainsKey($_.Slot) -and
+            $_.Media -ieq $s.DiskType
+        })
+        if ($s.DiskSizeGB) {
+            $lo = $s.DiskSizeGB * 0.75
+            $hi = $s.DiskSizeGB * 1.25
+            $sized = @($cands | Where-Object { $_.SizeGB -ge $lo -and $_.SizeGB -le $hi })
+            if ($sized.Count -ge $need) { $cands = $sized }
+            else { Write-Log "  (no exact size match within +-25%, using any $($s.DiskType) free drives)" 'DarkGray' }
+        }
+
+        if ($cands.Count -lt $need) {
+            Write-Log ("  NOT ENOUGH free {0} drives for hot spare: need {1}, have {2}. SKIP." -f $s.DiskType, $need, $cands.Count) 'Red'
+            continue
+        }
+
+        foreach ($d in ($cands | Select-Object -First $need)) {
+            if ($d.Slot -match '^(\d+):(\d+)$') {
+                $eid = $matches[1]
+                $slt = $matches[2]
+            } else {
+                Write-Log "  Unexpected slot format '$($d.Slot)' - skipping this drive." 'Red'
+                continue
+            }
+            Write-Log ("  storcli command: {0} /c0/e{1}/s{2} add hotsparedrive" -f $storcli, $eid, $slt) 'Green'
+            if (-not $Execute) {
+                Write-Log "  [DRY-RUN] not executed (-Execute to actually assign)." 'Yellow'
+                continue
+            }
+            $out = & $storcli "/c0/e$eid/s$slt" add hotsparedrive 2>&1
+            foreach ($l in $out) { Write-Log "    | $l" 'DarkGray' }
+            # storcli не всегда выставляет осмысленный код возврата, поэтому
+            # дополнительно смотрим на текст ответа.
+            $ok = ($LASTEXITCODE -eq 0) -or (($out -join ' ') -match 'Status\s*=\s*Success')
+            if ($ok) {
+                $used[$d.Slot] = $true
+                Write-Log ("  Hot spare assigned: {0}" -f $d.Slot) 'Green'
+            } else {
+                Write-Log ("  add hotsparedrive FAILED (exit {0}) for {1}." -f $LASTEXITCODE, $d.Slot) 'Red'
+            }
+        }
     }
 }
 

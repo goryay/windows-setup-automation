@@ -635,6 +635,27 @@ echo     [patch] Длительность теста применена: %TESTMI
 :SETUP_START
 echo === Запуск установки Windows с %UAFILE% ===
 start /wait setup.exe /unattend:%UAFILE%
+set "SETUPRC=%ERRORLEVEL%"
+echo.
+echo ===============================================================
+echo   setup.exe завершился, код возврата: %SETUPRC%
+echo ===============================================================
+if "%SETUPRC%"=="0" goto :eof
+
+:: setup.exe вернул код без вывода UI (запуск с /unattend). Обычно машина в этот
+:: момент уже перезагружается САМИМ Windows Setup - до сюда код доходит, только
+:: если setup.exe завершился БЫСТРО и ВЕРНУЛ управление cmd, не начав установку
+:: (типичный признак: unattend отвергнут на этапе валидации). WinPE после этой
+:: строки перезагрузится сам (winpeshl), поэтому сохраняем диагностику на Y:
+:: (сетевая шара, read only = No, переживает перезагрузку) ДО этого момента.
+echo *** setup.exe вернул ошибку - собираю диагностику на сервер перед возможной перезагрузкой...
+set "DIAGDIR=Y:\common\_diag\%SL%_%RANDOM%"
+md "%DIAGDIR%" >nul 2>&1
+copy /y "%UAFILE%" "%DIAGDIR%\autounattend_used.xml" >nul 2>&1
+if exist X:\Windows\Panther xcopy /y /e /i X:\Windows\Panther "%DIAGDIR%\Panther_X" >nul 2>&1
+if exist "X:\$WINDOWS.~BT\Sources\Panther" xcopy /y /e /i "X:\$WINDOWS.~BT\Sources\Panther" "%DIAGDIR%\Panther_BT" >nul 2>&1
+echo *** Диагностика ^(если файлы найдены^) сохранена на сервере в %DIAGDIR%
+echo *** Заберите её на сервере, если понадобится - каталог на Y: переживёт перезагрузку.
 goto :eof
 
 :: ============================================================

@@ -8,8 +8,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$afterRebootTask = 'IPDROM_AutoStressTest_AfterReboot'
-Unregister-ScheduledTask -TaskName $afterRebootTask -Confirm:$false -ErrorAction SilentlyContinue
+# Задачу автоподъёма IPDROM_AutoStressTest_AfterReboot здесь НЕ СНИМАЕМ (01.10.2026).
+# Раньше снимали первой же строкой - и этим лишали конвейер возможности подхватить
+# прогон, оборванный перезагрузкой: задачи уже нет, поднимать нечем, машина просто
+# стоит с автовходом. Теперь задачу снимает ровно тот, кто знает исход:
+# launch_auto_stress_after_reboot.ps1 (Close-ResumeChain по возврату этого скрипта,
+# либо ранний выход по флагу завершения после захвата FFU).
+# Повторного запуска в одной загрузке не будет: у задачи MultipleInstances=IgnoreNew,
+# а лончер держит замок StressStarted.lock с отметкой текущей загрузки.
 
 # Remove orphaned watchdog from previous crash (BSOD does not run finally block)
 Unregister-ScheduledTask -TaskName 'IPDROM_Watchdog_Reboot' -Confirm:$false -ErrorAction SilentlyContinue
@@ -100,8 +106,21 @@ function Send-ArchiveToServer {
         $formArg = 'file=@"' + $ArchivePath + '"'
 
         # Используем cmd /c чтобы curl корректно проинтерпретировал кавычки внутри -F аргумента
-        $curlOutput = & curl.exe -sS -F $formArg -w "`nHTTPSTATUS=%{http_code}`n" $ServerUrl 2>&1
-        $curlExit   = $LASTEXITCODE
+        #
+        # EAP='Continue' на время вызова ОБЯЗАТЕЛЕН. curl с -sS пишет ошибку связи в
+        # stderr, а '2>&1' превращает её в ErrorRecord; при общескриптовом
+        # $ErrorActionPreference='Stop' это становится терминирующей ошибкой, функция
+        # не успевает вернуть $false, и вызывающий код улетает в catch с
+        # Mark-PipelineFailure. Из-за этого недоступность сервера отчётов роняла весь
+        # конвейер и блокировала FFU (SL111111-009, 31.08.2026: curl (7) Timed out).
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $curlOutput = & curl.exe -sS -F $formArg -w "`nHTTPSTATUS=%{http_code}`n" $ServerUrl 2>&1
+            $curlExit   = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
 
         Write-ColorOutput '  --- curl output ---' 'DarkGray'
         foreach ($l in ($curlOutput -split "`r?`n")) {
@@ -932,6 +951,27 @@ function Get-NvidiaGpuLines {
     }
 }
 
+function Get-NvidiaDriverVersion {
+    # Версия ФАКТИЧЕСКИ установленного драйвера, например '596.86'.
+    # Пустая строка = драйвера нет либо nvidia-smi недоступен.
+    $smi = Get-NvidiaSmiPath
+    if (-not $smi) { return '' }
+    try {
+        $v = @(& $smi --query-gpu=driver_version --format=csv,noheader 2>$null |
+               Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
+        if ($v.Count -gt 0) { return $v[0].Trim() }
+    } catch {}
+    return ''
+}
+
+function Get-NvidiaVersionFromInstallerName {
+    # Пакеты NVIDIA называются '<версия>-quadro-...exe' / '<версия>-desktop-...exe',
+    # то есть версия - это первое, что стоит в имени файла: '596.86-quadro-...'.
+    param([string]$Name)
+    if ($Name -match '^\s*(\d{3,4}\.\d{1,3})') { return $Matches[1] }
+    return ''
+}
+
 function Wait-NvidiaGpusReady {
     param(
         [int]$ExpectedCount = 1,
@@ -1029,6 +1069,12 @@ function Install-NvidiaDriverIfNeeded {
     # поэтому "драйвер уже активен" больше не повод пропускать установку.
     # Признак того, что отработал именно НАШ полный инсталлятор - наличие панели:
     # MSIX-приложение для DCH-драйверов либо классический nvcplui.exe.
+    #
+    # Прогон 010 (10.09.2026): на Win11 IoT драйвер И панель оказались на месте
+    # СРАЗУ после установки ОС - шаг пропустился, и какая версия уехала в FFU,
+    # по логу установить было нельзя. Проверки "панель есть" недостаточно: она
+    # ничего не говорит о версии. Поэтому решение о пропуске принимается ниже,
+    # ПОСЛЕ выбора нашего пакета, и только при совпадении версий.
     $panelPresent = $false
     try {
         if (Get-AppxPackage -AllUsers -Name 'NVIDIACorp.NVIDIAControlPanel' -ErrorAction SilentlyContinue) { $panelPresent = $true }
@@ -1038,15 +1084,13 @@ function Install-NvidiaDriverIfNeeded {
         if (Test-Path -LiteralPath $nvcplui) { $panelPresent = $true }
     }
 
-    $driverActive = ((Get-NvidiaGpuLines).Count -gt 0)
-    if ($driverActive -and $panelPresent) {
-        Write-ColorOutput '  NVIDIA driver + Control Panel already present - install skipped.' 'Gray'
-        return
-    }
-    if ($driverActive) {
-        Write-ColorOutput '  NVIDIA driver active but Control Panel missing (INF-only driver) - installing full package.' 'Yellow'
-        Write-RaidLog 'NVIDIA: driver present without Control Panel - forcing full package install.'
-    }
+    $driverActive     = ((Get-NvidiaGpuLines).Count -gt 0)
+    $installedVersion = Get-NvidiaDriverVersion
+    Write-ColorOutput ("  NVIDIA state: driver={0} version='{1}' controlPanel={2}" -f `
+        $(if ($driverActive) { 'active' } else { 'absent' }),
+        $(if ($installedVersion) { $installedVersion } else { '<none>' }),
+        $(if ($panelPresent) { 'present' } else { 'missing' })) 'Gray'
+    Write-RaidLog ("NVIDIA state before install: active={0} version='{1}' panel={2}" -f $driverActive, $installedVersion, $panelPresent)
 
     # Read the declared GPU model from the SL config so the RIGHT driver branch
     # is chosen automatically (no operator choice).
@@ -1077,9 +1121,34 @@ function Install-NvidiaDriverIfNeeded {
     }
     if ($nvExe) { Write-ColorOutput "  Selected NVIDIA driver for '$gpuModel': $($nvExe.Name)" 'Gray' }
     if (-not $nvExe) {
-        Write-ColorOutput '  NVIDIA installer not found in payload - GPU stress may run without driver.' 'Yellow'
-        Write-RaidLog 'NVIDIA installer .exe not found under software\docs\drivers.'
+        if ($driverActive) {
+            Write-ColorOutput "  NVIDIA installer not found in payload - keeping the driver already in the OS (version '$installedVersion')." 'Yellow'
+            Write-RaidLog "NVIDIA installer not found; leaving pre-existing driver version '$installedVersion'."
+        } else {
+            Write-ColorOutput '  NVIDIA installer not found in payload - GPU stress may run without driver.' 'Yellow'
+            Write-RaidLog 'NVIDIA installer .exe not found under software\docs\drivers.'
+        }
         return
+    }
+
+    # === Решение: ставить или пропустить ===
+    # Пропускаем ТОЛЬКО когда в системе стоит ровно наша версия и панель на месте.
+    # Иначе ставим: заказчику должен уезжать аттестованный нами драйвер, а не тот,
+    # что подобрала установка Windows.
+    $targetVersion = Get-NvidiaVersionFromInstallerName -Name $nvExe.Name
+    if (-not $targetVersion) {
+        Write-ColorOutput "  Could not read version from installer name '$($nvExe.Name)' - installing unconditionally." 'Yellow'
+        Write-RaidLog "NVIDIA: version not parsable from '$($nvExe.Name)'; forcing install."
+    } elseif ($driverActive -and $panelPresent -and $installedVersion -eq $targetVersion) {
+        Write-ColorOutput "  NVIDIA $targetVersion + Control Panel already present - install skipped." 'Gray'
+        Write-RaidLog "NVIDIA install skipped: installed version '$installedVersion' matches payload '$targetVersion'."
+        return
+    } elseif ($driverActive -and $installedVersion -and $installedVersion -ne $targetVersion) {
+        Write-ColorOutput "  NVIDIA version mismatch: installed '$installedVersion', payload '$targetVersion' - reinstalling to the qualified version." 'Yellow'
+        Write-RaidLog "NVIDIA version mismatch: installed '$installedVersion' != payload '$targetVersion'; reinstalling."
+    } elseif ($driverActive -and -not $panelPresent) {
+        Write-ColorOutput '  NVIDIA driver active but Control Panel missing (INF-only driver) - installing full package.' 'Yellow'
+        Write-RaidLog 'NVIDIA: driver present without Control Panel - forcing full package install.'
     }
 
     Write-ColorOutput "  Installing NVIDIA driver before stress test: $($nvExe.Name)" 'Yellow'
@@ -1147,6 +1216,16 @@ function Install-NvidiaDriverIfNeeded {
     }
 
     Start-Sleep -Seconds 10   # дать драйверу подхватиться перед nvidia-smi ниже
+
+    # Контроль результата: в лог должна попасть версия, которая реально уедет в FFU.
+    $afterVersion = Get-NvidiaDriverVersion
+    if ($targetVersion -and $afterVersion -and $afterVersion -ne $targetVersion) {
+        Write-ColorOutput "  WARN: after install nvidia-smi reports '$afterVersion', expected '$targetVersion'." 'Yellow'
+        Write-RaidLog "NVIDIA post-install mismatch: got '$afterVersion', expected '$targetVersion'."
+    } else {
+        Write-ColorOutput "  NVIDIA driver version now: '$(if ($afterVersion) { $afterVersion } else { '<nvidia-smi silent>' })'" 'Gray'
+        Write-RaidLog "NVIDIA post-install version: '$afterVersion'"
+    }
 }
 
 Write-ColorOutput '[2/7] Detecting configuration...' 'Yellow'
@@ -1328,11 +1407,46 @@ try {
                 }
                 $infArg = Join-Path $bestDir '*.inf'
                 $out = & pnputil.exe /add-driver "$infArg" /subdirs /install 2>&1
-                Write-ColorOutput "  pnputil /add-driver exit=$LASTEXITCODE ($(@($out).Count) line(s) of output)." 'Gray'
+                $pnpExit = $LASTEXITCODE
+                Write-ColorOutput "  pnputil /add-driver exit=$pnpExit ($(@($out).Count) line(s) of output)." 'Gray'
+
+                # Вывод pnputil СОХРАНЯЕМ (01.10.2026). Полтысячи строк собирались в
+                # переменную и выбрасывались - в лог шло только их количество. Если
+                # отдельный драйвер из пака не вставал, следа не оставалось никакого.
+                # Производство как раз сообщило про Guardant: устройства в диспетчере
+                # с ошибкой после нашей настройки. Без этого файла причину не увидеть.
+                try {
+                    $pnpLog = Join-Path $script:StressLogDir ("pnputil_{0}_{1}.log" -f (Split-Path $bestDir -Leaf), (Get-Date -Format 'yyyyMMdd-HHmmss'))
+                    $header = @(
+                        "=== pnputil /add-driver $infArg /subdirs /install ===",
+                        "Pack      : $bestDir",
+                        "Exit code : $pnpExit",
+                        "Lines     : $(@($out).Count)",
+                        ""
+                    )
+                    ($header + @($out | ForEach-Object { "$_" })) | Set-Content -LiteralPath $pnpLog -Encoding utf8
+                    Write-ColorOutput "  pnputil output saved: $pnpLog" 'Gray'
+                } catch {
+                    Write-ColorOutput "  WARN: could not save pnputil output: $($_.Exception.Message)" 'Yellow'
+                }
+
                 & pnputil.exe /scan-devices 2>&1 | Out-Null
                 $afterDevs = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
                                Where-Object { $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 })
                 Write-ColorOutput "  Device Manager: $($afterDevs.Count) device(s) still without a driver (was $($problemDevs.Count)); some finalize on next boot." 'Green'
+
+                # ПЕРЕЧИСЛЯЕМ оставшиеся проблемные устройства поимённо (01.10.2026).
+                # Объекты уже собраны строкой выше - раньше из них печаталось только
+                # количество. Это и скрывало проблему: во ВСЕХ прогонах стабильно
+                # оставалось ровно 2 устройства, и мы читали это как безобидный
+                # остаток. По словам производства, Guardant как раз даёт 2 устройства.
+                # Имя и Hardware ID превращают "2 устройства" в проверяемый факт.
+                foreach ($d in $afterDevs) {
+                    Write-ColorOutput ("    ! {0} | {1} | CM_error={2}" -f `
+                        $(if ($d.Name) { $d.Name } else { '<без имени>' }),
+                        $(if ($d.PNPDeviceID) { $d.PNPDeviceID } else { '<без ID>' }),
+                        $d.ConfigManagerErrorCode) 'Yellow'
+                }
             }
         }
     }
@@ -1353,21 +1467,48 @@ try {
     if ($netfx.State -eq 'Enabled') {
         Write-ColorOutput '  NetFx3 already enabled.' 'Gray'
     } else {
-        $sxsCandidates = @(
-            (Join-Path $usbRoot 'sources\sxs'),
-            'C:\IPDROM\sources\sxs'
-        )
+        # Источник sxs ОБЯЗАН быть от той же ОС: DISM отказывается ставить компонент
+        # из чужого дистрибутива. common\sources\sxs - это sxs от Win11, поэтому на
+        # Server 2019/2022 включение молча проваливалось (SL111111-009, 31.08.2026:
+        # NetFx3 остался DisabledWithPayloadRemoved). Сначала ищем sxs под свою ОС,
+        # и только потом падаем на общий.
+        $osCaption = "$((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption)"
+        # IoT проверяется ПЕРВЫМ и с break: у "Windows 10 IoT Enterprise LTSC 2019"
+        # совпали бы сразу две ветки, а без break switch-выражение вернуло бы массив.
+        # IoT LTSC - отдельная редакция со своим хранилищем компонентов: общий sxs от
+        # Win11 Pro ей не подходит (SL839492-001 и SL111111-010, 04.09.2026: DISM
+        # вернул 0x800F081F CBS_E_SOURCE_MISSING).
+        $osTag = switch -Regex ($osCaption) {
+            'IoT'   { 'iot';         break }
+            '2019'  { 'server2019';  break }
+            '2022'  { 'server2022';  break }
+            default { '' }
+        }
+        $sxsCandidates = @()
+        if ($osTag) {
+            $sxsCandidates += (Join-Path $usbRoot "sources\sxs_$osTag")
+            $sxsCandidates += "C:\IPDROM\sources\sxs_$osTag"
+        }
+        $sxsCandidates += (Join-Path $usbRoot 'sources\sxs')
+        $sxsCandidates += 'C:\IPDROM\sources\sxs'
+        Write-ColorOutput "  OS: '$osCaption' -> sxs tag '$osTag'" 'Gray'
+
         $sxs = $sxsCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
         if ($sxs) {
             Write-ColorOutput "  Enabling NetFx3 offline from $sxs..." 'Yellow'
             & dism.exe /online /enable-feature /featurename:NetFx3 /all /quiet /norestart /source:"$sxs" /LimitAccess | Out-Null
-            if ($LASTEXITCODE -eq 0) {
+            $dismExit = $LASTEXITCODE
+            if ($dismExit -eq 0) {
                 Write-ColorOutput '  NetFx3 enabled.' 'Green'
             } else {
-                Write-Warning "  DISM enable-feature exit=$LASTEXITCODE. Intellect installer may prompt user."
+                # Через Write-ColorOutput, а не Write-Warning: предупреждения в файл
+                # лога не попадают, и эта ошибка дважды терялась при разборе.
+                Write-ColorOutput "  WARN: DISM enable-feature exit=$dismExit (source '$sxs'). Intellect installer may block on a '.NET 3.5?' modal." 'Yellow'
+                Write-RaidLog "NetFx3 enable failed: dism exit=$dismExit, source='$sxs', OS='$osCaption'."
             }
         } else {
-            Write-Warning "  sxs folder not found ($($sxsCandidates -join ', ')). Copy Win11 sources\sxs to common\sources\sxs on the PXE server."
+            Write-ColorOutput ("  WARN: no sxs found ({0}). Put the matching OS sources\sxs into common\sources\ on the PXE server." -f ($sxsCandidates -join ', ')) 'Yellow'
+            Write-RaidLog "NetFx3: no sxs source found. Tried: $($sxsCandidates -join ', ')"
         }
     }
 } catch {
@@ -1431,7 +1572,15 @@ if (Test-Path $axxonRouter) {
 
 Write-ColorOutput '[3/7] Setting up watchdog...' 'Yellow'
 
-$watchdogSeconds = ($DurationMinutes * 60) + 1800
+# Запас над длительностью теста: 30 мин -> 40 мин (10.09.2026).
+# Сторож нужен на случай реально зависшей машины, но он НЕ должен срабатывать на
+# штатном хвосте прогона. Замер на 010: тест 60 мин, а aida_fio_furmark вернулся
+# через 71,5 мин - фиксированный хвост (раскачка тестов, финальные скриншоты,
+# генерация отчёта) ~11,5 мин, до сторожа оставалось 17,5 мин. Подняв лимит
+# полного отчёта AIDA с 300 до 900 с, в худшем случае съедаем ещё 10 мин - запас
+# упал бы до ~7 мин. Ребут посреди конвейера, ДО захвата FFU, стоит дороже, чем
+# лишние 10 минут ожидания на действительно мёртвой машине.
+$watchdogSeconds = ($DurationMinutes * 60) + 2400
 $watchdogTaskName = 'IPDROM_Watchdog_Reboot'
 $triggerAt = (Get-Date).AddSeconds($watchdogSeconds)
 
@@ -1539,16 +1688,44 @@ if (Test-Path $baseDir) {
 
         Write-ColorOutput "  Archive created: $archivePath" 'Green'
         $serverUrl = 'http://10.0.6.41:3000/ulrep'
-        $uploaded = Send-ArchiveToServer -ArchivePath $archivePath -ServerUrl $serverUrl
+
+        # Три попытки с паузой: сервер отчётов периодически недоступен, а из-за одной
+        # неудачной отправки терять полуторачасовой прогон нельзя.
+        $uploaded = $false
+        for ($try = 1; $try -le 3 -and -not $uploaded; $try++) {
+            if ($try -gt 1) {
+                Write-ColorOutput "  Upload attempt $try/3 (previous failed, waiting 20s)..." 'Yellow'
+                Start-Sleep -Seconds 20
+            }
+            $uploaded = Send-ArchiveToServer -ArchivePath $archivePath -ServerUrl $serverUrl
+        }
+
         if ($uploaded) {
             Write-ColorOutput '  Upload successful!' 'Green'
         } else {
-            # Upload failure НЕ блокирует FFU — это серверная проблема.
-            # Только warning, пайплайн продолжается.
-            Write-Warning '  Upload failed (server-side issue, not a pipeline failure)'
+            # Недоступность сервера отчётов - НЕ повод считать машину бракованной:
+            # железо протестировано, отчёт просто не доехал. FFU и флешки создаём.
+            # Но архив ОБЯЗАТЕЛЬНО сохраняем: раньше его удаляла очистка [6.5/7],
+            # и переотправить было нечего (SL111111-009, 31.08.2026).
+            # Уносим его с рабочего стола в ProgramData: и от очистки спасли, и
+            # заказчику на столе zip не показываем.
+            $pendingDir = Join-Path $env:ProgramData 'IPDROM\PendingReports'
+            try {
+                New-Item -ItemType Directory -Path $pendingDir -Force -ErrorAction SilentlyContinue | Out-Null
+                $keptPath = Join-Path $pendingDir (Split-Path $archivePath -Leaf)
+                Move-Item -LiteralPath $archivePath -Destination $keptPath -Force -ErrorAction Stop
+                Write-ColorOutput "  WARN: report NOT uploaded after 3 attempts. Archive kept: $keptPath" 'Yellow'
+                Write-ColorOutput '  WARN: re-send it manually once the report server is back.' 'Yellow'
+                Write-RaidLog "Report upload failed after 3 attempts; archive preserved at $keptPath"
+            } catch {
+                Write-ColorOutput "  WARN: report not uploaded AND archive could not be preserved: $_" 'Yellow'
+                Write-RaidLog "Report upload failed and archive preservation failed: $_"
+            }
         }
     } catch {
-        Write-Warning "  Archive or upload error: $_"
+        # Сюда попадаем только при реальной проблеме с созданием архива - отправка
+        # свои ошибки обрабатывает сама и конвейер не роняет.
+        Write-Warning "  Archive creation error: $_"
         Mark-PipelineFailure "Archive creation failed: $_"
     }
 } else {
@@ -1660,12 +1837,33 @@ try {
 # конвейер и готовая машина работают под IPDROM, поэтому отключаем встроенного
 # Administrator ДО FFU-захвата, чтобы в образе он не был активен. На IoT/Pro он
 # и так отключён по умолчанию - там команда просто ничего не меняет (no-op).
-# Отключаем именно ЗДЕСЬ (мы залогинены под IPDROM), текущую сессию это не рвёт.
+#
+# 09-10.09.2026: шаг МОЛЧА не срабатывал на обеих ОС - 'Не найдено имя
+# пользователя'. Причина в имени: на русской Windows встроенная учётка
+# называется 'Администратор', а искали строку 'Administrator'. Ищем по
+# well-known RID 500 - он одинаков на любой локализации и переживает
+# переименование учётки.
+#
+# ВАЖНО: если конвейер работает ПОД этой же учёткой (а на 009/010 он шёл под
+# 'Admin'), отключать её нельзя - образ уедет без единой рабочей учётной записи.
+# Поэтому сверяемся с SID текущего пользователя и в этом случае оставляем как есть.
 try {
-    & net.exe user Administrator /active:no 2>&1 | Out-Null
-    Write-ColorOutput "  Built-in Administrator account disabled (delivery hardening)." 'Gray'
+    $curSid  = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $builtin = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction Stop |
+               Where-Object { $_.SID -match '-500$' } | Select-Object -First 1
+
+    if (-not $builtin) {
+        Write-ColorOutput "  Built-in Administrator (RID 500) not present - nothing to disable." 'Gray'
+    } elseif ($builtin.SID -eq $curSid) {
+        Write-ColorOutput "  Built-in Administrator is the CURRENT account ('$($builtin.Name)') - left ENABLED on purpose (image must keep a usable account)." 'Yellow'
+    } elseif ($builtin.Disabled) {
+        Write-ColorOutput "  Built-in Administrator ('$($builtin.Name)') already disabled - nothing to do." 'Gray'
+    } else {
+        & net.exe user $builtin.Name /active:no 2>&1 | Out-Null
+        Write-ColorOutput "  Built-in Administrator ('$($builtin.Name)') disabled (delivery hardening)." 'Gray'
+    }
 } catch {
-    Write-ColorOutput "  WARN: could not disable Administrator: $_" 'Yellow'
+    Write-ColorOutput "  WARN: could not disable built-in Administrator: $_" 'Yellow'
 }
 
 # ===================== PIPELINE HEALTH GATE =====================
@@ -1744,14 +1942,46 @@ if (Test-Path $protectSrc) {
         $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $action = New-ScheduledTaskAction -Execute $psExe `
             -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$localProtect`""
-        # 60s delay after logon gives USB stack time to enumerate the flashes
-        $trigger = New-ScheduledTaskTrigger -AtLogOn
-        $trigger.Delay = 'PT60S'
+        # ДВА триггера намеренно (правка 30.08.2026). Автовход теперь снимается ДО
+        # захвата FFU, чтобы образ уезжал к заказчику без беспарольного автовхода -
+        # а значит после возврата из WinPE логиниться некому, и триггер "при входе"
+        # сам по себе больше не сработает. Поэтому основной путь - AtStartup от
+        # SYSTEM, а AtLogOn оставлен запасным. Задержка 60 с - время на перечисление
+        # USB. protect_ipdromrec.ps1 под SYSTEM безопасен: единственный консольный
+        # вызов (SetConsoleMode) там обёрнут в try/catch и без консоли просто no-op.
+        $trgStartup = New-ScheduledTaskTrigger -AtStartup
+        $trgStartup.Delay = 'PT60S'
+        $trgLogon = New-ScheduledTaskTrigger -AtLogOn
+        $trgLogon.Delay = 'PT60S'
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
             -MultipleInstances IgnoreNew
-        Register-ScheduledTask -TaskName 'IPDROM_ProtectRec' -Action $action -Trigger $trigger `
-            -Settings $settings -RunLevel Highest -Force | Out-Null
-        Write-ColorOutput '  Task IPDROM_ProtectRec registered (60s delay after logon).' 'Green'
+        Register-ScheduledTask -TaskName 'IPDROM_ProtectRec' -Action $action -Trigger @($trgStartup, $trgLogon) `
+            -Settings $settings -Principal $principal -Force | Out-Null
+        Write-ColorOutput '  Task IPDROM_ProtectRec registered (SYSTEM; at startup + at logon, 60s delay).' 'Green'
+
+        # СТРАХОВКА: автовход снимаем ТОЛЬКО убедившись, что задача защиты реально
+        # зарегистрирована и включена. Иначе машина осталась бы разом и без автовхода,
+        # и без защиты флешки. Не подтвердилось - оставляем автовход взведённым, то
+        # есть ровно сегодняшнее поведение (хуже не станет), а launcher снимет его
+        # позже сам.
+        $protectTask = Get-ScheduledTask -TaskName 'IPDROM_ProtectRec' -ErrorAction SilentlyContinue
+        if ($protectTask -and $protectTask.State -ne 'Disabled') {
+            try {
+                $winlogon = 'Registry::HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+                Set-ItemProperty    -LiteralPath $winlogon -Name 'AutoAdminLogon'  -Value '0' -Type String -Force -ErrorAction Stop
+                Remove-ItemProperty -LiteralPath $winlogon -Name 'DefaultPassword' -Force -ErrorAction SilentlyContinue
+                $check = (Get-ItemProperty -LiteralPath $winlogon -Name 'AutoAdminLogon' -ErrorAction SilentlyContinue).AutoAdminLogon
+                Write-ColorOutput "  Auto-logon disarmed BEFORE FFU capture (AutoAdminLogon='$check') - image ships clean." 'Green'
+                Write-RaidLog "Auto-logon disarmed before FFU capture; readback AutoAdminLogon='$check'."
+            } catch {
+                Write-ColorOutput "  WARN: could not disarm auto-logon before capture (left armed): $_" 'Yellow'
+                Write-RaidLog "Pre-capture auto-logon disarm failed, left armed: $_"
+            }
+        } else {
+            Write-ColorOutput '  WARN: IPDROM_ProtectRec not verified - auto-logon left ARMED so the flash still gets protected.' 'Yellow'
+            Write-RaidLog 'Protect task verification failed - auto-logon intentionally left armed.'
+        }
     } catch {
         Write-Warning "  Failed to register protect task: $_"
     }

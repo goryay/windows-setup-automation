@@ -50,6 +50,9 @@ $currentBootTime.ToString('o') | Out-File -FilePath (Join-Path $stateDir 'Regist
 Remove-Item -LiteralPath (Join-Path $stateDir 'StressStarted.lock') -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $stateDir 'StressFailed.txt')   -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $stateDir 'StressFinished.txt') -Force -ErrorAction SilentlyContinue
+# Resume counter, read by launch_auto_stress_after_reboot.ps1 when a run was cut
+# short by a restart. A fresh pipeline run must start counting from zero.
+Remove-Item -LiteralPath (Join-Path $stateDir 'StressAttempts.txt') -Force -ErrorAction SilentlyContinue
 
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 

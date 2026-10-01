@@ -340,28 +340,100 @@ function Build-Disks {
 
     $rem = try { Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2" } catch { @() }
     $ipdrom = $rem | Where-Object { $_.VolumeName -eq 'IPDROM' } | Select-Object -First 1
-    $recovery = $rem | Where-Object { $_.VolumeName -match '(?i)recovery' } | Select-Object -First 1
+    # Разделы флешки восстановления называются 'IpdromREC' и 'WINRE'. До 11.09.2026
+    # здесь искали подстроку 'recovery', которой нет ни в одной из этих меток, поэтому
+    # секция ВСЕГДА печатала 'Не найдено' - независимо от того, что реально на флешке.
+    $recVol   = $rem | Where-Object { $_.VolumeName -eq 'IpdromREC' } | Select-Object -First 1
+    $winreVol = $rem | Where-Object { $_.VolumeName -eq 'WINRE' }     | Select-Object -First 1
+
+    # Содержимое флешки на два уровня вглубь, с размерами каталогов.
+    function Get-FlashTree {
+        param([string]$Root)
+        $lines = New-Object System.Collections.ArrayList
+        $top = @()
+        try { $top = @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction Stop | Sort-Object @{E={-not $_.PSIsContainer}}, Name) } catch { return '(нет доступа к содержимому)' }
+        foreach ($e in $top) {
+            if ($e.PSIsContainer) {
+                $inner = @()
+                try { $inner = @(Get-ChildItem -LiteralPath $e.FullName -Recurse -File -Force -ErrorAction SilentlyContinue) } catch {}
+                $sum = if ($inner.Count) { ($inner | Measure-Object -Property Length -Sum).Sum } else { 0 }
+                [void]$lines.Add(('[{0}]  {1} файл(ов), {2}' -f $e.Name, $inner.Count, (ConvertTo-Size ([uint64]$sum))))
+                $sub = @()
+                try { $sub = @(Get-ChildItem -LiteralPath $e.FullName -Force -ErrorAction SilentlyContinue | Sort-Object @{E={-not $_.PSIsContainer}}, Name) } catch {}
+                foreach ($s in $sub) {
+                    if ($s.PSIsContainer) {
+                        $si = @()
+                        try { $si = @(Get-ChildItem -LiteralPath $s.FullName -Recurse -File -Force -ErrorAction SilentlyContinue) } catch {}
+                        $ss = if ($si.Count) { ($si | Measure-Object -Property Length -Sum).Sum } else { 0 }
+                        [void]$lines.Add(('    [{0}]  {1} файл(ов), {2}' -f $s.Name, $si.Count, (ConvertTo-Size ([uint64]$ss))))
+                    } else {
+                        [void]$lines.Add(('    {0}  {1}' -f $s.Name, (ConvertTo-Size ([uint64]$s.Length))))
+                    }
+                }
+            } else {
+                [void]$lines.Add(('{0}  {1}' -f $e.Name, (ConvertTo-Size ([uint64]$e.Length))))
+            }
+        }
+        if ($lines.Count -eq 0) { return '(пусто)' }
+        return ($lines -join "`r`n")
+    }
 
     function FlashInfo($v) {
         if (-not $v) { return Pre 'Не найдено' }
         $root = $v.DeviceID + '\'
-        $dirs = try { (Get-ChildItem -Path $root -Directory -Force -ErrorAction Stop).Count } catch { 0 }
-        $files = try { (Get-ChildItem -Path $root -File -Force -ErrorAction Stop).Count } catch { 0 }
+        # Раньше считался ТОЛЬКО верхний уровень, а в корне флешки лежат одни каталоги -
+        # отсюда бессмысленное 'Папок: 1, Файлов: 0' при полностью заполненной флешке.
+        $allFiles = @()
+        $allDirs  = @()
+        try { $allFiles = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue) } catch {}
+        try { $allDirs  = @(Get-ChildItem -LiteralPath $root -Recurse -Directory -Force -ErrorAction SilentlyContinue) } catch {}
+        $used = if ($allFiles.Count) { ($allFiles | Measure-Object -Property Length -Sum).Sum } else { 0 }
         $sz = if ($v.Size) { ConvertTo-Size ([uint64]$v.Size) } else { '-' }
         $fr = if ($v.FreeSpace) { ConvertTo-Size ([uint64]$v.FreeSpace) } else { '-' }
-        return Pre @"
+        $head = @"
 $root
 Метка:    $($v.VolumeName)
 ФС:       $($v.FileSystem)
 Размер:   $sz (свободно $fr)
-Папок:    $dirs
-Файлов:   $files
+Папок:    $($allDirs.Count) (рекурсивно)
+Файлов:   $($allFiles.Count) (рекурсивно), суммарно $(ConvertTo-Size ([uint64]$used))
+
+Содержимое:
+"@
+        # Явный перевод строки: here-string НЕ сохраняет последний перенос перед "@,
+        # поэтому дерево приклеивалось вплотную к заголовку 'Содержимое:'.
+        return Pre ($head + "`r`n" + (Get-FlashTree -Root $root))
+    }
+
+    # Образ восстановления. ВАЖНО про порядок этапов: этот отчёт формируется на
+    # этапе [4.5/7], а FFU создаётся на [6.7/7] - уже после перезагрузки в WinPE,
+    # то есть через несколько часов. Поэтому отсутствие здесь флешки восстановления
+    # НЕ означает провал захвата, и отчёт не должен делать вид, что это проверка.
+    # Достоверный итог даёт protect_ipdromrec.ps1 при следующей загрузке: он
+    # проверяет .capture_failed, наличие restore.ffu и его размер, после чего
+    # пишет маркер. Если маркер уже есть - показываем его.
+    function Get-CaptureStatus {
+        $flag = Join-Path $env:ProgramData 'IPDROM\State\IpdromREC_Protected.flag'
+        if (Test-Path -LiteralPath $flag) {
+            $c = try { (Get-Content -LiteralPath $flag -Raw -ErrorAction Stop).Trim() } catch { '(маркер не прочитан)' }
+            return "ЗАХВАТ ПОДТВЕРЖДЁН`r`n`r`n$c"
+        }
+        return @"
+Образ ещё не захвачен на момент формирования отчёта - это ШТАТНО.
+Отчёт делается на этапе [4.5/7], FFU создаётся на [6.7/7] после перезагрузки в WinPE.
+
+Итог захвата подтверждает protect_ipdromrec.ps1 при следующей загрузке:
+он проверяет маркер .capture_failed, наличие restore.ffu и его размер,
+после чего отправляет на сервер отдельный файл '<SL>_capture.txt'.
+Локальная копия: C:\ProgramData\IPDROM\State\
 "@
     }
 
     $flashBlock = (SubBlock 'Флешка IPDROM' (FlashInfo $ipdrom) 'h4') +
-                  (SubBlock 'Флешка Recovery' (FlashInfo $recovery) 'h4')
-    $flashOuter = SubBlock 'Флешки Recovery и IPDROM' $flashBlock
+                  (SubBlock 'Образ восстановления (FFU)' (Pre (Get-CaptureStatus)) 'h4') +
+                  (SubBlock 'Флешка восстановления: раздел IpdromREC' (FlashInfo $recVol) 'h4') +
+                  (SubBlock 'Флешка восстановления: раздел WINRE' (FlashInfo $winreVol) 'h4')
+    $flashOuter = SubBlock 'Флешки восстановления и IPDROM' $flashBlock
 
     $body = (SubBlock 'ОС' $osBlock) + $mountBlock + $flashOuter
     return $body

@@ -551,7 +551,13 @@ function Ensure-SqlDefaultInstance {
 
     Write-Info ("Запускаю установку SQL Express: {0}" -f $exe.FullName)
     $log = Join-Path $Logs ("sql_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log")
-    $sqlArgs = "/qs /x:setup /ACTION=Install /FEATURES=SQL /INSTANCENAME=MSSQLSERVER /SQLSVCACCOUNT=`"NT AUTHORITY\NETWORK SERVICE`" /SQLSYSADMINACCOUNTS=`"BUILTIN\Administrators`" /TCPENABLED=1 /NPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS"
+    # /UPDATEENABLED=FALSE обязателен. Без него SQL 2014 включает "Product Updates"
+    # (SmartSetup), пытается вычислить список обновлений и в изолированной сети
+    # уходит в бесконечный цикл: PublishingLoopException, LoopThreshold=10000,
+    # HResult 0x85780001, делегат SelectedUpdatesSetting.CalculateValue. Установка
+    # падает за ~15 с, ни одно правило проверки при этом не помечено упавшим.
+    # Поймано на SL111111-009 (Server 2019) 31.08.2026.
+    $sqlArgs = "/qs /x:setup /ACTION=Install /UPDATEENABLED=FALSE /FEATURES=SQL /INSTANCENAME=MSSQLSERVER /SQLSVCACCOUNT=`"NT AUTHORITY\NETWORK SERVICE`" /SQLSYSADMINACCOUNTS=`"BUILTIN\Administrators`" /TCPENABLED=1 /NPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS"
     $ec = Start-Proc -FilePath $exe.FullName -Arguments $sqlArgs -WorkingDirectory $sqlDir -LogPath $log
     if ($ec -notin 0,3010,1641) { throw "SQL Express installer exit code: $ec. Log: $log" }
     Write-Ok "SQL Express установлен/обновлён. Код: $ec. Log: $log"

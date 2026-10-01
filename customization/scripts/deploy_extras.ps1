@@ -205,6 +205,42 @@ if ($SLConfigPath -and (Test-Path -LiteralPath $SLConfigPath)) {
     W "WARN: no SL config -- selective copies will be skipped."
 }
 
+# KEEP THIS FILE PURE ASCII -- see the char-code note further down: Windows
+# PowerShell in RU locale reads a BOM-less UTF-8 .ps1 as Windows-1251, and Cyrillic
+# bytes then decode into characters PowerShell treats as quotes, which breaks the
+# parse. On 12.09.2026 Russian text added here did exactly that: the script never
+# ran and the machine shipped with an EMPTY IPDROM flash (no software, drivers or
+# docs). A BOM fixes it, but a BOM is invisible and any editor can drop it -- plain
+# ASCII cannot break this way at all.
+#
+# Build reports accidentally saved into a driver folder used to ship to the customer
+# along with the pack: on 11.09.2026 the flash carried 'SL835161-004.html' and
+# 'latest_SL833170-010.html' in 'drivers\Asrock B760M-HDV M2' -- serial numbers of
+# OTHER people's orders. The source has been cleaned, but a guard is still needed in
+# case someone saves a report into the wrong folder again.
+# The mask is deliberately narrow: only our own artefacts. Vendor documentation
+# (readme.html, release notes and the like) is left alone.
+$script:StrayReportRegex = '^(SL\d{6}-\d{3}|latest_SL.*|Disk report.*|Software_Report.*|SystemReport.*)\.html?$'
+
+# Cleans the DESTINATION (the flash) only -- the source payload is never touched.
+function Remove-StrayReports {
+    param([Parameter(Mandatory)] [string]$Root)
+    if (-not (Test-Path -LiteralPath $Root)) { return }
+    $stray = @()
+    try {
+        $stray = @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -match $script:StrayReportRegex })
+    } catch { return }
+    foreach ($s in $stray) {
+        try {
+            Remove-Item -LiteralPath $s.FullName -Force -ErrorAction Stop
+            W ("  STRAY: removed foreign build report from flash: {0}" -f $s.Name)
+        } catch {
+            W ("  STRAY: could not remove {0}: {1}" -f $s.Name, $_.Exception.Message)
+        }
+    }
+}
+
 # Helper: copy file OR folder from $Src into $DstDir with logging
 function Copy-ToFlash {
     param(
@@ -226,6 +262,10 @@ function Copy-ToFlash {
         if ($item.PSIsContainer) {
             # Copy folder recursively into DstDir (preserves folder name)
             Copy-Item -LiteralPath $Src -Destination $DstDir -Recurse -Force -ErrorAction Stop
+            # A recursive copy takes the folder exactly as it is, including anything
+            # foreign that settled there. Strip our own reports on the flash side
+            # (see Remove-StrayReports above).
+            Remove-StrayReports -Root (Join-Path $DstDir $name)
         } else {
             Copy-Item -LiteralPath $Src -Destination $DstDir -Force -ErrorAction Stop
         }
@@ -277,10 +317,11 @@ if ($hasRaid) {
 # =============================================================================
 # 3) Axxon Intellect / IntellectX (based on axxonsoft key)
 # =============================================================================
-# Значения ключа - те же, что понимает Install-AxxonByBuildSpec:
+# Key values match what Install-AxxonByBuildSpec understands:
 #   i = Intellect classic | x = IntellectX | a = Axxon Next
-# Здесь раньше стояло 'ix' вместо 'x', поэтому для SL с IntellectX (SL002)
-# дистрибутив на флешку не копировался вообще - ветка уходила в default.
+# This used to read 'ix' instead of 'x', so for an SL with IntellectX (SL002) the
+# distributive was never copied to the flash at all -- the branch fell through to
+# default.
 $axxonsoft = if ($sl['axxonsoft']) { $sl['axxonsoft'].ToLower() } else { '' }
 switch ($axxonsoft) {
     'i' {
@@ -310,9 +351,10 @@ switch ($axxonsoft) {
 # 4) Detector Pack (if axxonsoft_addons mentions any Detector item)
 # =============================================================================
 $addons = if ($sl['axxonsoft_addons']) { $sl['axxonsoft_addons'] } else { '' }
-# Cyrillic 'Детектор' constructed via char codes so .ps1 file encoding doesn't
-# matter -- Windows PowerShell in RU locale reads BOM-less UTF-8 as Windows-1251
-# and mangles literals like 'Детектор' into 'Р”РµС‚РµРєС‚РѕСЂ' at parse time.
+# The Cyrillic word for "Detector" is built from char codes so this file's encoding
+# does not matter -- Windows PowerShell in RU locale reads BOM-less UTF-8 as
+# Windows-1251 and mangles such literals at parse time. THIS IS THE REASON the
+# whole file is kept ASCII-only; see the note at Remove-StrayReports above.
 $rusDetector = -join @(0x0414,0x0435,0x0442,0x0435,0x043A,0x0442,0x043E,0x0440 | ForEach-Object { [char]$_ })
 $hasDetector = $addons -match ("(?i)" + [regex]::Escape($rusDetector) + '|Detector')
 if ($hasDetector) {
@@ -352,11 +394,12 @@ function Select-NvidiaDriverForModel {
     if ($exes.Count -eq 0) { return $null }
     if ($exes.Count -eq 1) { return $exes[0] }
     $m = "$GpuModel"
-    # ДЕРЖАТЬ СИНХРОННЫМ с Select-NvidiaDriverForModel в auto_stress_test.ps1.
-    # NVIDIA отказалась от имени "Quadro": современные проф-карты называются
-    # "RTX A<nnn>" (Ampere: A400/A2000/A4000), "RTX <nnnn> Ada Generation" и
-    # "T<nnn>" (Turing). Без этих шаблонов RTX A400 проваливалась в ветку GeForce
-    # и на флешку уезжал 475.14-desktop вместо 596.59-quadro (приёмка 28.08.2026).
+    # KEEP IN SYNC with Select-NvidiaDriverForModel in auto_stress_test.ps1.
+    # NVIDIA dropped the "Quadro" name: modern pro cards are called
+    # "RTX A<nnn>" (Ampere: A400/A2000/A4000), "RTX <nnnn> Ada Generation" and
+    # "T<nnn>" (Turing). Without these patterns an RTX A400 fell through to the
+    # GeForce branch and 475.14-desktop shipped instead of 596.59-quadro
+    # (acceptance run 28.08.2026).
     if ($m -match '(?i)\bquadro\b|\bnvs\b|\bRTX\s*A\d|\bT\d{3,4}\b|Ada\s+Generation') {
         $pick = $exes | Where-Object { $_.Name -match '(?i)quadro|rtx' } | Sort-Object Length -Descending | Select-Object -First 1
         if ($pick) { return $pick }
@@ -505,12 +548,12 @@ if ($mbAsset) {
 }
 
 # =============================================================================
-# 7.5) Intel RST driver (setuprst.exe) — only for a real SYSTEM-LEVEL RAID.
+# 7.5) Intel RST driver (setuprst.exe) -- only for a real SYSTEM-LEVEL RAID.
 # Two conditions must hold together on the same group:
 #   group_N_disk_system = TRUE   -> this is the system disk group
 #   group_N_Type        = RAID-x -> and it is an actual RAID array
 # disk_system=TRUE alone is NOT enough: a system group can be 'wo_RAID'
-# (single disk, no array) — that needs no RAID driver at all.
+# (single disk, no array) -- that needs no RAID driver at all.
 # System RAID itself is built manually in BIOS by the operator; we only ship
 # and install the driver so Windows can see/manage the array.
 # =============================================================================

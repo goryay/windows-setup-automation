@@ -83,7 +83,6 @@ echo.
 set IPDROM_REPLY=
 for /f "usebackq delims=" %%i in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "(Read-Host 'Type R and press Enter to RESTORE (anything else cancels)').Trim()"`) do set IPDROM_REPLY=%%i
 
-echo DEBUG: captured reply = [%IPDROM_REPLY%]
 if /i "%IPDROM_REPLY%"=="R" goto :do_apply
 
 echo Cancelled. Press any key to reboot.
@@ -166,31 +165,6 @@ if defined IPDROM_TGTDISK (
     )
 )
 
-rem === CLEANUP LOCAL WINPE STAGING ON SYSTEM DISK BEFORE CAPTURE ===
-rem Prepare-IpdromRecFlash stages C:\WinPE + local BCD entry for bootsequence.
-rem Wipe staging + BCD entries BEFORE capture so FFU has clean system disk.
-rem Use goto/label structure to avoid cmd-parser quirks with nested if blocks.
-echo. >> "%IPDROM_LOG%"
-echo Reached cleanup phase. >> "%IPDROM_LOG%"
-echo Reached cleanup phase.
-set IPDROM_STAGE_DIR=%IPDROM_SYSDRV%\WinPE
-set IPDROM_CLEANUP=%IPDROM_STAGE_DIR%\Cleanup-CaptureStaging.ps1
-echo IPDROM_STAGE_DIR=%IPDROM_STAGE_DIR% >> "%IPDROM_LOG%"
-echo IPDROM_CLEANUP=%IPDROM_CLEANUP% >> "%IPDROM_LOG%"
-if not exist "%IPDROM_CLEANUP%" goto :no_local_stage
-echo Found cleanup script - running it... >> "%IPDROM_LOG%"
-echo Running Cleanup-CaptureStaging...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%IPDROM_CLEANUP%" -SysDrive "%IPDROM_SYSDRV%" -LogPath "%IPDROM_LOG%"
-set CLEANUP_EXIT=%ERRORLEVEL%
-echo Cleanup-CaptureStaging exit code: %CLEANUP_EXIT% >> "%IPDROM_LOG%"
-echo Cleanup-CaptureStaging exit code: %CLEANUP_EXIT%
-goto :cleanup_done
-:no_local_stage
-echo No local staging script found at %IPDROM_CLEANUP% - skipping. >> "%IPDROM_LOG%"
-:cleanup_done
-echo Cleanup phase finished. >> "%IPDROM_LOG%"
-echo Cleanup phase finished, proceeding to DISM.
-
 :: --- Backup old restore.ffu (if exists) before overwrite ---
 if exist "%IPDROM_TARGET%\restore.ffu" (
     echo Backing up existing restore.ffu to restore.old.ffu... >> "%IPDROM_LOG%"
@@ -250,6 +224,22 @@ if %DISM_EXIT% NEQ 0 (
 del /f /q "%IPDROM_TARGET%\.capture_pending"
 echo OK %DATE% %TIME% > "%IPDROM_TARGET%\.capture_done"
 if exist "%IPDROM_TARGET%\restore.old.ffu" del /f /q "%IPDROM_TARGET%\restore.old.ffu"
+
+:: --- Запоминаем РАЗМЕР исходного диска рядом с образом (12.09.2026) ---
+:: Зачем: при восстановлении оператор вводит номер диска вручную, и ошибка стоит
+:: дорого. На стенде SL111111-008 в списке рядом стояли системный NVMe на 477 ГБ
+:: и архивный массив на 22351 ГБ; выбрать массив ничто не мешало, а подтверждение
+:: выглядело точно так же, как при верном выборе - и 22 ТБ данных ушли бы молча.
+:: Записанный здесь размер позволяет ветке восстановления заметить несоответствие
+:: и потребовать осознанного подтверждения. Ошибка записи НЕ критична: без этого
+:: файла проверка просто пропускается (так ведут себя все флешки, собранные ранее).
+for /f "tokens=*" %%i in ('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[math]::Round((Get-Disk -Number %IPDROM_SYSDISK%).Size/1GB)" 2^>nul') do set IPDROM_SRCGB=%%i
+if defined IPDROM_SRCGB (
+    echo %IPDROM_SRCGB% > "%IPDROM_TARGET%\restore.info"
+    echo Source disk size recorded: %IPDROM_SRCGB% GB >> "%IPDROM_LOG%"
+) else (
+    echo WARN: could not read source disk size - restore.info not written. >> "%IPDROM_LOG%"
+)
 echo === Capture completed successfully === >> "%IPDROM_LOG%"
 echo === Capture completed successfully ===
 echo Reboot in 5 seconds...
@@ -283,11 +273,19 @@ echo. >> "%IPDROM_LOG%"
 echo Available physical disks: >> "%IPDROM_LOG%"
 wmic diskdrive get Index,Model,Size,InterfaceType,MediaType /format:list >> "%IPDROM_LOG%" 2>&1
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Disk | Sort-Object Number | Format-Table Number, FriendlyName, @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}}, BusType, PartitionStyle -AutoSize"
+:: Показываем ТОЛЬКО кандидатов: USB из списка убраны (12.09.2026, замечание
+:: тестировщика). Раньше флешки выводились вместе с предупреждением "не выбирай
+:: USB" - лишний шум и лишний шанс ошибиться, тем более что выбрать их всё равно
+:: не даёт заслон ниже. Полный список дисков по-прежнему уходит в лог (wmic выше),
+:: так что для разбора полётов ничего не теряется.
+:: Подстраховка: если внутренних дисков не нашлось вовсе (например, системный
+:: пришёл через USB-адаптер), показываем ВСЁ - пустой список без объяснений хуже.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$all=@(Get-Disk|Sort-Object Number); $cand=@($all|Where-Object{$_.BusType -ne 'USB'}); if($cand.Count -eq 0){Write-Host 'WARNING: no internal disks detected - listing ALL disks:'; $cand=$all}; $cand|Format-Table Number,FriendlyName,@{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}},BusType,PartitionStyle -AutoSize; $h=$all.Count-$cand.Count; if($h -gt 0){Write-Host ('  (' + $h + ' USB disk(s) hidden - restoring to USB is not supported)')}"
 
 echo.
-echo Find the SYSTEM DISK - usually the internal NVMe/SATA.
-echo DO NOT pick the IpdromREC USB - that would erase the recovery image itself.
+echo Pick the SYSTEM DISK - the internal NVMe/SATA the server boots from.
+echo WARNING: a large RAID volume in this list is the DATA array, not the system disk.
+echo Applying the image to it would DESTROY all data stored there.
 echo.
 
 :ask_index
@@ -295,7 +293,7 @@ echo.
 set IPDROM_APPLYIDX=
 for /f "usebackq delims=" %%i in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "(Read-Host 'Enter disk Index to APPLY recovery to, or X to cancel').Trim()"`) do set IPDROM_APPLYIDX=%%i
 
-echo DEBUG: index = [%IPDROM_APPLYIDX%]
+echo Selected disk index: [%IPDROM_APPLYIDX%]
 if /i "%IPDROM_APPLYIDX%"=="X" goto :apply_cancel
 if not defined IPDROM_APPLYIDX goto :apply_cancel
 
@@ -307,6 +305,83 @@ if defined IPDROM_TGTDISK if "%IPDROM_APPLYIDX%"=="%IPDROM_TGTDISK%" (
     echo.
     goto :ask_index
 )
+
+:: --- Safety check 2: существует ли такой диск, и не USB ли это ---
+:: На стенде в списке ДВЕ одинаковые Kingston DataTraveler 3.0. Проверка выше
+:: прикрывает только ту, где лежит restore.ffu; вторую (флешку IPDROM) можно было
+:: выбрать - и она стёрлась бы молча. Системный диск сервера всегда внутренний
+:: NVMe/SATA, поэтому USB как цель отсекаем целиком. Заодно ловим несуществующий
+:: индекс: опечатка раньше доходила до подтверждения и падала внутри DISM.
+:: Ветка умеет ТОЛЬКО отказать и спросить заново - сама она ничего не выполняет.
+set IPDROM_APPLYBUS=
+for /f "tokens=*" %%i in ('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$d = Get-Disk -Number %IPDROM_APPLYIDX% -ErrorAction SilentlyContinue; if ($d) { $d.BusType } else { 'NODISK' }" 2^>nul') do set IPDROM_APPLYBUS=%%i
+
+if /i "%IPDROM_APPLYBUS%"=="NODISK" (
+    echo.
+    echo ERROR: Disk %IPDROM_APPLYIDX% does not exist. Pick a Number from the list above.
+    echo.
+    goto :ask_index
+)
+if not defined IPDROM_APPLYBUS (
+    echo.
+    echo ERROR: cannot read disk %IPDROM_APPLYIDX% properties. Pick another.
+    echo.
+    goto :ask_index
+)
+if /i "%IPDROM_APPLYBUS%"=="USB" (
+    echo.
+    echo ERROR: Disk %IPDROM_APPLYIDX% is a USB disk ^(bus=%IPDROM_APPLYBUS%^).
+    echo The system disk is an internal NVMe/SATA drive - never a USB stick.
+    echo.
+    goto :ask_index
+)
+
+:: --- Safety check 3: размер выбранного диска против размера исходного ---
+:: Заслоны выше ловят USB и несуществующий индекс, но НЕ ловят главную опасность -
+:: архивный массив. На стенде рядом с системным NVMe (477 ГБ) стоит массив на
+:: 22351 ГБ, и подтверждение для него выглядело точно так же, как для верного
+:: выбора. Сверяем с размером, записанным при захвате (restore.info).
+:: Порог полуторакратный в обе стороны: замена диска на близкий по объёму вопросов
+:: не вызовет, а промах в разы - вызовет.
+:: Нет restore.info (флешки, собранные до 12.09.2026) - проверка пропускается.
+:: Ветка умеет ТОЛЬКО спросить; сама она ничего не выполняет.
+set IPDROM_SRCGB=
+if exist "%IPDROM_TARGET%\restore.info" for /f "usebackq tokens=1" %%i in ("%IPDROM_TARGET%\restore.info") do set IPDROM_SRCGB=%%i
+
+set IPDROM_TGTGB=
+for /f "tokens=*" %%i in ('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[math]::Round((Get-Disk -Number %IPDROM_APPLYIDX%).Size/1GB)" 2^>nul') do set IPDROM_TGTGB=%%i
+
+if not defined IPDROM_SRCGB goto :size_ok
+if not defined IPDROM_TGTGB goto :size_ok
+
+set /a IPDROM_SIZEBAD=0
+set /a "IPDROM_T2=%IPDROM_TGTGB%*2"
+set /a "IPDROM_S3=%IPDROM_SRCGB%*3"
+if %IPDROM_T2% GTR %IPDROM_S3% set /a IPDROM_SIZEBAD=1
+set /a "IPDROM_S2=%IPDROM_SRCGB%*2"
+set /a "IPDROM_T3=%IPDROM_TGTGB%*3"
+if %IPDROM_S2% GTR %IPDROM_T3% set /a IPDROM_SIZEBAD=1
+if %IPDROM_SIZEBAD%==0 goto :size_ok
+
+echo.
+echo ==============================================================
+echo  !!! SIZE MISMATCH !!!
+echo ==============================================================
+echo Recovery image was captured from a %IPDROM_SRCGB% GB disk.
+echo Disk %IPDROM_APPLYIDX% is %IPDROM_TGTGB% GB.
+echo.
+echo This is very likely the DATA array, not the system disk.
+echo Restoring here would DESTROY every file stored on it.
+echo ==============================================================
+echo.
+echo SIZE MISMATCH: image %IPDROM_SRCGB% GB vs disk %IPDROM_APPLYIDX% = %IPDROM_TGTGB% GB >> "%IPDROM_LOG%"
+set IPDROM_ERASE=
+for /f "usebackq delims=" %%i in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "(Read-Host 'Type ERASE in capitals to continue anyway, or X to pick another disk').Trim()"`) do set IPDROM_ERASE=%%i
+:: Сравнение БЕЗ /i - нужны именно заглавные. 'Y' жмут не глядя, слово - набирают осознанно.
+if not "%IPDROM_ERASE%"=="ERASE" goto :ask_index
+echo Operator confirmed ERASE despite size mismatch. >> "%IPDROM_LOG%"
+
+:size_ok
 
 :: --- Confirmation ---
 echo.
