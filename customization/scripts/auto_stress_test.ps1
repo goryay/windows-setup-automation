@@ -1556,136 +1556,176 @@ try {
     Write-ColorOutput "  Guardant driver install failed (non-fatal): $($_.Exception.Message)" 'Yellow'
 }
 
-# ===================== [2.37/7] MARVELL SATA HBA DRIVER =====================
+# ===================== [2.37/7] SATA HBA DRIVER (PCIe 4xSATA3) =====================
 # Плата расширения PCIe 4xSATA3 (software\PCIe4SATA3ASM). Конвейер её драйвер не
 # ставил НИКОГДА - папка просто лежала, ни один скрипт на неё не ссылался.
 # Производство сообщило, что ставить надо.
 #
-# ВЫБОР INF. В комплекте 62 INF под разные чипы и ОС, и большинство не годится:
-#   mv91xx.inf  - SCSI miniport под XP/2003, на современной Windows не тот тип;
-#   mvs91xx.inf - storport, именно он нужен Win8/10/11 и Server.
-# Фильтр по ИМЕНИ файла автоматически отсекает XP-миниports, поэтому берём только
-# mvs91xx.inf из пути с amd64. Из оставшихся выбираем тот, что объявляет DEV
-# реально присутствующего устройства, и с наибольшим DriverVer. Для 9215 это
-# 92XX\Windows Vista_2008_7_8\amd64 (1.2.0.1038, 21.06.2013) - единственный
-# storport-INF, где 9215 вообще объявлен.
-# Пути не хардкодим: в именах папок есть опечатки ("MarveIl" через заглавную I,
-# "Widows"), и любая правка имени сломала бы жёсткую ссылку.
+# В обороте ДВА варианта платы, и обслуживаются они по-разному:
+#   Marvell 9215 (PCI\VEN_1B4B) - в комплекте 62 INF под разные чипы и ОС.
+#       mv91xx.inf  - SCSI miniport под XP/2003, современной Windows не подходит;
+#       mvs91xx.inf - storport, он и нужен. Фильтр по ИМЕНИ файла сам отсекает
+#       неподходящий тип, плюс требуем путь с amd64. Для 9215 подходит ровно
+#       один: 92XX\Windows Vista_2008_7_8\amd64, версия 1.2.0.1038.
+#   ASMedia ASM106x (PCI\VEN_1B21) - в комплекте был только InstallShield
+#       setup.exe, без единого INF. Файлы драйвера извлечены из него один раз,
+#       вручную, и лежат в "ASM1061R Driver\amd64_extracted" (происхождение
+#       расписано там же в ORIGIN.txt). Установщик в конвейере НЕ запускается:
+#       любое непредусмотренное окно останавливает автоматический прогон
+#       намертво и без следов в логе - на этом конвейер уже горел трижды
+#       (модалка AIDA64, запрос доверия pnputil, QuickEdit в консоли).
 #
-# ГЕЙТ ПО ЖЕЛЕЗУ. Шаг выполняется, только если на машине реально есть устройство
-# PCI\VEN_1B4B. Нет платы - ничего не трогаем.
+# Пути не хардкодим: в именах папок комплекта есть опечатки ("MarveIl" через
+# заглавную I, "Widows"), и переименование сломало бы жёсткую ссылку.
 #
-# ЧЕСТНО ПРО РИСК: драйвер от 2013 года, подпись sha1RSA, сертификат издателя
-# истёк в 2015 (метка времени 2020 оставляет подпись валидной). Примет ли его
-# политика подписи ядра на Win11/Server 2022 - заранее не известно. Поэтому вывод
-# pnputil сохраняется целиком: при отказе в нём будет точная причина.
-Write-ColorOutput '[2.37/7] Installing Marvell SATA HBA driver (only if the card is present)...' 'Yellow'
+# ГЕЙТ ПО ЖЕЛЕЗУ ДВОЙНОЙ, и второе условие важнее первого:
+#   1) на машине есть устройство с нужным VEN;
+#   2) какой-то INF из комплекта объявляет РЕАЛЬНЫЙ DEV этого устройства.
+# Второе обязательно: под VEN_1B21 идут не только SATA-контроллеры, но и очень
+# распространённые USB 3.0-контроллеры ASMedia, к нашей плате отношения не
+# имеющие. Без проверки DEV мы бы лезли ставить SATA-драйвер на USB.
+#
+# ЧЕСТНО ПРО РИСК. Оба драйвера старые, подписаны sha1RSA, сертификаты издателей
+# истекли (подписи держатся метками времени, статус Valid):
+#   ASMedia, 2011 - подпись "Microsoft Windows Hardware Compatibility Publisher",
+#       то есть WHQL; такую политика подписи ядра принимает надёжнее;
+#   Marvell, 2013 - кросс-подпись вендора, путь слабее.
+# Примет ли их Win11/Server 2022 - заранее не известно. Поэтому вывод pnputil
+# сохраняется целиком: при отказе в нём будет точная причина.
+Write-ColorOutput '[2.37/7] Installing SATA HBA driver (only for a card actually present)...' 'Yellow'
 try {
-    $mvDevs = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
-                Where-Object { "$($_.PNPDeviceID)" -match 'PCI\\VEN_1B4B' })
-    if ($mvDevs.Count -eq 0) {
-        Write-ColorOutput '  No Marvell (PCI\VEN_1B4B) device present - skipping.' 'Gray'
-    } else {
-        $mvWanted = @{}
-        foreach ($d in $mvDevs) {
-            Write-ColorOutput ("  Found: {0} | {1} | service={2} | CM_error={3}" -f `
+    $hbaRoot = $null
+    foreach ($cand in @((Join-Path $usbRoot 'software\PCIe4SATA3ASM'), 'C:\IPDROM\software\PCIe4SATA3ASM')) {
+        if (Test-Path -LiteralPath $cand) { $hbaRoot = $cand; break }
+    }
+
+    # Таблица правил вместо двух копий одного блока: карты отличаются только
+    # вендором, именем нужного INF и именем службы после привязки.
+    $hbaRules = @(
+        [pscustomobject]@{ Vendor = 'Marvell'; Vid = '1B4B'; InfName = 'mvs91xx.inf';  PathMustMatch = '(?i)\\amd64\\'; Service = 'mvs91xx'  },
+        [pscustomobject]@{ Vendor = 'ASMedia'; Vid = '1B21'; InfName = 'asahci64.inf'; PathMustMatch = $null;           Service = 'asahci64' }
+    )
+
+    $hbaHandled = 0
+    foreach ($rule in $hbaRules) {
+        $devs = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+                  Where-Object { "$($_.PNPDeviceID)" -match ("PCI\\VEN_{0}" -f $rule.Vid) })
+        if ($devs.Count -eq 0) { continue }
+
+        $wanted = @{}
+        foreach ($d in $devs) {
+            Write-ColorOutput ("  [{0}] found: {1} | {2} | service={3} | CM_error={4}" -f `
+                $rule.Vendor,
                 $(if ($d.Name) { $d.Name } else { '<no name>' }),
                 $d.PNPDeviceID,
                 $(if ($d.Service) { $d.Service } else { '<none>' }),
                 $d.ConfigManagerErrorCode) 'Gray'
-            if ("$($d.PNPDeviceID)" -match 'DEV_([0-9A-Fa-f]{4})') { $mvWanted[$matches[1].ToUpper()] = $true }
+            if ("$($d.PNPDeviceID)" -match 'DEV_([0-9A-Fa-f]{4})') { $wanted[$matches[1].ToUpper()] = $true }
         }
 
-        $hbaRoot = $null
-        foreach ($cand in @((Join-Path $usbRoot 'software\PCIe4SATA3ASM'), 'C:\IPDROM\software\PCIe4SATA3ASM')) {
-            if (Test-Path -LiteralPath $cand) { $hbaRoot = $cand; break }
-        }
         if (-not $hbaRoot) {
-            Write-ColorOutput '  HBA driver folder (software\PCIe4SATA3ASM) not found - skipping.' 'Yellow'
+            Write-ColorOutput ("  [{0}] driver folder software\PCIe4SATA3ASM not found - cannot install." -f $rule.Vendor) 'Yellow'
+            continue
+        }
+
+        $best    = $null
+        $bestVer = [version]'0.0.0.0'
+        foreach ($inf in (Get-ChildItem -LiteralPath $hbaRoot -Recurse -Filter $rule.InfName -ErrorAction SilentlyContinue)) {
+            if ($rule.PathMustMatch -and ($inf.FullName -notmatch $rule.PathMustMatch)) { continue }
+            $text = ''
+            try { $text = Get-Content -LiteralPath $inf.FullName -Raw -ErrorAction Stop } catch { continue }
+            if (-not $text) { continue }
+
+            $covers = $false
+            foreach ($id in $wanted.Keys) {
+                if ($text -match ("(?i)VEN_{0}&DEV_{1}" -f $rule.Vid, $id)) { $covers = $true; break }
+            }
+            if (-not $covers) { continue }
+
+            $ver = [version]'0.0.0.0'
+            if ($text -match '(?im)^\s*DriverVer\s*=\s*[^,]*,\s*([0-9]+(?:\.[0-9]+){1,3})') {
+                try { $ver = [version]$matches[1] } catch {}
+            }
+            Write-ColorOutput ("    candidate: {0} (DriverVer {1})" -f $inf.FullName.Substring($hbaRoot.Length).TrimStart('\'), $ver) 'DarkGray'
+            if ($ver -gt $bestVer) { $bestVer = $ver; $best = $inf.FullName }
+        }
+
+        if (-not $best) {
+            # Штатный случай для USB-контроллеров ASMedia: вендор совпал, а SATA
+            # к ним отношения не имеет. Это не ошибка.
+            Write-ColorOutput ("  [{0}] no INF in the package covers the present device(s) - not this card, skipping." -f $rule.Vendor) 'Gray'
+            continue
+        }
+
+        $hbaHandled++
+        Write-ColorOutput ("  [{0}] selected: {1} (DriverVer {2})" -f $rule.Vendor, $best, $bestVer) 'Yellow'
+
+        # Издателя доверяем заранее, иначе pnputil поднимет модальное окно и
+        # повесит автоматический прогон.
+        try {
+            $hbaStore = New-Object System.Security.Cryptography.X509Certificates.X509Store 'TrustedPublisher','LocalMachine'
+            $hbaStore.Open('ReadWrite')
+            $hbaSeen = 0
+            foreach ($cat in (Get-ChildItem -LiteralPath (Split-Path $best -Parent) -Filter *.cat -ErrorAction SilentlyContinue)) {
+                $signer = (Get-AuthenticodeSignature -LiteralPath $cat.FullName -ErrorAction SilentlyContinue).SignerCertificate
+                if ($signer) { try { $hbaStore.Add($signer); $hbaSeen++ } catch {} }
+            }
+            $hbaStore.Close()
+            Write-ColorOutput ("  [{0}] pre-trusted {1} signer(s)." -f $rule.Vendor, $hbaSeen) 'Gray'
+        } catch {
+            Write-ColorOutput ("  [{0}] WARNING: could not pre-trust signers: {1}" -f $rule.Vendor, $_.Exception.Message) 'Yellow'
+        }
+
+        $hbaOut  = & pnputil.exe /add-driver "$best" /install 2>&1
+        $hbaExit = $LASTEXITCODE
+        Write-ColorOutput ("  [{0}] pnputil /add-driver exit={1} ({2} line(s))." -f $rule.Vendor, $hbaExit, @($hbaOut).Count) 'Gray'
+
+        try {
+            $hbaLog = Join-Path $script:StressLogDir ("pnputil_hba_{0}_{1}.log" -f $rule.Vendor.ToLower(), (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            (@("=== pnputil /add-driver /install ===",
+               "Vendor    : $($rule.Vendor) (PCI\VEN_$($rule.Vid))",
+               "INF       : $best",
+               "DriverVer : $bestVer",
+               "Exit code : $hbaExit",
+               "") + @($hbaOut | ForEach-Object { "$_" })) | Set-Content -LiteralPath $hbaLog -Encoding utf8
+            Write-ColorOutput ("  [{0}] pnputil output saved: {1}" -f $rule.Vendor, $hbaLog) 'Gray'
+        } catch {
+            Write-ColorOutput ("  [{0}] WARN: could not save pnputil output: {1}" -f $rule.Vendor, $_.Exception.Message) 'Yellow'
+        }
+
+        & pnputil.exe /scan-devices 2>&1 | Out-Null
+
+        $after = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+                   Where-Object { "$($_.PNPDeviceID)" -match ("PCI\\VEN_{0}" -f $rule.Vid) })
+        $bound = 0
+        foreach ($d in $after) {
+            # Интересует только то устройство, ради которого всё затевалось.
+            $isTarget = $false
+            if ("$($d.PNPDeviceID)" -match 'DEV_([0-9A-Fa-f]{4})') { $isTarget = $wanted.ContainsKey($matches[1].ToUpper()) }
+            if (-not $isTarget) { continue }
+
+            $code = $d.ConfigManagerErrorCode
+            $bad  = ($code -and $code -ne 0)
+            if ("$($d.Service)" -match ("(?i)^{0}$" -f [regex]::Escape($rule.Service))) { $bound++ }
+            Write-ColorOutput ("    {0}: {1} | service={2} | CM_error={3}" -f `
+                $(if ($bad) { 'STILL FAILING' } else { 'OK' }),
+                $(if ($d.Name) { $d.Name } else { '<no name>' }),
+                $(if ($d.Service) { $d.Service } else { '<none>' }),
+                $code) $(if ($bad) { 'Red' } else { 'Green' })
+        }
+
+        if ($bound -gt 0) {
+            Write-ColorOutput ("  [{0}] driver bound to {1} device(s) - card is on its native driver." -f $rule.Vendor, $bound) 'Green'
         } else {
-            $mvBest = $null
-            $mvBestVer = [version]'0.0.0.0'
-            foreach ($inf in (Get-ChildItem -LiteralPath $hbaRoot -Recurse -Filter 'mvs91xx.inf' -ErrorAction SilentlyContinue)) {
-                if ($inf.FullName -notmatch '(?i)\\amd64\\') { continue }
-                $text = ''
-                try { $text = Get-Content -LiteralPath $inf.FullName -Raw -ErrorAction Stop } catch { continue }
-                if (-not $text) { continue }
-
-                $covers = $false
-                foreach ($id in $mvWanted.Keys) {
-                    if ($text -match ("(?i)DEV_{0}" -f $id)) { $covers = $true; break }
-                }
-                if (-not $covers) { continue }
-
-                $ver = [version]'0.0.0.0'
-                if ($text -match '(?im)^\s*DriverVer\s*=\s*[^,]*,\s*([0-9]+(?:\.[0-9]+){1,3})') {
-                    try { $ver = [version]$matches[1] } catch {}
-                }
-                Write-ColorOutput ("    candidate: {0} (DriverVer {1})" -f $inf.FullName.Substring($hbaRoot.Length).TrimStart('\'), $ver) 'DarkGray'
-                if ($ver -gt $mvBestVer) { $mvBestVer = $ver; $mvBest = $inf.FullName }
-            }
-
-            if (-not $mvBest) {
-                Write-ColorOutput "  No storport INF (mvs91xx.inf) covers the present device(s) - nothing to install." 'Yellow'
-            } else {
-                Write-ColorOutput ("  Selected: {0} (DriverVer {1})" -f $mvBest, $mvBestVer) 'Yellow'
-
-                # Издателя доверяем заранее, иначе pnputil поднимет модальное окно и
-                # повесит автоматический прогон.
-                try {
-                    $mvStore = New-Object System.Security.Cryptography.X509Certificates.X509Store 'TrustedPublisher','LocalMachine'
-                    $mvStore.Open('ReadWrite')
-                    $mvSeen = 0
-                    foreach ($cat in (Get-ChildItem -LiteralPath (Split-Path $mvBest -Parent) -Filter *.cat -ErrorAction SilentlyContinue)) {
-                        $signer = (Get-AuthenticodeSignature -LiteralPath $cat.FullName -ErrorAction SilentlyContinue).SignerCertificate
-                        if ($signer) { try { $mvStore.Add($signer); $mvSeen++ } catch {} }
-                    }
-                    $mvStore.Close()
-                    Write-ColorOutput "  Pre-trusted $mvSeen Marvell signer(s)." 'Gray'
-                } catch {
-                    Write-ColorOutput "  WARNING: could not pre-trust Marvell signers: $($_.Exception.Message)" 'Yellow'
-                }
-
-                $mvOut  = & pnputil.exe /add-driver "$mvBest" /install 2>&1
-                $mvExit = $LASTEXITCODE
-                Write-ColorOutput "  pnputil /add-driver exit=$mvExit ($(@($mvOut).Count) line(s))." 'Gray'
-
-                try {
-                    $mvLog = Join-Path $script:StressLogDir ("pnputil_marvell_{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-                    (@("=== pnputil /add-driver /install ===",
-                       "INF       : $mvBest",
-                       "DriverVer : $mvBestVer",
-                       "Exit code : $mvExit",
-                       "") + @($mvOut | ForEach-Object { "$_" })) | Set-Content -LiteralPath $mvLog -Encoding utf8
-                    Write-ColorOutput "  pnputil output saved: $mvLog" 'Gray'
-                } catch {
-                    Write-ColorOutput "  WARN: could not save Marvell pnputil output: $($_.Exception.Message)" 'Yellow'
-                }
-
-                & pnputil.exe /scan-devices 2>&1 | Out-Null
-
-                $mvAfter = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
-                             Where-Object { "$($_.PNPDeviceID)" -match 'PCI\\VEN_1B4B' })
-                foreach ($d in $mvAfter) {
-                    $code = $d.ConfigManagerErrorCode
-                    $bad  = ($code -and $code -ne 0)
-                    Write-ColorOutput ("    {0}: {1} | service={2} | CM_error={3}" -f `
-                        $(if ($bad) { 'STILL FAILING' } else { 'OK' }),
-                        $(if ($d.Name) { $d.Name } else { '<no name>' }),
-                        $(if ($d.Service) { $d.Service } else { '<none>' }),
-                        $code) $(if ($bad) { 'Red' } else { 'Green' })
-                }
-                $mvBound = @($mvAfter | Where-Object { "$($_.Service)" -match '(?i)mvs91xx' })
-                if ($mvBound.Count -gt 0) {
-                    Write-ColorOutput "  Marvell driver bound to $($mvBound.Count) device(s) - card is on the native driver." 'Green'
-                } else {
-                    Write-ColorOutput '  Marvell driver did NOT bind - card is still on the inbox driver. See the pnputil log above for the reason.' 'Red'
-                }
-            }
+            Write-ColorOutput ("  [{0}] driver did NOT bind - card is still on the inbox driver. See the pnputil log for the reason." -f $rule.Vendor) 'Red'
         }
     }
+
+    if ($hbaHandled -eq 0) {
+        Write-ColorOutput '  No supported SATA HBA present (checked Marvell VEN_1B4B and ASMedia VEN_1B21) - skipping.' 'Gray'
+    }
 } catch {
-    Write-ColorOutput "  Marvell HBA driver install failed (non-fatal): $($_.Exception.Message)" 'Yellow'
+    Write-ColorOutput "  SATA HBA driver install failed (non-fatal): $($_.Exception.Message)" 'Yellow'
 }
 
 # ===================== [2.4/7] .NET FRAMEWORK 3.5 =====================
