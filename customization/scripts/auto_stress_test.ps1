@@ -170,6 +170,73 @@ function Write-RaidLog {
     $line | Out-File -FilePath $logFile -Encoding UTF8 -Append
 }
 
+function Get-FilesystemSignatureFromBytes {
+    <#
+      Чистый разбор буфера: ни ввода-вывода, ни состояния. Вынесено из
+      Get-VolumeSignature отдельно именно для проверяемости - смещения и
+      магические числа можно прогнать на синтетических буферах, не имея под
+      рукой диска с ext4 и прав администратора.
+      Возвращает имя найденной ФС или $null.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$Buffer,
+        [Parameter(Mandatory)][int]$Length
+    )
+
+    $txt = {
+        param([int]$Off, [int]$Len)
+        if (($Off + $Len) -gt $Length) { return '' }
+        -join ($Buffer[$Off..($Off + $Len - 1)] | ForEach-Object { [char]$_ })
+    }
+
+    # Сначала то, что Windows обязан был опознать сам. Если сигнатура есть, а
+    # смонтировать не удалось - файловая система повреждена, а не отсутствует,
+    # и форматировать её тем более нельзя.
+    if ((& $txt 3 8) -eq 'NTFS    ') { return 'NTFS (present but not mounted - damaged?)' }
+    if ((& $txt 3 8) -eq 'EXFAT   ') { return 'exFAT (present but not mounted - damaged?)' }
+    if ((& $txt 54 5) -eq 'FAT16' -or (& $txt 54 5) -eq 'FAT12' -or (& $txt 82 5) -eq 'FAT32') { return 'FAT' }
+
+    # Чужие для Windows файловые системы: их он не читает и показывает 'Unknown'
+    # ровно так же, как раздел, который никогда не форматировали.
+    if ((& $txt 0 4) -eq 'XFSB')                                                  { return 'XFS' }
+    if ($Length -ge 0x43A -and $Buffer[0x438] -eq 0x53 -and $Buffer[0x439] -eq 0xEF) { return 'ext2/3/4' }
+    if ((& $txt 0x10040 8) -eq '_BHRfS_M')                                        { return 'btrfs' }
+    if ((& $txt 0x200 8)   -eq 'LABELONE')                                        { return 'LVM2' }
+
+    return $null
+}
+
+function Get-VolumeSignature {
+    <#
+      Читает НАЧАЛО тома сырыми байтами и ищет сигнатуры известных файловых систем.
+      Возвращает имя найденной ФС, строку 'unreadable: ...' или $null, если ничего
+      не нашлось.
+
+      Зачем (07.10.2026). Windows показывает FileSystemType='Unknown' в ДВУХ разных
+      случаях: раздел никогда не форматировали И на разделе чужая ФС (ext4/XFS/
+      btrfs/LVM), которую Windows читать не умеет. В обоих случаях он не видит там
+      ни одного файла - читать нечем. Поэтому проверка "файлов нет, значит пусто"
+      уверенно разрешает формат ровно тогда, когда на диске лежат чужие данные.
+      Сигнатура в суперблоке такой двусмысленности не имеет.
+
+      Любой неожиданный исход (том не читается, прочитали меньше сектора) трактуем
+      как "там что-то есть" и форматировать запрещаем: безопасный отказ лучше.
+    #>
+    param([Parameter(Mandatory)][string]$DriveLetter)
+
+    $buf  = New-Object byte[] 131072     # 128 КБ: хватает до суперблока btrfs (0x10040)
+    $read = 0
+    try {
+        $fs = New-Object System.IO.FileStream(("\\.\{0}:" -f $DriveLetter), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try { $read = $fs.Read($buf, 0, $buf.Length) } finally { $fs.Dispose() }
+    } catch {
+        return ("unreadable: {0}" -f $_.Exception.Message)
+    }
+    if ($read -lt 512) { return ("unreadable: only {0} byte(s) read" -f $read) }
+
+    return (Get-FilesystemSignatureFromBytes -Buffer $buf -Length $read)
+}
+
 function Get-FreeDriveLetter {
     $used = @(
         Get-Volume -ErrorAction SilentlyContinue |
@@ -647,15 +714,68 @@ function Ensure-DataDiskHasDriveLetter {
     try {
         foreach ($partition in $partitions) {
             if ($partition.DriveLetter) {
-                $letters += $partition.DriveLetter.ToString().ToUpper()
+                $letter = $partition.DriveLetter.ToString().ToUpper()
+            } else {
+                $letter = Get-FreeDriveLetter
+                Write-ColorOutput "  Assigning drive letter $letter`: to disk $($Disk.Number), partition $($partition.PartitionNumber)..." 'Yellow'
+                Write-RaidLog "Assigning drive letter $letter`: to disk $($Disk.Number), partition $($partition.PartitionNumber)"
+
+                Add-PartitionAccessPath -DiskNumber $Disk.Number -PartitionNumber $partition.PartitionNumber -DriveLetter $letter -ErrorAction Stop
+            }
+
+            # --- ДЫРА, ЗАКРЫТАЯ 07.10.2026 ---
+            # Раньше здесь всё и заканчивалось: букву забрали и пошли дальше. Файловую
+            # систему не смотрели НИКОГДА. Из-за этого раздел, который существует, но
+            # не отформатирован, проходил весь путь молча, а потом отбраковывался
+            # фильтром NTFS ниже - и стресс-тест час шёл без дисковой нагрузки, при
+            # этом рапортуя об успехе (SL111111-026 и -027, 06-07.10.2026).
+            # Замкнутый круг: не форматируем, потому что раздел есть; отбраковываем,
+            # потому что он не отформатирован.
+            #
+            # Форматируем ТОЛЬКО когда совпало всё:
+            #   - разрешено создание ($AllowCreatePartition: диск на MegaRAID, не
+            #     загрузочный, не системный, не USB, и в raid_config.json включено
+            #     init_if_present_but_raw);
+            #   - Windows не опознал файловую систему;
+            #   - и сырое чтение начала тома не нашло ни одной известной сигнатуры.
+            # Последнее условие - главное: оно отличает "никогда не форматировали"
+            # от "чужая ФС, которую Windows не читает". См. Get-VolumeSignature.
+            $vol = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue
+            $fsType = if ($vol) { "$($vol.FileSystemType)" } else { '<no volume>' }
+
+            if ($vol -and $vol.FileSystemType -eq 'NTFS') {
+                $letters += $letter
                 continue
             }
 
-            $letter = Get-FreeDriveLetter
-            Write-ColorOutput "  Assigning drive letter $letter`: to disk $($Disk.Number), partition $($partition.PartitionNumber)..." 'Yellow'
-            Write-RaidLog "Assigning drive letter $letter`: to disk $($Disk.Number), partition $($partition.PartitionNumber)"
+            if (-not $AllowCreatePartition) {
+                Write-RaidLog "Drive $letter`: FileSystemType='$fsType' but auto-create is not allowed - left untouched."
+                $letters += $letter
+                continue
+            }
+            if (-not $vol) {
+                Write-RaidLog "Drive $letter`: no volume object - cannot inspect or format, left untouched."
+                $letters += $letter
+                continue
+            }
 
-            Add-PartitionAccessPath -DiskNumber $Disk.Number -PartitionNumber $partition.PartitionNumber -DriveLetter $letter -ErrorAction Stop
+            $sig = Get-VolumeSignature -DriveLetter $letter
+            if ($sig) {
+                Write-RaidLog "REFUSING to format $letter`: - raw scan found '$sig'. Partition is NOT empty; leaving it alone."
+                Write-ColorOutput "  Drive $letter`: not NTFS but carries a '$sig' signature - NOT formatting." 'Yellow'
+                $letters += $letter
+                continue
+            }
+
+            Write-ColorOutput "  Drive $letter`: FileSystemType='$fsType', no filesystem signature found - formatting as NTFS..." 'Yellow'
+            Write-RaidLog "Formatting $letter`: (disk $($Disk.Number), partition $($partition.PartitionNumber), size $([math]::Round($partition.Size/1GB,1)) GB): FileSystemType='$fsType', raw scan found nothing."
+            try {
+                Format-Volume -DriveLetter $letter -FileSystem NTFS -NewFileSystemLabel 'Archive' -Confirm:$false -Force -ErrorAction Stop | Out-Null
+                $after = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue
+                Write-RaidLog "Formatted $letter`: -> FileSystemType='$(if ($after) { $after.FileSystemType } else { '<unknown>' })'"
+            } catch {
+                Write-RaidLog "Format of $letter`: FAILED: $_"
+            }
             $letters += $letter
         }
     } catch {
@@ -1305,6 +1425,60 @@ if ($driveLetters.Count -gt 0) {
     Write-ColorOutput "  FIO target drives: $($driveLetters -join ', ')" 'Green'
 } else {
     Write-ColorOutput "  FIO target drives not found. RAID may be visible in BIOS/StorCLI but not exposed to Windows." 'Yellow'
+
+    # --- ЗАСЛОН (07.10.2026) ---
+    # Раньше здесь было только это жёлтое предупреждение. Тест молча собирался без
+    # FIO, час крутил процессор, рапортовал Pipeline healthy, снимался FFU - и
+    # машина уезжала, НЕ протестированная по дискам (SL111111-026 и -027).
+    # Дефект не в том, что диск не поднялся, а в том, что конвейер не замечает,
+    # что не проверил то, что обещал. Причина в следующий раз будет другая -
+    # контроллер, вылетевший диск, не назначенная буква - а исход тот же.
+    #
+    # Сверяем ОБЕЩАНИЕ с ФАКТОМ: если SL объявил массив данных, а пригодного тома
+    # в Windows нет - это провал сборки, захват FFU блокируется.
+    # Машин без массива данных это не касается: там таких групп в конфиге нет.
+    # Горячий резерв тоже идёт с disk_system=FALSE, поэтому по Type отсеиваем всё,
+    # что не RAID (HotSpare и прочее) - иначе конфиг с одним резервом дал бы
+    # ложное срабатывание.
+    $slDeclaresDataArray = $false
+    try {
+        $slForRaid = (Get-ItemProperty -Path 'HKLM:\Software\IPDROM' -Name 'SL' -ErrorAction SilentlyContinue).SL
+        if ($slForRaid) {
+            $cfgForRaid = Join-Path $usbRoot "config\$slForRaid.txt"
+            if (-not (Test-Path -LiteralPath $cfgForRaid)) { $cfgForRaid = "C:\IPDROM\config\$slForRaid.txt" }
+            if (Test-Path -LiteralPath $cfgForRaid) {
+                $grp = @{}
+                foreach ($line in (Get-Content -LiteralPath $cfgForRaid -ErrorAction SilentlyContinue)) {
+                    if ($line -match '^\s*group_(\d+)_(.+?)\s*=\s*(.*)$') {
+                        $gn = $matches[1]; $gf = $matches[2].Trim().ToLower(); $gv = $matches[3].Trim()
+                        if (-not $grp.ContainsKey($gn)) { $grp[$gn] = @{} }
+                        $grp[$gn][$gf] = $gv
+                    }
+                }
+                foreach ($gn in $grp.Keys) {
+                    $isSys = "$($grp[$gn]['disk_system'])".Trim().ToUpper()
+                    $gType = "$($grp[$gn]['type'])"
+                    if ($isSys -eq 'FALSE' -and $gType -match '(?i)raid') {
+                        $slDeclaresDataArray = $true
+                        Write-RaidLog "SL group $gn declares a DATA array (Type='$gType', disk_system=FALSE)."
+                        break
+                    }
+                }
+            } else {
+                Write-RaidLog "SL config not found for the data-array check: $cfgForRaid"
+            }
+        }
+    } catch {
+        Write-RaidLog "Data-array declaration check failed: $_"
+    }
+
+    if ($slDeclaresDataArray) {
+        Write-ColorOutput '  *** SL declares a DATA RAID array, but no writable volume reached Windows. ***' 'Red'
+        Write-ColorOutput '  *** The stress test would run with NO disk load at all. Blocking FFU capture. ***' 'Red'
+        Mark-PipelineFailure 'SL declares a data RAID array, but no writable data volume was found - the stress test would have run without any disk load'
+    } else {
+        Write-ColorOutput '  SL declares no data array - running without FIO is expected here.' 'Gray'
+    }
 }
 Write-ColorOutput "  Additional drives: $($driveLetters -join ', ')" 'Gray'
 
@@ -1488,7 +1662,11 @@ try {
     if (-not $grdDir) {
         Write-ColorOutput '  Guardant driver folder not found - skipping.' 'Gray'
     } else {
-        $grdInfs = @(Get-ChildItem -LiteralPath $grdDir -Recurse -Filter *.inf -ErrorAction SilentlyContinue)
+        # -File обязателен: без него под маску *.inf попадают ещё и ИМЕНА ПАПОК
+        # вида grdusb.inf_amd64_5dc335baad6f68ab, и строка ниже рапортует 4 INF
+        # там, где файлов ровно два. На работу это не влияло (маску разворачивает
+        # сам pnputil), но в логе выглядело как лишние пакеты.
+        $grdInfs = @(Get-ChildItem -LiteralPath $grdDir -Recurse -File -Filter *.inf -ErrorAction SilentlyContinue)
         Write-ColorOutput ("  Source: {0} ({1} INF: {2})" -f $grdDir, $grdInfs.Count, (($grdInfs | ForEach-Object { $_.Name }) -join ', ')) 'Gray'
 
         # Издателя доверяем заранее - иначе pnputil поднимет модальное окно и повесит

@@ -536,6 +536,10 @@ foreach ($p in $plan) {
 
     # --- РЕАЛЬНОЕ СОЗДАНИЕ ---
     Write-Log "  Creating array..." 'Yellow'
+    # Снимок номеров дисков ДО создания - чтобы потом точно знать, какой наш.
+    $disksBefore = @()
+    try { $disksBefore = @(Get-Disk -ErrorAction SilentlyContinue | ForEach-Object { $_.Number }) } catch {}
+
     $out = & $storcli /c0 add vd $($p.Level) drives=$slots 2>&1
     foreach ($l in $out) { Write-Log "    | $l" 'DarkGray' }
     if ($LASTEXITCODE -eq 0) {
@@ -543,6 +547,41 @@ foreach ($p in $plan) {
         # Дать контроллеру/ОС время увидеть новый VD (RAID-6 инициализируется
         # в фоне, но диск должен появиться до rescan в вызывающем скрипте).
         Start-Sleep -Seconds 8
+
+        # --- ЧИСТЫЙ СТАРТ (07.10.2026) ---
+        # storcli add vd НЕ обнуляет пластины: старая таблица разделов от прежнего
+        # массива остаётся читаемой по тем же адресам. Windows видит GPT и раздел,
+        # но раскладка страйпов изменилась, файловая система внутри - мусор
+        # (FileSystemType='Unknown'), и диск уходит по ветке "раздел уже есть".
+        # Так на SL111111-026 и -027 стресс-тест час шёл без дисковой нагрузки.
+        #
+        # Массив создали МЫ, секунды назад - ценного на нём нет по построению,
+        # поэтому стереть таблицу разделов безопасно. После этого диск приходит
+        # в Windows действительно RAW и идёт по ветке, которая работает верно:
+        # Initialize-Disk -> New-Partition -> Format-Volume.
+        try {
+            $fresh = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.Number -notin $disksBefore })
+            if ($fresh.Count -eq 0) {
+                Write-Log "  New VD not enumerated by Windows yet - partition table left as is (data-disk prep will handle it)." 'Yellow'
+            }
+            foreach ($d in $fresh) {
+                # Страховки, хоть диск и заведомо наш: ошибка здесь необратима.
+                if ($d.IsBoot -or $d.IsSystem) {
+                    Write-Log "  SAFETY: disk $($d.Number) reports IsBoot/IsSystem - NOT touching it." 'Red'
+                    continue
+                }
+                if ("$($d.BusType)" -eq 'USB') {
+                    Write-Log "  SAFETY: disk $($d.Number) is on the USB bus - NOT touching it." 'Red'
+                    continue
+                }
+                Write-Log ("  Clearing stale partition table on the new disk {0} ({1}, {2} GB)..." -f $d.Number, $d.FriendlyName, [math]::Round($d.Size / 1GB, 1)) 'Yellow'
+                Clear-Disk -Number $d.Number -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
+                $chk = Get-Disk -Number $d.Number -ErrorAction SilentlyContinue
+                Write-Log ("  Disk {0} cleared, PartitionStyle now '{1}'." -f $d.Number, $(if ($chk) { $chk.PartitionStyle } else { '<unknown>' })) 'Green'
+            }
+        } catch {
+            Write-Log "  Could not clear the new disk's partition table: $_ (data-disk prep will try to handle it)" 'Yellow'
+        }
     } else {
         Write-Log "  storcli add vd FAILED (exit $LASTEXITCODE). Group $($p.Group) skipped." 'Red'
     }

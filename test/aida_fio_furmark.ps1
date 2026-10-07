@@ -696,6 +696,59 @@ $finalShotTime = $aidaEndTime.AddSeconds(-30)    # T - 30 s  : AidaFinal (AIDA �
 # поэтому отдаём его сюда - см. проверку в начале функции.
 $script:AidaDeadline = $aidaEndTime
 
+# --- ЗАМЕР РЕАЛЬНОЙ НАГРУЗКИ (07.10.2026) ---
+# До сих пор мы час ждали окончания теста и верили на слово, что машина под
+# нагрузкой. На SL111111-027 скриншоты AIDA показали ровные 25-28 C по процессору
+# от старта и до конца - это температуры простоя, хотя тест формально шёл.
+# Проверить было нечем: ни одной цифры о загрузке в логах не оставалось.
+# Теперь на каждом ударе heartbeat (раз в 2 минуты) снимаем загрузку и частоту,
+# копим в $script:LoadSamples и в конце печатаем min/avg/max. Это закрывает
+# вопрос "а грузилось ли вообще" раз и навсегда.
+#
+# Счётчик берём из Win32_PerfFormattedData_PerfOS_Processor, а НЕ через Get-Counter:
+# у Get-Counter пути локализованы, и на русской Windows счётчика
+# '\Processor(_Total)\% Processor Time' просто не существует - там он называется
+# '\Процессор(_Total)\% загруженности процессора'. Классы CIM от локали не зависят.
+$script:LoadSamples = @()
+
+function Get-LoadSample {
+    $load    = $null
+    $freqPct = $null
+
+    # Основной источник: одним запросом отдаёт и загрузку, и РЕАЛЬНУЮ частоту в
+    # процентах от максимальной - то есть видно, поднялся ли процессор в турбо
+    # или сидит в троттлинге.
+    # Win32_Processor.CurrentClockSpeed для этого НЕ годится: он отдаёт номинал
+    # и под нагрузкой не меняется вообще (проверено 07.10.2026 - 1990 МГц и в
+    # простое, и под нагрузкой, тогда как PercentofMaximumFrequency рос).
+    try {
+        $pi = Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'" -ErrorAction Stop
+        if ($pi) {
+            $load    = [int]$pi.PercentProcessorTime
+            $freqPct = [int]$pi.PercentofMaximumFrequency
+        }
+    } catch {}
+
+    # Запасные пути по загрузке, если класс выше недоступен.
+    if ($null -eq $load) {
+        try {
+            $perf = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop
+            if ($perf) { $load = [int]$perf.PercentProcessorTime }
+        } catch {}
+    }
+    if ($null -eq $load) {
+        try {
+            $cpus = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
+            if ($cpus.Count -gt 0) {
+                $avgLoad = ($cpus | Measure-Object -Property LoadPercentage -Average).Average
+                if ($null -ne $avgLoad) { $load = [int]$avgLoad }
+            }
+        } catch {}
+    }
+
+    return [pscustomobject]@{ Load = $load; FreqPct = $freqPct }
+}
+
 function Wait-Until {
     # Resilient wait until $Target wall-clock time.
     # Uses small (max 30s) Start-Sleep chunks in a loop so that if Windows
@@ -742,7 +795,15 @@ function Wait-Until {
         # Heartbeat every 2 minutes so it's visible in log that we're alive
         if (((Get-Date) - $lastLog).TotalSeconds -ge 120) {
             $remNow = [int](($Target - (Get-Date)).TotalSeconds)
-            if ($remNow -gt 0) { Write-Log "    ...still waiting for ${Label}: ${remNow}s remaining (now $((Get-Date).ToString('HH:mm:ss')))" 'DarkGray' }
+            if ($remNow -gt 0) {
+                # Замер пишем в ту же строку heartbeat: отдельных записей не плодим,
+                # а хронология нагрузки видна прямо по ходу ожидания.
+                $smp = Get-LoadSample
+                if ($null -ne $smp.Load) { $script:LoadSamples += $smp.Load }
+                $loadTxt = if ($null -ne $smp.Load)    { "{0}%" -f $smp.Load } else { 'n/a' }
+                $freqTxt = if ($null -ne $smp.FreqPct) { "freq {0}% of max" -f $smp.FreqPct } else { 'freq n/a' }
+                Write-Log "    ...still waiting for ${Label}: ${remNow}s remaining (now $((Get-Date).ToString('HH:mm:ss'))) | CPU $loadTxt, $freqTxt" 'DarkGray'
+            }
             $lastLog = Get-Date
         }
     }
@@ -814,6 +875,27 @@ if ($lastLaunchOffsetSec -gt 0) {
 # ===================== 80 SEC FOR CONSOLE FINAL STATUS =====================
 Write-Log "Waiting 80s for console windows to print final status (_FINAL title)..."
 Start-Sleep -Seconds 80
+
+# ===================== НАГРУЗКА ЗА ПРОГОН =====================
+# Сводка по замерам, накопленным в Wait-Until. Именно здесь видно, если тест час
+# отработал вхолостую: порог 80% выбран с запасом - AIDA64 с подтестами CPU+FPU
+# держит около 100%, и даже 80% означает, что нагрузки фактически не было.
+if ($script:LoadSamples.Count -gt 0) {
+    $st   = $script:LoadSamples | Measure-Object -Minimum -Maximum -Average
+    $avgL = [int]$st.Average
+    $maxL = [int]$st.Maximum
+    Write-Log ("CPU load over the run: min {0}%, avg {1}%, max {2}% ({3} samples)" -f [int]$st.Minimum, $avgL, $maxL, $script:LoadSamples.Count) 'Cyan'
+    if ($maxL -lt 80) {
+        Write-Log "  *** WARNING: CPU never reached 80% - the stress test did NOT load this machine. ***" 'Red'
+        Write-Log "  Check that AIDA64 really started its CPU/FPU subtests, and compare with the temperatures on the screenshots." 'Red'
+    } elseif ($avgL -lt 50) {
+        Write-Log "  *** WARNING: average CPU load below 50% - the machine was loaded only part of the time. ***" 'Yellow'
+    } else {
+        Write-Log "  CPU load looks healthy for a stress run." 'Green'
+    }
+} else {
+    Write-Log "CPU load: no samples collected (run shorter than one heartbeat?)." 'Yellow'
+}
 
 # ===================== TOOL-SPECIFIC FINAL SCREENSHOTS =====================
 # FurMark/FIO консоли нужны открытыми с _FINAL заголовком, иначе их не найти.
