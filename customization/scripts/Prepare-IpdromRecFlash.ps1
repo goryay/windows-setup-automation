@@ -361,7 +361,7 @@ foreach ($d in $allUsbDisks) {
         [void]$reasons.Add("foreign partitions/data (labels: $($labels -join ',' )))")
     }
     if ($isRecyclable) {
-        Write-Log ("  note:      Disk {0} has {1} unlabeled partition(s) — treating as recyclable (previous half-format)." -f $d.Number, $partitions.Count) 'DarkYellow'
+        Write-Log ("  note:      Disk {0} has {1} unlabeled partition(s) - treating as recyclable (previous half-format)." -f $d.Number, $partitions.Count) 'DarkYellow'
     }
 
     $entry = [pscustomobject]@{
@@ -383,7 +383,19 @@ foreach ($d in $allUsbDisks) {
 }
 
 if ($candidates.Count -eq 0) {
-    Write-Log "No suitable USB flash candidates found. Skipping." 'Yellow'
+    # Раньше здесь было одно слово "Skipping", и отсутствие флешки восстановления
+    # проходило почти незаметно: сборка шла дальше, машина собиралась без образа,
+    # и выяснялось это только при разборе логов (SL111111-027, 07.10.2026 - два
+    # прогона подряд без флешки). Пишем громко и с причиной по каждому носителю.
+    Write-Log "========================================" 'Red'
+    Write-Log "   NO RECOVERY FLASH - IMAGE WILL NOT BE CREATED" 'Red'
+    Write-Log "========================================" 'Red'
+    Write-Log "Not a single USB drive qualified. Reason for each one is listed above." 'Red'
+    Write-Log "A recovery flash must be:" 'Yellow'
+    Write-Log "  - between $MinFlashGB and $MaxFlashGB GB in size;" 'Yellow'
+    Write-Log "  - NOT labelled 'IPDROM' (that label marks the delivery flash, which is a different one)." 'Yellow'
+    Write-Log "Plug in a suitable drive and re-run the build." 'Yellow'
+    Write-Log "NOTE: one flash cannot do both jobs - delivery and recovery are two separate drives." 'Yellow'
     exit 4
 }
 

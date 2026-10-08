@@ -544,9 +544,22 @@ foreach ($p in $plan) {
     foreach ($l in $out) { Write-Log "    | $l" 'DarkGray' }
     if ($LASTEXITCODE -eq 0) {
         Write-Log "  Array created OK (group $($p.Group), $($p.Level))." 'Green'
-        # Дать контроллеру/ОС время увидеть новый VD (RAID-6 инициализируется
-        # в фоне, но диск должен появиться до rescan в вызывающем скрипте).
-        Start-Sleep -Seconds 8
+
+        # Ждём, пока Windows перечислит новый VD, с опросом до 60 с и явным
+        # /scan-devices между попытками. Фиксированной паузы в 8 секунд мало:
+        # не дождались - таблица разделов осталась старой, диск ушёл по ветке
+        # "раздел уже есть", и сборку остановил заслон. То есть ровно та
+        # ситуация, ради которой этот блок и писался.
+        $fresh = @()
+        for ($try = 1; $try -le 10; $try++) {
+            Start-Sleep -Seconds 6
+            try { & pnputil.exe /scan-devices 2>&1 | Out-Null } catch {}
+            $fresh = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.Number -notin $disksBefore })
+            if ($fresh.Count -gt 0) {
+                Write-Log ("  New VD enumerated by Windows after {0}s." -f ($try * 6)) 'Gray'
+                break
+            }
+        }
 
         # --- ЧИСТЫЙ СТАРТ (07.10.2026) ---
         # storcli add vd НЕ обнуляет пластины: старая таблица разделов от прежнего
@@ -560,9 +573,9 @@ foreach ($p in $plan) {
         # в Windows действительно RAW и идёт по ветке, которая работает верно:
         # Initialize-Disk -> New-Partition -> Format-Volume.
         try {
-            $fresh = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.Number -notin $disksBefore })
             if ($fresh.Count -eq 0) {
-                Write-Log "  New VD not enumerated by Windows yet - partition table left as is (data-disk prep will handle it)." 'Yellow'
+                Write-Log "  WARNING: new VD did NOT appear in Windows within 60s - stale partition table left in place." 'Red'
+                Write-Log "  The data-disk prep will try to handle it, and will refuse if it finds a filesystem signature." 'Yellow'
             }
             foreach ($d in $fresh) {
                 # Страховки, хоть диск и заведомо наш: ошибка здесь необратима.

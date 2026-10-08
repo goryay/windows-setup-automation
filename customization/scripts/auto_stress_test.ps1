@@ -2318,41 +2318,26 @@ try {
     Write-ColorOutput "  WARN: could not disable built-in Administrator: $_" 'Yellow'
 }
 
-# ===================== PIPELINE HEALTH GATE =====================
-# Не запускаем FFU-захват если что-то критичное завалилось.
-# Машину с битыми тестами или незавершёнными артефактами клиенту отгружать нельзя.
+# ===================== PIPELINE HEALTH GATE, часть 1: ПРЕДУПРЕДИТЬ =====================
+# Заслон РАЗДЕЛЁН НАДВОЕ (08.10.2026). Раньше он прямо здесь делал exit 1 и обрывал
+# скрипт целиком - а вместе с захватом FFU отваливалась и доставка на флешку [6.6/7]:
+# софт, драйверы, документация. Оператор оставался и без образа, и с пустой флешкой,
+# хотя сообщение обещало только отсутствие FFU (SL111111-027, 07.10.2026: флешка
+# IPDROM осталась пустой, 29,2 ГБ свободно из 29,2 ГБ).
+# Теперь: предупреждаем здесь, доставку на флешку выполняем ВСЕГДА - она ничего не
+# ломает и нужна оператору при любом исходе, - а блокируем ровно захват FFU, ниже,
+# перед [6.65/7]. Машина с проваленными тестами всё так же не уедет.
 if (-not $script:PipelineHealthy) {
     Write-ColorOutput "`n========================================" 'Red'
-    Write-ColorOutput '   FFU CAPTURE BLOCKED' 'Red'
+    Write-ColorOutput '   PIPELINE FAILED - FFU CAPTURE WILL BE BLOCKED' 'Red'
     Write-ColorOutput '========================================' 'Red'
-    Write-ColorOutput 'Pipeline had failures - FFU recovery image will NOT be created:' 'Red'
     foreach ($f in $script:PipelineFailures) {
         Write-ColorOutput "  - $f" 'Red'
     }
-    Write-ColorOutput "`nFix the issues above and either:" 'Yellow'
-    Write-ColorOutput '  1) Re-run the full pipeline from a clean install, OR' 'Yellow'
-    Write-ColorOutput '  2) Capture FFU manually after fixing (Prepare + Trigger).' 'Yellow'
-
-    # Записываем подробный маркер для оператора/диагностики
-    $failureMarker = Join-Path $env:ProgramData 'IPDROM_PipelineFailed.flag'
-    $marker = "Pipeline failure at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n"
-    $marker += "Failures:`r`n"
-    foreach ($f in $script:PipelineFailures) { $marker += "  - $f`r`n" }
-    Set-Content -LiteralPath $failureMarker -Value $marker -Encoding utf8 -Force
-    Write-ColorOutput "`nFailure details saved: $failureMarker" 'Gray'
-
-    # ВАЖНО: ставим Completed.flag чтобы launcher не зациклился на повторных стрессах.
-    # Если оператор хочет переделать - руками удаляет оба флага.
-    if (-not (Test-Path $flagFile)) {
-        New-Item -Path $flagFile -ItemType File -Force | Out-Null
-    }
-    Write-ColorOutput "`n========================================" 'Red'
-    Write-ColorOutput '   PIPELINE COMPLETED WITH FAILURES' 'Red'
-    Write-ColorOutput '========================================' 'Red'
-    exit 1
+    Write-ColorOutput '  Delivery flash is still being filled below - the operator needs it either way.' 'Yellow'
+} else {
+    Write-ColorOutput '  Pipeline healthy - proceeding to FFU capture.' 'Green'
 }
-
-Write-ColorOutput '  Pipeline healthy - proceeding to FFU capture.' 'Green'
 
 # ===================== [6.6/7] DEPLOY EXTRAS TO IPDROM =====================
 # Copy drivers/, software/, per-SL PDFs to the flash operator picked in WinPE
@@ -2376,6 +2361,59 @@ if (Test-Path $deployExtras) {
     }
 } else {
     Write-ColorOutput '  deploy_extras.ps1 not found - skipping.' 'Gray'
+}
+
+# ===================== PIPELINE HEALTH GATE, часть 2: ОСТАНОВИТЬ =====================
+# Доставка на флешку выполнена, дальше идёт то, чего делать нельзя: регистрация
+# задачи защиты и захват FFU. Здесь и останавливаемся.
+#
+# Сообщение пишем ПОДРОБНО и с конкретными командами. Прежнее «Fix the issues above»
+# инструкцией не было: оператор видел красный текст и не знал, что делать, и стенд
+# стоял до нашего разбора. Ниже - разбор по каждой известной причине.
+if (-not $script:PipelineHealthy) {
+    Write-ColorOutput "`n========================================" 'Red'
+    Write-ColorOutput '   FFU CAPTURE BLOCKED' 'Red'
+    Write-ColorOutput '========================================' 'Red'
+    Write-ColorOutput 'Recovery image will NOT be created. Reasons:' 'Red'
+    foreach ($f in $script:PipelineFailures) {
+        Write-ColorOutput "  - $f" 'Red'
+    }
+
+    # Подсказка по той причине, которая реально встречается на стендах.
+    if (($script:PipelineFailures -join ' ') -match 'data RAID array') {
+        Write-ColorOutput "`n  WHAT TO DO - the data array carries a partition the pipeline will not touch:" 'Yellow'
+        Write-ColorOutput '  The safe route is to let the pipeline build the array itself.' 'Yellow'
+        Write-ColorOutput '    1) Delete the data virtual drive (check the VD number first with /c0 show):' 'Yellow'
+        Write-ColorOutput '         C:\IPDROM\SoftForTest\StorCLI\storcli64.exe /c0 show' 'Cyan'
+        Write-ColorOutput '         C:\IPDROM\SoftForTest\StorCLI\storcli64.exe /c0/v0 del force' 'Cyan'
+        Write-ColorOutput '    2) Re-run the build. The pipeline creates the array and wipes its' 'Yellow'
+        Write-ColorOutput '       partition table automatically, so this cannot happen again.' 'Yellow'
+        Write-ColorOutput '  Alternative, if the array must be kept - wipe the partition table by hand' 'Yellow'
+        Write-ColorOutput '  (CHECK the disk number: Get-Disk must show AVAGO and the array size):' 'Yellow'
+        Write-ColorOutput '         Get-Disk' 'Cyan'
+        Write-ColorOutput '         Clear-Disk -Number <N> -RemoveData -RemoveOEM -Confirm:$false' 'Cyan'
+    }
+
+    Write-ColorOutput "`n  Software, drivers and documentation HAVE been copied to the IPDROM flash." 'Gray'
+    Write-ColorOutput '  Only the recovery image is missing.' 'Gray'
+
+    # Подробный маркер для оператора/диагностики
+    $failureMarker = Join-Path $env:ProgramData 'IPDROM_PipelineFailed.flag'
+    $marker = "Pipeline failure at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n"
+    $marker += "Failures:`r`n"
+    foreach ($f in $script:PipelineFailures) { $marker += "  - $f`r`n" }
+    Set-Content -LiteralPath $failureMarker -Value $marker -Encoding utf8 -Force
+    Write-ColorOutput "`nFailure details saved: $failureMarker" 'Gray'
+
+    # ВАЖНО: ставим Completed.flag чтобы launcher не зациклился на повторных стрессах.
+    # Если оператор хочет переделать - руками удаляет оба флага.
+    if (-not (Test-Path $flagFile)) {
+        New-Item -Path $flagFile -ItemType File -Force | Out-Null
+    }
+    Write-ColorOutput "`n========================================" 'Red'
+    Write-ColorOutput '   PIPELINE COMPLETED WITH FAILURES' 'Red'
+    Write-ColorOutput '========================================' 'Red'
+    exit 1
 }
 
 # ===================== [6.65/7] REGISTER PROTECT-IPDROMREC TASK =====================
