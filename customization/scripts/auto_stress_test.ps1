@@ -617,10 +617,66 @@ function Get-MegaRaidVirtualDriveState {
     return $false
 }
 
+function Test-SlDeclaresDataArray {
+    <#
+      Объявляет ли конфиг SL группу ДАННЫХ на RAID-контроллере.
+
+      Это не праздный вопрос, а признак того, что массив пересобран ЭТОЙ установкой.
+      install.bat в WinPE на каждой установке делает:
+          storcli /c0/vall del force          - удаляет ВСЕ массивы
+          cscript build_avago.vbs ... EXECUTE - собирает заново по конфигу SL
+      и делает это ровно тогда, когда в конфиге есть группы под avago.
+      Значит при положительном ответе содержимое массива - остатки ПРЕДЫДУЩЕГО
+      массива: storcli не обнуляет пластины, и старая разметка остаётся читаемой,
+      а данные после пересборки недостижимы. Защищать там нечего.
+
+      Горячий резерв тоже идёт с disk_system=FALSE, поэтому по Type отсеиваем всё,
+      что не RAID - иначе конфиг с одним резервом дал бы ложный ответ.
+      Результат кэшируем: спрашивают дважды - при подготовке дисков и в заслоне.
+    #>
+    param([Parameter(Mandatory)][string]$UsbRoot)
+
+    if ($null -ne $script:SlDataArrayDeclared) { return $script:SlDataArrayDeclared }
+    $script:SlDataArrayDeclared = $false
+    try {
+        $slName = (Get-ItemProperty -Path 'HKLM:\Software\IPDROM' -Name 'SL' -ErrorAction SilentlyContinue).SL
+        if (-not $slName) { return $script:SlDataArrayDeclared }
+
+        $cfg = Join-Path $UsbRoot "config\$slName.txt"
+        if (-not (Test-Path -LiteralPath $cfg)) { $cfg = "C:\IPDROM\config\$slName.txt" }
+        if (-not (Test-Path -LiteralPath $cfg)) {
+            Write-RaidLog "SL config not found for the data-array check: $cfg"
+            return $script:SlDataArrayDeclared
+        }
+
+        $grp = @{}
+        foreach ($line in (Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*group_(\d+)_(.+?)\s*=\s*(.*)$') {
+                $gn = $matches[1]; $gf = $matches[2].Trim().ToLower(); $gv = $matches[3].Trim()
+                if (-not $grp.ContainsKey($gn)) { $grp[$gn] = @{} }
+                $grp[$gn][$gf] = $gv
+            }
+        }
+        foreach ($gn in $grp.Keys) {
+            $isSys = "$($grp[$gn]['disk_system'])".Trim().ToUpper()
+            $gType = "$($grp[$gn]['type'])"
+            if ($isSys -eq 'FALSE' -and $gType -match '(?i)raid') {
+                $script:SlDataArrayDeclared = $true
+                Write-RaidLog "SL group $gn declares a DATA array (Type='$gType', disk_system=FALSE)."
+                break
+            }
+        }
+    } catch {
+        Write-RaidLog "Data-array declaration check failed: $_"
+    }
+    return $script:SlDataArrayDeclared
+}
+
 function Ensure-DataDiskHasDriveLetter {
     param(
         [Parameter(Mandatory)]$Disk,
-        [bool]$AllowCreatePartition
+        [bool]$AllowCreatePartition,
+        [string]$UsbRoot = ''
     )
 
     Write-RaidLog "Preparing disk Number=$($Disk.Number), FriendlyName=$($Disk.FriendlyName), Size=$($Disk.Size), BusType=$($Disk.BusType), PartitionStyle=$($Disk.PartitionStyle), Offline=$($Disk.IsOffline), ReadOnly=$($Disk.IsReadOnly)"
@@ -761,14 +817,44 @@ function Ensure-DataDiskHasDriveLetter {
 
             $sig = Get-VolumeSignature -DriveLetter $letter
             if ($sig) {
-                Write-RaidLog "REFUSING to format $letter`: - raw scan found '$sig'. Partition is NOT empty; leaving it alone."
-                Write-ColorOutput "  Drive $letter`: not NTFS but carries a '$sig' signature - NOT formatting." 'Yellow'
-                $letters += $letter
-                continue
+                # --- ПЕРЕКРЫТИЕ ОТКАЗА (09.10.2026) ---
+                # Сигнатурная защита писалась против чужих данных. Но в PXE-потоке
+                # массив данных пересобирает САМ конвейер, в WinPE: install.bat делает
+                # storcli /c0/vall del force, затем build_avago.vbs ... EXECUTE. Пластины
+                # при этом не обнуляются, поэтому разметка и загрузочный сектор NTFS от
+                # ПРЕДЫДУЩЕГО массива остаются читаемыми - и защита упиралась в них,
+                # а сборку останавливал заслон (SL111111-026 и -027, 07-08.10.2026).
+                #
+                # Я трое суток считал, что массив собирают руками перед сборкой. Это было
+                # неверно: сборщик не трогал ничего, всё делал конвейер, а мой "чистый
+                # старт" стоял в apply_raid_groups, который массив никогда не создаёт -
+                # к запуску Windows он уже собран. Поэтому очистка ни разу не сработала.
+                #
+                # Условие перекрытия точное: конфиг SL объявляет группу данных RAID,
+                # значит install.bat на ЭТОЙ установке массив удалил и пересобрал, и всё
+                # читаемое на нём - мусор прежнего массива. Данные после пересборки
+                # недостижимы, защищать нечего.
+                # Вне этого условия отказ остаётся в силе.
+                $rebuiltByPipeline = $false
+                if ($UsbRoot) { $rebuiltByPipeline = Test-SlDeclaresDataArray -UsbRoot $UsbRoot }
+
+                if (-not $rebuiltByPipeline) {
+                    Write-RaidLog "REFUSING to format $letter`: - raw scan found '$sig'. Partition is NOT empty; leaving it alone."
+                    Write-ColorOutput "  Drive $letter`: not NTFS but carries a '$sig' signature - NOT formatting." 'Yellow'
+                    $letters += $letter
+                    continue
+                }
+
+                Write-RaidLog "Drive $letter`: raw scan found '$sig', BUT the SL config declares this data array, so install.bat rebuilt it during this install (storcli vall del + build_avago). The signature belongs to the previous array - formatting."
+                Write-ColorOutput "  Drive $letter`: stale '$sig' from the previous array (rebuilt by the pipeline this install) - formatting." 'Yellow'
             }
 
-            Write-ColorOutput "  Drive $letter`: FileSystemType='$fsType', no filesystem signature found - formatting as NTFS..." 'Yellow'
-            Write-RaidLog "Formatting $letter`: (disk $($Disk.Number), partition $($partition.PartitionNumber), size $([math]::Round($partition.Size/1GB,1)) GB): FileSystemType='$fsType', raw scan found nothing."
+            # Сюда приходим двумя путями: сигнатур не нашлось вовсе, либо нашлась
+            # старая от пересобранного конвейером массива (перекрытие выше).
+            # Формулировка не должна врать ни в том, ни в другом случае.
+            $why = if ($sig) { "stale '$sig' from the array rebuilt during this install" } else { 'no filesystem signature found' }
+            Write-ColorOutput "  Drive $letter`: FileSystemType='$fsType', $why - formatting as NTFS..." 'Yellow'
+            Write-RaidLog "Formatting $letter`: (disk $($Disk.Number), partition $($partition.PartitionNumber), size $([math]::Round($partition.Size/1GB,1)) GB): FileSystemType='$fsType', $why."
             try {
                 Format-Volume -DriveLetter $letter -FileSystem NTFS -NewFileSystemLabel 'Archive' -Confirm:$false -Force -ErrorAction Stop | Out-Null
                 $after = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue
@@ -884,7 +970,7 @@ function Get-FioTargetDriveLetters {
 
         Write-RaidLog "Disk $($disk.Number): bus=$busType, megaRaidLike=$isMegaRaidLike, safeBus=$isSafeBus, allowCreate=$allowCreate"
 
-        $preparedLetters += Ensure-DataDiskHasDriveLetter -Disk $disk -AllowCreatePartition:$allowCreate
+        $preparedLetters += Ensure-DataDiskHasDriveLetter -Disk $disk -AllowCreatePartition:$allowCreate -UsbRoot $UsbRoot
     }
 
     Invoke-StorageRescan -SkipDiskpart $skipDiskpart
@@ -1440,37 +1526,10 @@ if ($driveLetters.Count -gt 0) {
     # Горячий резерв тоже идёт с disk_system=FALSE, поэтому по Type отсеиваем всё,
     # что не RAID (HotSpare и прочее) - иначе конфиг с одним резервом дал бы
     # ложное срабатывание.
-    $slDeclaresDataArray = $false
-    try {
-        $slForRaid = (Get-ItemProperty -Path 'HKLM:\Software\IPDROM' -Name 'SL' -ErrorAction SilentlyContinue).SL
-        if ($slForRaid) {
-            $cfgForRaid = Join-Path $usbRoot "config\$slForRaid.txt"
-            if (-not (Test-Path -LiteralPath $cfgForRaid)) { $cfgForRaid = "C:\IPDROM\config\$slForRaid.txt" }
-            if (Test-Path -LiteralPath $cfgForRaid) {
-                $grp = @{}
-                foreach ($line in (Get-Content -LiteralPath $cfgForRaid -ErrorAction SilentlyContinue)) {
-                    if ($line -match '^\s*group_(\d+)_(.+?)\s*=\s*(.*)$') {
-                        $gn = $matches[1]; $gf = $matches[2].Trim().ToLower(); $gv = $matches[3].Trim()
-                        if (-not $grp.ContainsKey($gn)) { $grp[$gn] = @{} }
-                        $grp[$gn][$gf] = $gv
-                    }
-                }
-                foreach ($gn in $grp.Keys) {
-                    $isSys = "$($grp[$gn]['disk_system'])".Trim().ToUpper()
-                    $gType = "$($grp[$gn]['type'])"
-                    if ($isSys -eq 'FALSE' -and $gType -match '(?i)raid') {
-                        $slDeclaresDataArray = $true
-                        Write-RaidLog "SL group $gn declares a DATA array (Type='$gType', disk_system=FALSE)."
-                        break
-                    }
-                }
-            } else {
-                Write-RaidLog "SL config not found for the data-array check: $cfgForRaid"
-            }
-        }
-    } catch {
-        Write-RaidLog "Data-array declaration check failed: $_"
-    }
+    # Разбор конфига вынесен в Test-SlDeclaresDataArray: тот же ответ нужен и при
+    # подготовке дисков (там он разрешает затереть разметку прежнего массива).
+    # Результат кэширован, повторного чтения файла не будет.
+    $slDeclaresDataArray = Test-SlDeclaresDataArray -UsbRoot $usbRoot
 
     if ($slDeclaresDataArray) {
         Write-ColorOutput '  *** SL declares a DATA RAID array, but no writable volume reached Windows. ***' 'Red'
